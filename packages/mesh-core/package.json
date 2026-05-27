@@ -1,0 +1,58 @@
+{
+  "name": "@oxpulse/mesh-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "description": "BLE / WiFi-Direct offline mesh transport for oxpulse-chat (Phase B.1+)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./native": {
+      "types": "./dist/native/index.d.ts",
+      "import": "./dist/native/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --outDir dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
+    "@noble/post-quantum": "^0.6.1",
+    "@oxpulse/identity": "workspace:*",
+    "@oxpulse/wire-codec": "^0.3.0",
+    "sframe-ratchet": "0.5.0"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^6.2.1",
+    "@capacitor-community/bluetooth-le": "^6.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@capacitor/core": { "optional": true },
+    "@capacitor-community/bluetooth-le": { "optional": true }
+  },
+  "devDependencies": {
+    "@capacitor/core": "^6.2.1",
+    "@capacitor-community/bluetooth-le": "^6.1.0",
+    "@types/node": "^22",
+    "jsdom": "^26.0.0",
+    "rimraf": "^5",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5",
+    "fake-indexeddb": "^6.2.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

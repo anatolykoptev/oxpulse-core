@@ -1,0 +1,21 @@
+{
+  "name": "oxpulse-core-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OxPulse core platform primitives — Ed25519 device identity + BLE/WiFi-Direct offline mesh transport. Shared by oxpulse-chat (messenger) and call surfaces.",
+  "license": "AGPL-3.0-or-later",
+  "author": "Anatoly Koptev <anatoly@koptev.me>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anatolykoptev/oxpulse-core.git"
+  },
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "typecheck": "pnpm -r exec tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

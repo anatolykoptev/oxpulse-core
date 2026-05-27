@@ -1,0 +1,38 @@
+{
+  "name": "@oxpulse/identity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "description": "Long-term Ed25519 device identity for oxpulse-chat (Phase B.2+)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --outDir dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.2.0"
+  },
+  "devDependencies": {
+    "@noble/curves": "^2.2.0",
+    "@types/node": "^22",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5",
+    "fake-indexeddb": "^6.2.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
