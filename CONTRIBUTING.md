@@ -22,20 +22,29 @@ pnpm changeset
 
 Pick the affected packages, the SemVer bump (patch/minor/major), and write a short summary. This creates `.changeset/<random>.md` which **must** be committed to the PR.
 
-The `changeset-required` CI check enforces this on every PR targeting `main`.
+**Reviewer enforces** the changeset presence during code review. Per `~/CLAUDE.md` "GHA blocked", there is no CI gate — code-quality-reviewer checks for `.changeset/*.md` in every PR touching publishable source. Block merge if missing (unless `[no-changeset]` is in the PR title).
 
 ### When the change does NOT need a changeset
 
-For pure docs, CI, tests on internal-only code, or infra-only changes — apply the `skip-changeset` PR label OR include `[no-changeset]` in the PR title.
+For pure docs, CI, tests on internal-only code, or infra-only changes — include `[no-changeset]` in the PR title.
 
-### Release flow
+### Release flow (manual operator)
 
-1. Merge feature PR → `main`.
-2. `release.yml` GHA runs on `main` push. If any `.changeset/*.md` accumulated, it opens a "chore(release): version packages" PR that:
-   - Runs `changeset version` (bumps package versions, rewrites per-package CHANGELOG.md, consumes the changesets)
-   - Updates `pnpm-lock.yaml`
-3. Operator reviews the rollup PR and merges to `main`.
-4. On the subsequent `main` push, `release.yml` calls `pnpm changeset:publish` which runs `npm publish` for each bumped package (requires `private: true` removed + `NPM_TOKEN` repo secret set).
+1. Merge feature PRs → `main`.
+2. When ready to cut a release, on a clean `main` checkout:
+   ```bash
+   pnpm changeset:version    # bumps versions, rewrites CHANGELOG.md, consumes changesets, syncs lockfile
+   git add -A && git commit -m "chore(release): version packages"
+   git push origin main
+   ```
+3. After private flags removed + NPM creds configured, publish:
+   ```bash
+   pnpm install --frozen-lockfile
+   pnpm changeset:publish    # npm publishes each bumped package + creates git tags
+   git push --follow-tags
+   ```
+
+NOTE: GHA templates (release.yml + changeset-required.yml) lived in earlier commits of this branch before being removed per `~/CLAUDE.md` "GHA blocked" rule. They can be revived from history when cloud CI budget is restored.
 
 ### What goes inside a changeset
 

@@ -9,9 +9,9 @@ Complements `~/CLAUDE.md`. Project-specific only.
 - TypeScript ESM, vitest. No build for non-publishable code.
 - Phase 1 of oxpulse-chat monorepo split (see `/home/krolik/src/oxpulse-chat/docs/superpowers/specs/2026-05-27-monorepo-split-chat-extract.md`).
 
-## Release workflow
+## Release workflow (manual — GHA blocked)
 
-This repo uses [changesets](https://github.com/changesets/changesets) for version + changelog automation.
+This repo uses [changesets](https://github.com/changesets/changesets) CLI for version + changelog automation. **No GitHub Actions** — `~/CLAUDE.md` global rule "GHA blocked. Cloud CI cancelled" applies repo-wide. Operator runs CLI commands locally.
 
 When opening a PR touching `@oxpulse/identity` or `@oxpulse/mesh-core` source:
 
@@ -21,9 +21,22 @@ pnpm changeset
 
 Pick the affected packages + SemVer bump + summary. Commit the resulting `.changeset/<random>.md` with your PR.
 
-The `changeset-required` CI check enforces this on every PR. Bypass via label `skip-changeset` OR `[no-changeset]` in PR title (for docs / CI / non-publishable code).
+**Reviewer enforces** the changeset presence during code review (no CI gate). Bypass via `[no-changeset]` in PR title (for docs / CI / non-publishable code).
 
-On `main` merge: `release.yml` opens a "chore(release): version packages" PR via changesets/action. After operator approves + merges, the next `main` push triggers `changeset publish` (no-op while packages are `private: true`; actual `npm publish` runs after the `private: true` flags are flipped).
+Release flow (manual operator):
+1. Merge feature PRs → `main`. Each carries a `.changeset/*.md` if it touched publishable code.
+2. When ready to cut release (operator decision), on a clean `main` checkout:
+   ```bash
+   pnpm changeset:version    # bumps versions, rewrites CHANGELOG.md, consumes changesets
+   git add -A && git commit -m "chore(release): version packages"
+   git push origin main
+   ```
+3. Then publish (no-op while packages are `private: true`; runs `npm publish` after flags flipped):
+   ```bash
+   pnpm install --frozen-lockfile
+   pnpm changeset:publish    # npm publishes each bumped package + creates git tags
+   git push --follow-tags
+   ```
 
 ## Current state
 
