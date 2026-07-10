@@ -195,7 +195,6 @@ export class NoiseXxHandshake {
   // refactor should use a union type:
   //   mlkemState: { phase: 'keypair'; kp: MlkemKeypair }
   //              | { phase: 'encapped'; ciphertext: Uint8Array }
-  // See: plan docs/superpowers/plans/2026-05-16-mesh-phase-b2-crypto-layer.md R7
   private mlkemKeypair: { publicKey: Uint8Array; secretKey: Uint8Array } | null = null;
   private mlkemSharedSecret: Uint8Array | null = null;
 

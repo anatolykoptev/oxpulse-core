@@ -3,8 +3,6 @@
 // Phase 2 T0.5 — operator decision #10:
 //   X25519 keypair is separate from Ed25519 (NOT derived).
 //   Bound to the Ed25519 identity via a self-sig over "oxp/pkbind/v1" || x25519_pub.
-//
-// Plan: docs/superpowers/plans/2026-05-17-phase2-w7p2b1-sdk-pairwise.md §T0.5
 
 import { x25519, ed25519 } from '@noble/curves/ed25519.js';
 import type { DeviceIdentity } from './device-identity.js';

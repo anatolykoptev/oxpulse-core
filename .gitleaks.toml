@@ -1,0 +1,22 @@
+# gitleaks.toml — secrets scanner allowlist for oxpulse-core.
+#
+# gitleaks v8 auto-loads any `.gitleaks.toml` in the scanned directory.
+#
+# Every entry MUST cite WHY a given path is benign — the gate loses signal
+# otherwise.
+#
+# Run locally: gitleaks dir . --config .gitleaks.toml --no-banner
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Cryptographic Known-Answer-Test (KAT) vector files"
+
+paths = [
+    # Cryptographic Known-Answer-Test vectors. Hex strings that LOOK like
+    # API keys / secrets but are NIST SP 800-38D / FIPS / RFC reference
+    # values for AES-GCM, ML-KEM, Noise-XX, Curve25519 test implementations —
+    # public standard test data, not real secrets.
+    '''packages/mesh-core/src/__tests__/crypto/.*\.test\.ts''',
+]
