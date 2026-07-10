@@ -11,7 +11,7 @@
 # Two independently-versioned packages (packages/identity, packages/mesh-core) →
 # separate-pull-requests:true so each gets its own release PR; component tags
 # (include-component-in-tag:true) keep identity-vX.Y.Z / mesh-core-vX.Y.Z distinct
-# instead of colliding on a single vX.Y.Z per the sfu-kit single-package pattern.
+# instead of colliding on a single vX.Y.Z.
 #
 # Versioning: 0.x pre-1.0 (bump-minor-pre-major + bump-patch-for-minor-pre-major) —
 # feat/fix bump PATCH, a breaking change bumps MINOR. Do NOT `git tag` by hand:
@@ -21,13 +21,6 @@
 # dependencies by oxpulse-chat (not published to npm). This workflow only
 # manages version + changelog + git tag + release PR — actual consumption stays
 # a source/engine dependency, unchanged by this setup.
-#
-# Runner: self-hosted per fleet CI rule (GitHub-hosted Actions are paid, never
-# used fleet-wide) — runs on the krolik self-hosted runner once one is
-# registered for this repo. NONE is registered yet as of this workflow's
-# creation (0 runners on the repo at setup time) — flagged in the
-# release-please-setup audit report; the job will queue until a runner is
-# added (`~/actions-runner-oxpulse-core`, mirroring the other fleet repos).
 
 name: release-please
 
@@ -42,7 +35,7 @@ permissions:
 
 jobs:
   release-please:
-    runs-on: [self-hosted, krolik]
+    runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
         with:
