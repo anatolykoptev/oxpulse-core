@@ -33,7 +33,6 @@
  *   carries its own senderSig — the wrap signature is a separate proof of
  *   transport-layer authorship.
  *
- * @see docs/superpowers/plans/2026-05-17-phase3-mesh-bridge.md §T1
  * @see packages/wire-codec/src/mesh-bundle.ts  (outer frame)
  * @see packages/crypto-primitives/src/envelope.ts  (MessageEnvelope v1)
  */

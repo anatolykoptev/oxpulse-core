@@ -7,7 +7,6 @@
  * 3×3 neighboring subscription.
  *
  * Phase B mesh broadcast transport.
- * Spec: docs/superpowers/specs/2026-05-16-mesh-phase-b-public-broadcast-design.md
  *
  * Constants (GEOHASH_ALPHABET, GEOHASH_LENGTH, CHANNEL_ID_HASH_BYTE_COUNT)
  * are sourced from mesh-constants.json via the generated constants file.

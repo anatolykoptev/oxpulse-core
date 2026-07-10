@@ -1,7 +1,5 @@
 // T0.5 — X25519 identity keypair + self-sig binding
 //
-// Plan: docs/superpowers/plans/2026-05-17-phase2-w7p2b1-sdk-pairwise.md §T0.5
-//
 // Tests:
 //   1. generateX25519Identity returns 32-byte priv, 32-byte pub, 64-byte selfSig
 //   2. verifyX25519SelfSig passes for own keypair

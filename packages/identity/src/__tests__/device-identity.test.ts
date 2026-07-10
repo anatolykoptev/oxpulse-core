@@ -1,6 +1,5 @@
 // Stage B Device Identity client coverage.
 //
-// Plan: docs/superpowers/plans/2026-05-04-identity-and-1to1-plan.md §B.5
 //   B3 — page reload → IDB unwrap → same device_pubkey
 //   B4 — two browsers same human → two distinct device_pubkey
 // FOLLOWUPS.md #10
