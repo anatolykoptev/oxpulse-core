@@ -1,19 +1,20 @@
 # oxpulse-core
 
-Platform primitives shared between **oxpulse-chat** (group messenger) and call surfaces of the OxPulse family.
+Offline-first platform primitives for peer-to-peer and degraded-network apps: a
+post-quantum mesh transport and long-term device identity, used across the OxPulse family.
 
 ## Packages
 
 | Package | Purpose | Status |
 |---|---|---|
-| [`@oxpulse/identity`](packages/identity) | Long-term Ed25519 device identity (host + device + room-host seed; IndexedDB-backed) | Pre-1.0 — internal API stability not guaranteed |
-| [`@oxpulse/mesh-core`](packages/mesh-core) | BLE / WiFi-Direct offline mesh transport (frame, outbox, dedupe, router, peer-registry, GATT channel) | Pre-1.0 |
+| [`@oxpulse/identity`](packages/identity) | Long-term Ed25519 device identity (host + device + room-host seed; IndexedDB-backed) | Pre-1.0 — API stability not yet guaranteed |
+| [`@oxpulse/mesh-core`](packages/mesh-core) | BLE / WiFi-Direct offline mesh transport (frame, outbox, dedupe, router, peer-registry, GATT channel; Noise-XX + ML-KEM post-quantum handshake) | Pre-1.0 |
 
-## Why a separate repo
+## Why a separate package
 
-Both `@oxpulse/identity` and `@oxpulse/mesh-core` are imported from multiple downstream surfaces (chat handlers, call signaling, group-call admission, federated mailbox transport). Extracting them out of the oxpulse-chat monorepo lets each downstream surface pin a stable version and lets us iterate on the shared layer with its own release cadence.
-
-This repo is **Phase 1 of the oxpulse-chat monorepo split**. Later phases (chat extraction, web-app split) are gated on first paying B2B `chat-sdk` customer.
+These primitives are consumed by several independent surfaces (messaging, signaling,
+offline transport), so they live in their own package with an independent release cadence.
+Downstream apps pin a stable version instead of tracking a larger codebase.
 
 ## Layout
 
@@ -33,4 +34,5 @@ pnpm -r run test
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). If you embed `@oxpulse/identity` or `@oxpulse/mesh-core` in a network service, the network service source must be made available under AGPL.
+[AGPL-3.0-or-later](LICENSE). If you embed `@oxpulse/identity` or `@oxpulse/mesh-core` in a
+network service, the network service source must be made available under AGPL.
