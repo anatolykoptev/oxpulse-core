@@ -17,10 +17,5 @@
   },
   "engines": {
     "node": ">=18"
-  },
-  "pnpm": {
-    "patchedDependencies": {
-      "@oxpulse/wire-codec@0.3.0": "patches/@oxpulse__wire-codec@0.3.0.patch"
-    }
   }
 }

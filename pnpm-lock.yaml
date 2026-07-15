@@ -4,11 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-patchedDependencies:
-  '@oxpulse/wire-codec@0.3.0':
-    hash: 20ecdd6eee4d40a6f41c0cf9836587d06d76d921c31d92266d4608c390b22f28
-    path: patches/@oxpulse__wire-codec@0.3.0.patch
-
 importers:
 
   .: {}
@@ -44,11 +39,11 @@ importers:
         specifier: ^0.6.1
         version: 0.6.1
       '@oxpulse/identity':
-        specifier: workspace:*
-        version: link:../identity
+        specifier: ^0.1.0
+        version: 0.1.1
       '@oxpulse/wire-codec':
-        specifier: 0.3.0
-        version: 0.3.0(patch_hash=20ecdd6eee4d40a6f41c0cf9836587d06d76d921c31d92266d4608c390b22f28)
+        specifier: ^0.4.1
+        version: 0.4.1
       sframe-ratchet:
         specifier: 0.5.0
         version: 0.5.0(@noble/curves@2.2.0)(@noble/hashes@2.2.0)
@@ -193,8 +188,12 @@ packages:
   '@oxc-project/types@0.139.0':
     resolution: {integrity: sha512-r9gHphtCs+1M7J0pw6Sn/hh/Wpa/iQrOOkrNAlVLF/gHq+/CJmHIWKKUUhdWjcD6CIa8idarspCsASiXCXvFUw==}
 
-  '@oxpulse/wire-codec@0.3.0':
-    resolution: {integrity: sha512-iWzmkNhGbJn53Fh64czQxedgG2kUlAENF0YOhDL/4zdQ6f2M94HC4r4/EkuiIyU5Q535ovPpmaA2Feu1zbR5Ww==}
+  '@oxpulse/identity@0.1.1':
+    resolution: {integrity: sha512-1uPOBCs4xWZK/2x7kO8xyqqJIY/kivpJ0bPQrHwYA4zItvstV6kvpS33kWABPyUcy9o98pXdbaFXz21kSK6aTA==}
+    engines: {node: '>=18'}
+
+  '@oxpulse/wire-codec@0.4.1':
+    resolution: {integrity: sha512-ApGMadfcr5Bm6YvPnTN4e2r96jXeZIVVUG8AgeyDH7R47+APvGqZJ79J6Mq+gPNbZ8ec4JYHxSmcAQXWKSCSFw==}
     engines: {node: '>=18'}
 
   '@pkgjs/parseargs@0.11.0':
@@ -1087,7 +1086,11 @@ snapshots:
 
   '@oxc-project/types@0.139.0': {}
 
-  '@oxpulse/wire-codec@0.3.0(patch_hash=20ecdd6eee4d40a6f41c0cf9836587d06d76d921c31d92266d4608c390b22f28)':
+  '@oxpulse/identity@0.1.1':
+    dependencies:
+      '@noble/curves': 2.2.0
+
+  '@oxpulse/wire-codec@0.4.1':
     dependencies:
       '@bokuweb/zstd-wasm': 0.0.27
       cbor-x: 1.6.4
