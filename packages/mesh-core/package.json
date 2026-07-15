@@ -1,6 +1,6 @@
 {
   "name": "@oxpulse/mesh-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "description": "BLE / WiFi-Direct offline mesh transport for oxpulse-chat (Phase B.1+)",
