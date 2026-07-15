@@ -2,7 +2,7 @@
   "name": "oxpulse-core-monorepo",
   "version": "0.0.0",
   "private": true,
-  "description": "OxPulse core platform primitives — Ed25519 device identity + BLE/WiFi-Direct offline mesh transport. Shared by oxpulse-chat (messenger) and call surfaces.",
+  "description": "OxPulse core platform primitives \u2014 Ed25519 device identity + BLE/WiFi-Direct offline mesh transport. Shared by oxpulse-chat (messenger) and call surfaces.",
   "license": "AGPL-3.0-or-later",
   "author": "Anatoly Koptev <anatoly@koptev.me>",
   "repository": {
@@ -17,5 +17,10 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@oxpulse/wire-codec@0.3.0": "patches/@oxpulse__wire-codec@0.3.0.patch"
+    }
   }
 }

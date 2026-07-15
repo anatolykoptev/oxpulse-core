@@ -1,0 +1,30 @@
+diff --git a/dist/codec.d.ts b/dist/codec.d.ts
+index 2f0e45908f2e7e9eb62fc522e1b6f7c8287d62f2..85eadf34576ddf0466ceead37cdf27e0097402f7 100644
+--- a/dist/codec.d.ts
++++ b/dist/codec.d.ts
+@@ -1,5 +1,5 @@
+-import { ALL_DICTS, loadDict, type DictName } from "./dicts";
+-import type { WireBytes } from "./brands";
++import { ALL_DICTS, loadDict, type DictName } from "./dicts.js";
++import type { WireBytes } from "./brands.js";
+ export type { DictName };
+ export { ALL_DICTS, loadDict };
+ export type WireCap = "json" | "cbor" | "cbor+zstd" | "zstd-dict-ru-v1" | "zstd-dict-fa-v1" | "zstd-dict-en-v1" | "envelope-v2";
+diff --git a/dist/codec.js b/dist/codec.js
+index 30120ac089c00ead9a33264a03fc02f082efd2ea..8e7e390b96e90a312072b4221689b86b026bf70e 100644
+--- a/dist/codec.js
++++ b/dist/codec.js
+@@ -34,10 +34,10 @@
+ // See: https://github.com/kriszyp/cbor-x#no-eval-build
+ import { Encoder as CborEncoder, decode as cborDecode } from "cbor-x/index-no-eval";
+ import { init as zstdInit, compress as zstdCompress, decompress as zstdDecompress, createCCtx, createDCtx, compressUsingDict, decompressUsingDict, } from "@bokuweb/zstd-wasm";
+-import { ALL_DICTS, DICT_ID_TO_NAME, DICT_NAME_TO_ID, getDictBytes, loadDict, } from "./dicts";
+-import { canEncodeAsV2, toV2, fromV2 } from "./envelope-v2";
++import { ALL_DICTS, DICT_ID_TO_NAME, DICT_NAME_TO_ID, getDictBytes, loadDict, } from "./dicts.js";
++import { canEncodeAsV2, toV2, fromV2 } from "./envelope-v2.js";
+ import { WireCodecError } from "./errors.js";
+-import { asWireBytes } from "./brands";
++import { asWireBytes } from "./brands.js";
+ export { ALL_DICTS, loadDict };
+ /** All capabilities this build can encode AND decode.
+  *  Note: dict caps are advertised statically (build-time). At encode time, if the
