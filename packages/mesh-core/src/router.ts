@@ -45,7 +45,8 @@ export interface RouteOutgoingArgs {
   channelId: Uint8Array;
 }
 
-export type IncomingHandler = (frame: Uint8Array) => void;
+// Handler signature consumed by SseSubscribe (below); internal to this module.
+type IncomingHandler = (frame: Uint8Array) => void;
 
 /** SSE subscription hook: receives a handler, returns an unsubscribe function. */
 export type SseSubscribe = (handler: IncomingHandler) => () => void;

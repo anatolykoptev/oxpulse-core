@@ -170,18 +170,12 @@ function tofuSave(store: Record<string, TofuRecord>): void {
   _tofuMemStore = evicted;
 }
 
-/**
- * Reset the TOFU store (for testing only — production callers: none).
- * @internal
- */
+/** Reset the TOFU store. Test-only helper (leading `_` per convention). */
 export function _resetTofuStore(): void {
   _tofuMemStore = null;
 }
 
-/**
- * Expose tofuCheck for testing (for testing only — production callers: none).
- * @internal
- */
+/** Expose tofuCheck for tests. Test-only helper (leading `_` per convention). */
 export function _tofuCheck(peerIdHex: string, pubkeyB64: string): { trusted: boolean; keyChanged: boolean } {
   return tofuCheck(peerIdHex, pubkeyB64);
 }

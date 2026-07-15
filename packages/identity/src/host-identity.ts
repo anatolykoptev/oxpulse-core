@@ -146,7 +146,27 @@ export function buildPinMintPayload(roomId: string, ts: number): string {
 /// Build shortlink-mint payload — ADR-0005 door 3 (Wave 4).
 /// Domain prefix "shortlink-mint" distinguishes from "pin-mint" so a
 /// PIN-mint signature cannot be replayed as a shortlink-mint and vice-versa.
-/// Format: `shortlink-mint:{room_id}:{ts}` (ts = Unix seconds as integer)
-export function buildShortlinkMintPayload(roomId: string, ts: number): string {
-    return `shortlink-mint:${roomId}:${ts}`;
+///
+/// Group kind-carrier binding (SEC-CR-001): when a group host mints WITH a
+/// typed-10 `redirectRoomId`, that redirect is folded INTO the signed payload
+/// (`shortlink-mint:{room_id}:{redirect}:{ts}`). This authenticates the
+/// presence AND value of the redirect: an active MITM that strips the field
+/// from the request makes the server verify `shortlink-mint:{room_id}:{ts}`
+/// against a signature made over the redirect-inclusive form → mismatch → 403.
+/// Without this binding, stripping the field silently falls back to the 9-char
+/// `room_id` → `/s/<alias>` → bare-9 → mesh (the kind-carrier downgrade the
+/// PR exists to fix, re-introduced over an unauthenticated channel).
+///
+/// Format (1:1 / no redirect):   `shortlink-mint:{room_id}:{ts}`
+/// Format (group / w/ redirect): `shortlink-mint:{room_id}:{redirect}:{ts}`
+/// ts = Unix seconds as integer. The no-redirect form is byte-identical to the
+/// pre-binding format, so deployed 1:1 clients are unaffected.
+export function buildShortlinkMintPayload(
+    roomId: string,
+    ts: number,
+    redirectRoomId?: string,
+): string {
+    return redirectRoomId !== undefined
+        ? `shortlink-mint:${roomId}:${redirectRoomId}:${ts}`
+        : `shortlink-mint:${roomId}:${ts}`;
 }

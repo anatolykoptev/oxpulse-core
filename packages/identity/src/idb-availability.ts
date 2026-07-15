@@ -14,7 +14,7 @@
 const PROBE_DB_NAME = '__oxp_idb_probe__';
 const PROBE_TIMEOUT_MS = 500;
 
-export type IDBUnavailableReason = 'no_indexedDB' | 'open_failed' | 'timeout';
+type IDBUnavailableReason = 'no_indexedDB' | 'open_failed' | 'timeout';
 
 /**
  * Probe whether IndexedDB is usable in the current runtime.
@@ -33,16 +33,17 @@ export async function isIDBAvailable(): Promise<boolean> {
 	return probe.available;
 }
 
-export interface IDBProbeResult {
+interface IDBProbeResult {
 	available: true;
 }
 
-export interface IDBProbeFailure {
+interface IDBProbeFailure {
 	available: false;
 	reason: IDBUnavailableReason;
 }
 
-export type IDBProbeOutcome = IDBProbeResult | IDBProbeFailure;
+// Discriminated return of probeIDBAvailability(); consumed in-package via inference.
+type IDBProbeOutcome = IDBProbeResult | IDBProbeFailure;
 
 /**
  * Full probe — returns availability flag AND reason on failure.

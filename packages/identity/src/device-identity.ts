@@ -901,7 +901,9 @@ export { toBase64url, fromBase64url } from './base64url.js';
  *   4. exportKey("pkcs8") -> 48-byte PKCS#8 envelope.
  *   5. Strip the 16-byte OID header to get the raw 32-byte secret.
  *
- * @internal - for identity-backup export path only
+ * Public API, narrow scope: use only on the identity-backup export path.
+ * Re-exported from `index.ts`. The leading paragraphs document the threat
+ * model that gates lawful use; do not call this from product feature code.
  */
 export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; publicB64u: string }> {
 	const stored = await idb.load<{ publicKeyB64: string; wrappedPrivateKey: ArrayBuffer }>(DEVICE_KEY_NAME);
@@ -967,7 +969,8 @@ export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; pub
 
 /**
  * Replace the stored device identity with the provided Ed25519 secret + pubkey.
- * @internal - for identity-backup restore path only
+ * Public API, narrow scope: use only on the identity-backup restore path.
+ * Re-exported from `index.ts`. Do not call from product feature code.
  */
 export async function replaceDeviceIdentity(
 	secret: Uint8Array,
@@ -1025,7 +1028,8 @@ export async function replaceDeviceIdentity(
 
 /**
  * Overwrite the profile_seed with the provided bytes.
- * @internal - for identity-backup restore path only
+ * Public API, narrow scope: use only on the identity-backup restore path.
+ * Re-exported from `index.ts`. Do not call from product feature code.
  */
 export async function setProfileSeed(seed: Uint8Array): Promise<void> {
 	cachedProfileSeed = null;
