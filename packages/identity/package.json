@@ -1,7 +1,6 @@
 {
   "name": "@oxpulse/identity",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "description": "Long-term Ed25519 device identity for oxpulse-chat (Phase B.2+)",
