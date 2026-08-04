@@ -126,15 +126,18 @@ export async function routeOutgoing(
 
   if (online && hasBle) {
     // Dual mode (MAJOR 3): online bridge + BLE concurrent via Promise.all.
+    // B4: if BLE fails, strategy downgrades to 'online' (not false 'online+ble').
     const jwt = await getToken(ctx.geohash, ctx.dayUtc, ctx.identityKey);
     let bleError: string | undefined;
     const [bridgeResult] = await Promise.all([
       bridgeSend({ bundle, jwt }),
       sendToBle(bundle, peers).catch((err: unknown) => {
         bleError = err instanceof Error ? err.message : String(err);
+        emitMeshMetric('ble_send_failed', { reason: bleError.slice(0, 80) });
       }),
     ]);
-    return { strategy: 'online+ble', bridgeResult, bleError };
+    // B4: strategy reflects what actually succeeded, not what was attempted.
+    return { strategy: bleError ? 'online' : 'online+ble', bridgeResult, bleError };
   }
 
   // Neither: enqueue for later retry using caller-provided msgId (not re-parsed from bytes).
