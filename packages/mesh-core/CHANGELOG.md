@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.3...mesh-core-v0.1.4) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** bounded mailbox storage — atomic evict-on-put + cursor reads ([#19](https://github.com/anatolykoptev/oxpulse-core/issues/19)) ([95e1cd6](https://github.com/anatolykoptev/oxpulse-core/commit/95e1cd63ca6ea2aacecc22371cb6d3bce7986022))
+
 ## [0.1.3](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.2...mesh-core-v0.1.3) (2026-08-04)
 
 
