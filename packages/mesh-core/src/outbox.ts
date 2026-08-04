@@ -12,7 +12,12 @@
  *   status          'pending' | 'sent' | 'failed'
  *
  * API: enqueue, nextPending, markSent, markFailed, evictOlderThan, open, close.
+ *
+ * S6: bounded storage — enqueue() enforces MESH_OUTBOX_MAX_ENTRIES atomically
+ * (count + evict-oldest + put in a single readwrite transaction).
  */
+
+import { emitMeshMetric } from './metrics.js';
 
 export interface OutboxEntry {
   msgId: string;
@@ -34,6 +39,9 @@ const DB_VERSION = 1;
 
 /** Maximum delivery attempts before an entry is marked terminal (status='failed'). */
 export const MAX_OUTBOX_ATTEMPTS = 8;
+
+/** S6: Maximum entry count — bounded put enforces this atomically. */
+export const MESH_OUTBOX_MAX_ENTRIES = 5000;
 
 /** Canonical object store name — import this instead of using a string literal. */
 export const MESH_OUTBOX_STORE_NAME = 'outbox';
@@ -81,6 +89,11 @@ export class Outbox {
     return this.db;
   }
 
+  /**
+   * S6: Bounded enqueue — count + evict-oldest + put in a single readwrite
+   * transaction. If the store exceeds MESH_OUTBOX_MAX_ENTRIES, the oldest
+   * entries (lowest lastAttemptMs) are evicted before the put.
+   */
   enqueue(args: EnqueueArgs): Promise<void> {
     return new Promise((resolve, reject) => {
       const entry: OutboxEntry = {
@@ -92,9 +105,41 @@ export class Outbox {
         status: 'pending',
       };
       const tx = this.getDb().transaction(MESH_OUTBOX_STORE_NAME, 'readwrite');
-      const req = tx.objectStore(MESH_OUTBOX_STORE_NAME).put(entry);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
+      const store = tx.objectStore(MESH_OUTBOX_STORE_NAME);
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const count = countReq.result;
+        if (count >= MESH_OUTBOX_MAX_ENTRIES) {
+          // Evict oldest entries (lowest lastAttemptMs) to make room.
+          const evictCount = Math.max(1, Math.floor(count * 0.1));
+          const index = store.index('lastAttemptMs');
+          let evicted = 0;
+          const evictCursor = index.openCursor();
+          evictCursor.onsuccess = (ev) => {
+            const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+            if (!cursor || evicted >= evictCount) {
+              // Done evicting — now put the new entry.
+              const putReq = store.put(entry);
+              putReq.onsuccess = () => {
+                emitMeshMetric('mailbox_evicted', { store: 'outbox', count: String(evicted) });
+                resolve();
+              };
+              putReq.onerror = () => reject(putReq.error);
+              return;
+            }
+            cursor.delete();
+            evicted++;
+            cursor.continue();
+          };
+          evictCursor.onerror = () => reject(evictCursor.error);
+        } else {
+          // Under cap — just put.
+          const putReq = store.put(entry);
+          putReq.onsuccess = () => resolve();
+          putReq.onerror = () => reject(putReq.error);
+        }
+      };
+      countReq.onerror = () => reject(countReq.error);
     });
   }
 
@@ -204,6 +249,49 @@ export class Outbox {
         cursor.continue();
       };
       req.onerror = () => reject(req.error);
+    });
+  }
+
+  /** S6: Return the current entry count. */
+  size(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const tx = this.getDb().transaction(MESH_OUTBOX_STORE_NAME, 'readonly');
+      const req = tx.objectStore(MESH_OUTBOX_STORE_NAME).count();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  /**
+   * S6: Evict the OLDEST entries (lowest lastAttemptMs) until the store
+   * contains at most `maxEntries`. Single readwrite transaction.
+   */
+  evictExcess(maxEntries: number = MESH_OUTBOX_MAX_ENTRIES): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const tx = this.getDb().transaction(MESH_OUTBOX_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(MESH_OUTBOX_STORE_NAME);
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const count = countReq.result;
+        if (count <= maxEntries) { resolve(0); return; }
+        const toEvict = count - maxEntries;
+        const index = store.index('lastAttemptMs');
+        let evicted = 0;
+        const cursorReq = index.openCursor();
+        cursorReq.onsuccess = (ev) => {
+          const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor || evicted >= toEvict) {
+            if (evicted > 0) emitMeshMetric('mailbox_evicted', { store: 'outbox', count: String(evicted) });
+            resolve(evicted);
+            return;
+          }
+          cursor.delete();
+          evicted++;
+          cursor.continue();
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      };
+      countReq.onerror = () => reject(countReq.error);
     });
   }
 }
