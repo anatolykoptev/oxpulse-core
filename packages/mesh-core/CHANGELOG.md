@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.11...mesh-core-v0.1.12) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** enforce BLE connection limit to avoid platform caps ([#36](https://github.com/anatolykoptev/oxpulse-core/issues/36)) ([f8b4be0](https://github.com/anatolykoptev/oxpulse-core/commit/f8b4be06d2d8ec5969c42ed47525feb3e70407b3))
+
 ## [0.1.11](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.10...mesh-core-v0.1.11) (2026-08-04)
 
 
