@@ -431,9 +431,13 @@ export async function startMesh(): Promise<void> {
  */
 function checkHandshakeTimeouts(): void {
   const now = Date.now();
-  for (const cs of cryptoStates.values()) {
+  // S2: iterate entries (not values) so we can check connectedDevices by deviceId.
+  // If the device already disconnected, skip — don't report a stale timeout.
+  for (const [deviceId, cs] of cryptoStates) {
     if (cs.verdict !== 'pending') continue;
     if (cs.session !== null) continue;  // past handshake — session already established
+    // S2: skip if device already disconnected — no false timeout report.
+    if (!connectedDevices.has(deviceId)) continue;
     if (now - cs.handshakeStartedAt > HANDSHAKE_TIMEOUT_MS) {
       // S1: use state machine — don't override accepted/rejected.
       if (!transitionVerdict(cs, 'rejected')) continue;
