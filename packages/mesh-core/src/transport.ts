@@ -250,6 +250,31 @@ function nextBackoffMs(deviceId: string): number {
   return ms;
 }
 
+/**
+ * #44: Clear backoff/backoffCounts entries for a device on disconnect.
+ * Prevents unbounded Map growth in high-churn environments where devices
+ * repeatedly connect/disconnect without ever succeeding.
+ * Emits a `backoff_cleared` metric when entries existed (observability).
+ */
+function clearBackoff(deviceId: string): void {
+  const had = backoff.has(deviceId) || backoffCounts.has(deviceId);
+  backoff.delete(deviceId);
+  backoffCounts.delete(deviceId);
+  if (had) {
+    emitMeshMetric('backoff_cleared', { device: deviceId });
+  }
+}
+
+/** Expose backoff Map size for testing (issue #44). @internal */
+export function _getBackoffSize(): number {
+  return backoff.size;
+}
+
+/** Expose backoffCounts Map size for testing (issue #44). @internal */
+export function _getBackoffCountsSize(): number {
+  return backoffCounts.size;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -332,6 +357,8 @@ export async function startMesh(): Promise<void> {
         mtuCache.delete(deviceId);
         reassemblers.delete(deviceId);
         cryptoStates.delete(deviceId);
+        // #44: clear backoff entries to prevent unbounded Map growth on churn.
+        clearBackoff(deviceId);
       });
       const mtu = await negotiateMtu(deviceId);
       mtuCache.set(deviceId, mtu);
@@ -376,6 +403,8 @@ export async function startMesh(): Promise<void> {
       mtuCache.delete(e.deviceAddress);
       connectedDevices.delete(e.deviceAddress);
       cryptoStates.delete(e.deviceAddress);
+      // #44: clear backoff entries to prevent unbounded Map growth on churn.
+      clearBackoff(e.deviceAddress);
     }
   });
   listenerRemovers.push(async () => connHandle.remove());

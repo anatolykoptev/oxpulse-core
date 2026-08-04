@@ -35,7 +35,10 @@ export type MeshMetric =
   // The guard correctly prevents processing, but the drop must be observable.
   | 'handshake_frame_dropped'
   // S7: BLE connection limit reached — new connection attempt skipped.
-  | 'ble_connection_limit_reached';
+  | 'ble_connection_limit_reached'
+  // #44: backoff/backoffCounts entries cleared on device disconnect to prevent
+  // unbounded Map growth on device churn. label: device — BLE MAC string.
+  | 'backoff_cleared';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;
