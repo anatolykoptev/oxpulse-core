@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.10...mesh-core-v0.1.11) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** bounded outbox storage with entry count limit ([#34](https://github.com/anatolykoptev/oxpulse-core/issues/34)) ([de6d998](https://github.com/anatolykoptev/oxpulse-core/commit/de6d998c93eb0b51b4010886ae7c20e9ed5eea5b))
+
 ## [0.1.10](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.9...mesh-core-v0.1.10) (2026-08-04)
 
 
