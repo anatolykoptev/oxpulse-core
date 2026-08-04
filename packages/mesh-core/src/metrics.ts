@@ -38,7 +38,10 @@ export type MeshMetric =
   | 'ble_connection_limit_reached'
   // #44: backoff/backoffCounts entries cleared on device disconnect to prevent
   // unbounded Map growth on device churn. label: device — BLE MAC string.
-  | 'backoff_cleared';
+  | 'backoff_cleared'
+  // #45: Bloom filter params (m, k) changed between sessions — existing bits
+  // discarded because they cannot be re-mapped. labels: old_m, new_m, old_k, new_k.
+  | 'bloom_params_changed';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;

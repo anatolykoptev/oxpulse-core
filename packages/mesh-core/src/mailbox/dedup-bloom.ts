@@ -25,6 +25,7 @@
  */
 
 import { DEDUP_BLOOM_CAPACITY, DEDUP_BLOOM_FP_RATE } from '../constants.generated.js';
+import { emitMeshMetric } from '../metrics.js';
 
 export interface BloomDedupOptions {
   dbName?: string;
@@ -135,7 +136,14 @@ export class BloomDedup {
     } else {
       if (row) {
         // Existing row had different params (capacity/fpRate changed between sessions).
-        // Bits cannot be re-mapped — discard. Log once so operators can spot it.
+        // Bits cannot be re-mapped — discard. Log once so operators can spot it,
+        // and emit a metric so the silent state loss is observable in telemetry.
+        emitMeshMetric('bloom_params_changed', {
+          old_m: String(row.m),
+          new_m: String(this.m),
+          old_k: String(row.k),
+          new_k: String(this.k),
+        });
         console.warn(
           `[bloom] params changed (m: ${row.m}→${this.m}, k: ${row.k}→${this.k}); discarding ${row.bits.byteLength} bytes of state`
         );
