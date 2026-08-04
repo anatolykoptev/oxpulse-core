@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.5...mesh-core-v0.1.6) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** downgrade strategy to 'online' when BLE fails in dual mode ([#24](https://github.com/anatolykoptev/oxpulse-core/issues/24)) ([525caea](https://github.com/anatolykoptev/oxpulse-core/commit/525caea6c38a35c32ea25512c9eeb49f38e1020c))
+
 ## [0.1.5](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.4...mesh-core-v0.1.5) (2026-08-04)
 
 
