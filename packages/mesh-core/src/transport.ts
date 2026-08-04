@@ -325,8 +325,10 @@ export async function startMesh(): Promise<void> {
       backoff.delete(deviceId);
       backoffCounts.delete(deviceId);
       // B.2: initiate Noise XX handshake immediately after connecting.
+      // B3: propagate handshake errors to meshState + CryptoState (was swallowed).
       initiateHandshake(deviceId, sighting.peerId).catch((err) => {
-        console.warn('[mesh] handshake initiation failed for', deviceId, err);
+        const cs = cryptoStates.get(deviceId);
+        failHandshake(cs, deviceId, err);
       });
     } catch (err) {
       console.warn('[mesh] connect failed for', deviceId, err);
@@ -617,6 +619,28 @@ async function getLocalIdentity(): Promise<import('./crypto/noise-xx.js').NoiseX
 }
 
 /**
+ * B3: Centralized handshake failure handler.
+ *
+ * Called from the 3 catch sites that previously only console.warn'd.
+ * Sets meshState.error, marks the CryptoState as rejected, emits a metric,
+ * and notifies handshake change subscribers so the UI refreshes.
+ *
+ * Idempotent: if verdict is already 'rejected' (inner try/catch in
+ * advanceHandshake already handled it), this is a no-op — the error
+ * was already propagated and we don't want to overwrite the reason label.
+ */
+function failHandshake(cs: CryptoState | undefined, deviceId: string, err: unknown): void {
+  const reason = err instanceof Error ? err.message : String(err);
+  console.warn(`[mesh] handshake failed for ${deviceId}:`, err);
+  if (cs && cs.verdict !== 'rejected') {
+    cs.verdict = 'rejected';
+    emitMeshMetric('handshake_failed', { reason: reason.slice(0, 80) });
+    notifyHandshakeChange();
+  }
+  meshState.error = 'handshake-failed';
+}
+
+/**
  * Determine handshake role: lexicographic comparison of our peerId vs peer's peerId.
  * Smaller = initiator, larger = responder.
  */
@@ -844,10 +868,11 @@ function handleIncomingChunk(deviceAddress: string, chunk: Uint8Array): void {
           };
           cryptoStates.set(deviceAddress, csNew);
           advanceHandshake(csNew, deviceAddress, capturedFrameType, capturedPayload).catch((err) => {
-            console.warn('[mesh] advanceHandshake error', deviceAddress, err);
+            failHandshake(csNew, deviceAddress, err);
           });
         }).catch((err) => {
-          console.warn('[mesh] responder identity bootstrap failed', deviceAddress, err);
+          // B3: identity bootstrap failure must propagate to meshState, not just console.warn.
+          failHandshake(undefined, deviceAddress, err);
         });
       } else {
         console.warn('[mesh] handshake frame from unknown device (no registry entry)', deviceAddress);
@@ -855,7 +880,7 @@ function handleIncomingChunk(deviceAddress: string, chunk: Uint8Array): void {
       return;
     }
     advanceHandshake(cs, deviceAddress, res.frameType, res.payload).catch((err) => {
-      console.warn('[mesh] advanceHandshake error', deviceAddress, err);
+      failHandshake(cs, deviceAddress, err);
     });
     return;
   }
