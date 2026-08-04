@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.8...mesh-core-v0.1.9) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** skip handshake timeout for disconnected devices ([#30](https://github.com/anatolykoptev/oxpulse-core/issues/30)) ([f90dee2](https://github.com/anatolykoptev/oxpulse-core/commit/f90dee22754e6caabf936c69f968011e53e3fedb))
+
 ## [0.1.8](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.7...mesh-core-v0.1.8) (2026-08-04)
 
 
