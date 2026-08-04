@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.12...mesh-core-v0.1.13) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** review council fixes — outbox eviction math + test coverage + dead code ([#41](https://github.com/anatolykoptev/oxpulse-core/issues/41)) ([080d72e](https://github.com/anatolykoptev/oxpulse-core/commit/080d72e0a3ed15af24ad3ea3aae6e28a69d17c6e))
+
 ## [0.1.12](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.11...mesh-core-v0.1.12) (2026-08-04)
 
 
