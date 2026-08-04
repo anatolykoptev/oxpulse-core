@@ -157,19 +157,25 @@ export class Outbox {
   }
 
   private updateEntry(msgId: string, fn: (e: OutboxEntry) => OutboxEntry): Promise<void> {
+    // B5: use cursor.update() for atomic read-modify-write.
+    // The cursor holds the record lock within the transaction — no other
+    // readwrite transaction can interleave between the read and the write.
+    // Previous get-then-put pattern relied on IDB transaction serialization
+    // which is correct per spec but fragile across implementations.
     return new Promise((resolve, reject) => {
       const tx = this.getDb().transaction(MESH_OUTBOX_STORE_NAME, 'readwrite');
       const store = tx.objectStore(MESH_OUTBOX_STORE_NAME);
-      const getReq = store.get(msgId);
-      getReq.onsuccess = () => {
-        const existing = getReq.result as OutboxEntry | undefined;
-        if (!existing) { resolve(); return; }
+      const cursorReq = store.openCursor(IDBKeyRange.only(msgId));
+      cursorReq.onsuccess = (ev) => {
+        const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+        if (!cursor) { resolve(); return; }
+        const existing = cursor.value as OutboxEntry;
         const updated = fn(existing);
-        const putReq = store.put(updated);
-        putReq.onsuccess = () => resolve();
-        putReq.onerror = () => reject(putReq.error);
+        const updateReq = cursor.update(updated);
+        updateReq.onsuccess = () => resolve();
+        updateReq.onerror = () => reject(updateReq.error);
       };
-      getReq.onerror = () => reject(getReq.error);
+      cursorReq.onerror = () => reject(cursorReq.error);
     });
   }
 
