@@ -95,6 +95,20 @@ const reassemblers = new Map<string, FrameReassembler>();
 
 type CryptoVerdict = 'pending' | 'accepted' | 'rejected';
 
+/**
+ * S1: Verdict state machine — only pending → accepted | rejected allowed.
+ * Terminal states (accepted, rejected) are sticky — a late timeout or
+ * handshake error cannot override a user's explicit accept/reject decision.
+ */
+function transitionVerdict(cs: CryptoState, next: CryptoVerdict): boolean {
+  if (cs.verdict === 'pending') {
+    cs.verdict = next;
+    return true;
+  }
+  // Already in a terminal state — ignore the transition.
+  return false;
+}
+
 interface CryptoState {
   handshake: NoiseXxHandshake;
   role: 'initiator' | 'responder';
@@ -421,7 +435,8 @@ function checkHandshakeTimeouts(): void {
     if (cs.verdict !== 'pending') continue;
     if (cs.session !== null) continue;  // past handshake — session already established
     if (now - cs.handshakeStartedAt > HANDSHAKE_TIMEOUT_MS) {
-      cs.verdict = 'rejected';
+      // S1: use state machine — don't override accepted/rejected.
+      if (!transitionVerdict(cs, 'rejected')) continue;
       console.warn(`[mesh] handshake timeout for peer ${cs.peerIdHex} after ${HANDSHAKE_TIMEOUT_MS}ms`);
       emitMeshMetric('handshake_timeout', { peer: cs.peerIdHex });
       meshState.error = 'handshake-failed';
@@ -535,7 +550,8 @@ export function getPendingHandshakes(): PendingHandshake[] {
 export function acceptPeer(peerIdHex: string): void {
   for (const cs of cryptoStates.values()) {
     if (cs.peerIdHex === peerIdHex) {
-      cs.verdict = 'accepted';
+      // S1: state machine — only pending → accepted.
+      if (!transitionVerdict(cs, 'accepted')) return;
       notifyHandshakeChange();
       return;
     }
@@ -548,7 +564,8 @@ export function acceptPeer(peerIdHex: string): void {
 export function rejectPeer(peerIdHex: string): void {
   for (const cs of cryptoStates.values()) {
     if (cs.peerIdHex === peerIdHex) {
-      cs.verdict = 'rejected';
+      // S1: state machine — only pending → rejected.
+      if (!transitionVerdict(cs, 'rejected')) return;
       emitMeshMetric('sas_mismatch', { peer: peerIdHex });
       meshState.error = 'unknown-peer-key';
       notifyHandshakeChange();
@@ -632,8 +649,8 @@ async function getLocalIdentity(): Promise<import('./crypto/noise-xx.js').NoiseX
 function failHandshake(cs: CryptoState | undefined, deviceId: string, err: unknown): void {
   const reason = err instanceof Error ? err.message : String(err);
   console.warn(`[mesh] handshake failed for ${deviceId}:`, err);
-  if (cs && cs.verdict !== 'rejected') {
-    cs.verdict = 'rejected';
+  // S1: state machine — don't override an accepted peer with a late failure.
+  if (cs && transitionVerdict(cs, 'rejected')) {
     emitMeshMetric('handshake_failed', { reason: reason.slice(0, 80) });
     notifyHandshakeChange();
   }
@@ -724,7 +741,7 @@ async function advanceHandshake(
     console.warn(`[mesh] handshake permanently rejected after 3 failures: ${msg}`);
     emitMeshMetric('handshake_failed', { reason: msg });
     meshState.error = 'handshake-failed';
-    cs.verdict = 'rejected';
+    transitionVerdict(cs, 'rejected');
     return;
   }
 
@@ -744,7 +761,7 @@ async function advanceHandshake(
     } catch (err) {
       console.warn('[mesh] handshake writeMsg2 failed', deviceId, err);
       meshState.error = 'handshake-failed';
-      cs.verdict = 'rejected';
+      transitionVerdict(cs, 'rejected');
       return;
     }
   } else if (frameType === FrameType.HandshakeMsg2 && cs.role === 'initiator') {
@@ -756,7 +773,7 @@ async function advanceHandshake(
     } catch (err) {
       console.warn('[mesh] handshake writeMsg3 failed', deviceId, err);
       meshState.error = 'handshake-failed';
-      cs.verdict = 'rejected';
+      transitionVerdict(cs, 'rejected');
       return;
     }
   }
@@ -770,7 +787,7 @@ async function advanceHandshake(
     } catch (err) {
       console.warn('[mesh] handshake split failed', deviceId, err);
       meshState.error = 'handshake-failed';
-      cs.verdict = 'rejected';
+      transitionVerdict(cs, 'rejected');
       return;
     }
 
@@ -854,7 +871,9 @@ function handleIncomingChunk(deviceAddress: string, chunk: Uint8Array): void {
         const capturedOurPeerId = peerId;
         getLocalIdentity().then((identity) => {
           // Guard: mesh may have stopped or device reconnected while we awaited IDB.
-          if (!capturedOurPeerId || cryptoStates.has(deviceAddress)) return;
+          // S1: also check connectedDevices — if the device disconnected while we
+          // were waiting for IDB, don't create an orphaned cryptoStates entry.
+          if (!capturedOurPeerId || cryptoStates.has(deviceAddress) || !connectedDevices.has(deviceAddress)) return;
           const csNew: CryptoState = {
             handshake: new NoiseXxHandshake({ role, identity }),
             role,
