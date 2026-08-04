@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.14](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.13...mesh-core-v0.1.14) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** clear backoff/backoffCounts Maps on device disconnect ([#52](https://github.com/anatolykoptev/oxpulse-core/issues/52)) ([00b19c5](https://github.com/anatolykoptev/oxpulse-core/commit/00b19c5cdb6812d386ab2f42c9199713e903308a))
+* **mesh-core:** emit bloom_params_changed metric on Bloom filter state discard ([#53](https://github.com/anatolykoptev/oxpulse-core/issues/53)) ([145f16b](https://github.com/anatolykoptev/oxpulse-core/commit/145f16b418716494f52077ff33906f49fd973366))
+* **mesh-core:** reset handshakeFailures on successful handshake completion ([#54](https://github.com/anatolykoptev/oxpulse-core/issues/54)) ([1cfd3c7](https://github.com/anatolykoptev/oxpulse-core/commit/1cfd3c7f880acac50de5e3df3d75e125d243c686))
+
 ## [0.1.13](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.12...mesh-core-v0.1.13) (2026-08-04)
 
 
