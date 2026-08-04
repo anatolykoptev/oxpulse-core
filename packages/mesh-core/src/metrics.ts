@@ -27,7 +27,10 @@ export type MeshMetric =
   | 'mailbox_evicted'
   // B.3 mailbox: QuotaExceededError caught during put(), triggering aggressive eviction + retry.
   // label: store — 'inbox' | 'spool'.
-  | 'mailbox_quota_exceeded';
+  | 'mailbox_quota_exceeded'
+  // B.4 router: BLE send failure in dual mode (online+ble). Strategy downgrades to 'online'.
+  // label: reason — error message, max 80 chars.
+  | 'ble_send_failed';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;
