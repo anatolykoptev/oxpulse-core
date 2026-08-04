@@ -275,6 +275,11 @@ export function _getBackoffCountsSize(): number {
   return backoffCounts.size;
 }
 
+/** Expose handshakeFailures for a device's CryptoState (issue #46). @internal */
+export function _getHandshakeFailures(deviceId: string): number {
+  return cryptoStates.get(deviceId)?.handshakeFailures ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -837,6 +842,15 @@ async function advanceHandshake(
 
     cs.session = new Session({ sendKey: split.sendKey, recvKey: split.recvKey, direction });
     cs.sas = hs.sas();
+
+    // #46: reset handshakeFailures on successful session establishment.
+    // The counter must count violations within a single handshake attempt,
+    // not across the lifetime of a CryptoState. Without this reset, 2 prior
+    // failures + a later re-handshake violation would cause premature rejection.
+    if ((cs.handshakeFailures ?? 0) > 0) {
+      cs.handshakeFailures = 0;
+      emitMeshMetric('handshake_failures_reset', { device: deviceId });
+    }
 
     // TOFU: check peer's static pubkey.
     const peerPub = hs.peerStaticPublicKey();
