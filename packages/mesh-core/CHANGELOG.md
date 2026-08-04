@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.6...mesh-core-v0.1.7) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** atomic read-modify-write via cursor.update for outbox + spool ([#26](https://github.com/anatolykoptev/oxpulse-core/issues/26)) ([f8dd50d](https://github.com/anatolykoptev/oxpulse-core/commit/f8dd50d503327a56fcfc40f86da664a207c88be4))
+
 ## [0.1.6](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.5...mesh-core-v0.1.6) (2026-08-04)
 
 
