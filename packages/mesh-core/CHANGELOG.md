@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.9...mesh-core-v0.1.10) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** emit metric when handshake frame dropped during mesh stop ([#32](https://github.com/anatolykoptev/oxpulse-core/issues/32)) ([b92ab00](https://github.com/anatolykoptev/oxpulse-core/commit/b92ab00df714785e3aae54a2d983bcd8d6bf091d))
+
 ## [0.1.9](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.8...mesh-core-v0.1.9) (2026-08-04)
 
 
