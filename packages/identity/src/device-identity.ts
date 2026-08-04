@@ -681,7 +681,26 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 			return cachedX25519Keypair;
 		} catch (e) {
 			if ((e as { name?: string })?.name !== 'NotSupportedError') throw e;
-			// WebCrypto X25519 newly absent (runtime downgrade) — fall through to regenerate.
+			// S8: WebCrypto X25519 newly absent (runtime downgrade).
+			// If the original generation persisted wrappedPrivateKeyRaw (S8 fix),
+			// recover the existing key via the noble path instead of regenerating
+			// and breaking TOFU trust with all peers.
+			if (existing.wrappedPrivateKeyRaw && existing.wrappedPrivateKeyRaw.byteLength > 0) {
+				const seedKey = await crypto.subtle.unwrapKey(
+					'raw',
+					existing.wrappedPrivateKeyRaw,
+					wrappingKey,
+					'AES-KW',
+					{ name: 'AES-KW', length: 256 },
+					true,
+					['wrapKey', 'unwrapKey'],
+				);
+				const rawBuf = await crypto.subtle.exportKey('raw', seedKey);
+				cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: new Uint8Array(rawBuf) };
+				console.info('[identity] WebCrypto X25519 downgrade — recovered existing keypair via noble fallback');
+				return cachedX25519Keypair;
+			}
+			// No raw fallback persisted (pre-S8 keypair) — fall through to regenerate.
 			// Existing keypair bytes are lost; generate fresh (noble path).
 		}
 	}
@@ -698,10 +717,26 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 
 		const wrappedPriv = await crypto.subtle.wrapKey('pkcs8', kp.privateKey, wrappingKey, 'AES-KW');
 
+		// S8: also export the raw private key bytes and wrap them as AES-KW.
+		// Persisting wrappedPrivateKeyRaw alongside wrappedPrivateKey means a
+		// later WebCrypto X25519 downgrade (browser update removes X25519
+		// support) can recover via the noble path at line 654-666 instead of
+		// regenerating a fresh keypair and breaking TOFU trust with all peers.
+		const rawPrivBytes = await crypto.subtle.exportKey('raw', kp.privateKey);
+		const privAsKey = await crypto.subtle.importKey(
+			'raw',
+			rawPrivBytes,
+			{ name: 'AES-KW', length: 256 },
+			true,
+			['wrapKey', 'unwrapKey'],
+		);
+		const wrappedPrivRaw = await crypto.subtle.wrapKey('raw', privAsKey, wrappingKey, 'AES-KW');
+
 		// Persist before re-importing as non-extractable (window ≈ one tick, only WebCrypto awaits).
-		await idb.save<StoredX25519Keypair>(X25519_KEYPAIR_NAME, {
+		await idb.save<StoredX25519NobleKeypair>(X25519_KEYPAIR_NAME, {
 			publicKey: rawPub,
 			wrappedPrivateKey: wrappedPriv,
+			wrappedPrivateKeyRaw: wrappedPrivRaw,
 		});
 
 		// Re-import non-extractable — drop the extractable handle.
