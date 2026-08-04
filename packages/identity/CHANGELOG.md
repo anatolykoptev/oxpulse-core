@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.3...identity-v0.1.4) (2026-08-04)
+
+
+### Fixed
+
+* **identity:** ephemeral fallback on IDB QuotaExceededError ([#39](https://github.com/anatolykoptev/oxpulse-core/issues/39)) ([6d8f564](https://github.com/anatolykoptev/oxpulse-core/commit/6d8f564c54782acf66e9f4884d353484185fc85e))
+
 ## [0.1.3](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.2...identity-v0.1.3) (2026-08-04)
 
 
