@@ -219,6 +219,16 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 			const ephemeral = await generateDeviceIdentity();
 			return ephemeral;
 		}
+		// S9: QuotaExceededError — IDB quota full. Treat same as IDBUnavailable:
+		// emit ephemeral identity so the app can boot, with a distinct metric
+		// so operators can alert on quota pressure.
+		if ((e as { name?: string })?.name === 'QuotaExceededError') {
+			track('client.identity_quota_exceeded_fallback', undefined, {
+				error_class: 'idb_quota_exceeded',
+			});
+			const ephemeral = await generateDeviceIdentity();
+			return ephemeral;
+		}
 		track('client.identity_create_failed', undefined, {
 			error_class: classifyIdentityError(e, 'create'),
 		});
