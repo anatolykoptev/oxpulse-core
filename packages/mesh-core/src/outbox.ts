@@ -52,9 +52,11 @@ export const MESH_OUTBOX_DB_NAME = 'mesh-router-outbox';
 export class Outbox {
   private db: IDBDatabase | null = null;
   private readonly dbName: string;
+  private readonly maxEntries: number;
 
-  constructor(dbName = MESH_OUTBOX_DB_NAME) {
+  constructor(dbName = MESH_OUTBOX_DB_NAME, maxEntries: number = MESH_OUTBOX_MAX_ENTRIES) {
     this.dbName = dbName;
+    this.maxEntries = maxEntries;
   }
 
   open(): Promise<void> {
@@ -109,9 +111,10 @@ export class Outbox {
       const countReq = store.count();
       countReq.onsuccess = () => {
         const count = countReq.result;
-        if (count >= MESH_OUTBOX_MAX_ENTRIES) {
-          // Evict oldest entries (lowest lastAttemptMs) to make room.
-          const evictCount = Math.max(1, Math.floor(count * 0.1));
+        if (count >= this.maxEntries) {
+          // Evict oldest entries (lowest lastAttemptMs) to make room for the new entry.
+          // Exact count: evict (count - maxEntries + 1) so the store stays at cap after put.
+          const evictCount = count - this.maxEntries + 1;
           const index = store.index('lastAttemptMs');
           let evicted = 0;
           const evictCursor = index.openCursor();
@@ -249,49 +252,6 @@ export class Outbox {
         cursor.continue();
       };
       req.onerror = () => reject(req.error);
-    });
-  }
-
-  /** S6: Return the current entry count. */
-  size(): Promise<number> {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction(MESH_OUTBOX_STORE_NAME, 'readonly');
-      const req = tx.objectStore(MESH_OUTBOX_STORE_NAME).count();
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  /**
-   * S6: Evict the OLDEST entries (lowest lastAttemptMs) until the store
-   * contains at most `maxEntries`. Single readwrite transaction.
-   */
-  evictExcess(maxEntries: number = MESH_OUTBOX_MAX_ENTRIES): Promise<number> {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction(MESH_OUTBOX_STORE_NAME, 'readwrite');
-      const store = tx.objectStore(MESH_OUTBOX_STORE_NAME);
-      const countReq = store.count();
-      countReq.onsuccess = () => {
-        const count = countReq.result;
-        if (count <= maxEntries) { resolve(0); return; }
-        const toEvict = count - maxEntries;
-        const index = store.index('lastAttemptMs');
-        let evicted = 0;
-        const cursorReq = index.openCursor();
-        cursorReq.onsuccess = (ev) => {
-          const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
-          if (!cursor || evicted >= toEvict) {
-            if (evicted > 0) emitMeshMetric('mailbox_evicted', { store: 'outbox', count: String(evicted) });
-            resolve(evicted);
-            return;
-          }
-          cursor.delete();
-          evicted++;
-          cursor.continue();
-        };
-        cursorReq.onerror = () => reject(cursorReq.error);
-      };
-      countReq.onerror = () => reject(countReq.error);
     });
   }
 }
