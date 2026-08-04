@@ -12,10 +12,18 @@
  *   addedAtMs      number      wall-clock ms when first spooled
  *   hopsRemaining  number      decrements on each forward; 0 = drop
  *
+ * Bounded storage: put() enforces MESH_SPOOL_MAX_ENTRIES atomically —
+ * count + evict-oldest + put in a single readwrite transaction.
+ * QuotaExceededError triggers aggressive eviction + retry.
+ *
  * Eviction:
  * - wall-time TTL via addedAtMs (typical 7 days, caller-supplied)
  * - hop budget via decrementHops() — auto-removes at 0
+ * - entry-count cap via bounded put() (MESH_SPOOL_MAX_ENTRIES)
  */
+
+import { MESH_SPOOL_MAX_ENTRIES } from '../constants.generated.js';
+import { emitMeshMetric } from '../metrics.js';
 
 export interface SpoolEntry {
   msgId: string;
@@ -30,12 +38,19 @@ export const MESH_SPOOL_STORE_NAME = 'spool';
 
 const DB_VERSION = 1;
 
+/**
+ * Fraction of maxEntries to evict on QuotaExceededError before retry.
+ */
+const QUOTA_EVICT_FRACTION = 0.1;
+
 export class Spool {
   private db: IDBDatabase | null = null;
   private readonly dbName: string;
+  private readonly maxEntries: number;
 
-  constructor(dbName = MESH_SPOOL_DB_NAME) {
+  constructor(dbName = MESH_SPOOL_DB_NAME, maxEntries = MESH_SPOOL_MAX_ENTRIES) {
     this.dbName = dbName;
+    this.maxEntries = maxEntries;
   }
 
   open(): Promise<void> {
@@ -67,15 +82,137 @@ export class Spool {
     return this.db;
   }
 
+  /**
+   * Insert an entry, atomically enforcing the maxEntries cap.
+   *
+   * Count + evict-oldest + put in a single readwrite transaction.
+   * On QuotaExceededError: aggressively evict 10% of maxEntries and retry once.
+   */
   put(entry: SpoolEntry): Promise<void> {
+    return this.putBounded(entry, false);
+  }
+
+  private putBounded(entry: SpoolEntry, isRetry: boolean): Promise<void> {
     return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction(MESH_SPOOL_STORE_NAME, 'readwrite');
-      const req = tx.objectStore(MESH_SPOOL_STORE_NAME).put(entry);
-      req.onsuccess = () => resolve();
+      const db = this.getDb();
+      const tx = db.transaction(MESH_SPOOL_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(MESH_SPOOL_STORE_NAME);
+
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const total = countReq.result;
+        const toEvict = total >= this.maxEntries ? total - this.maxEntries + 1 : 0;
+
+        if (toEvict === 0) {
+          const putReq = store.put(entry);
+          putReq.onsuccess = () => resolve();
+          putReq.onerror = () => reject(putReq.error);
+          return;
+        }
+
+        const index = store.index('addedAtMs');
+        const cursorReq = index.openCursor(); // ascending = oldest first
+        let evicted = 0;
+        cursorReq.onsuccess = (ev) => {
+          const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor || evicted >= toEvict) {
+            const putReq = store.put(entry);
+            putReq.onsuccess = () => {
+              emitMeshMetric('mailbox_evicted', { store: 'spool', count: String(evicted) });
+              resolve();
+            };
+            putReq.onerror = () => reject(putReq.error);
+            return;
+          }
+          cursor.delete();
+          evicted++;
+          cursor.continue();
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      };
+      countReq.onerror = () => reject(countReq.error);
+
+      tx.onerror = () => {
+        const error = tx.error;
+        if (error && error.name === 'QuotaExceededError' && !isRetry) {
+          emitMeshMetric('mailbox_quota_exceeded', { store: 'spool' });
+          this.evictAggressive(Math.max(1, Math.floor(this.maxEntries * QUOTA_EVICT_FRACTION)))
+            .then(() => this.putBounded(entry, true))
+            .then(resolve, reject);
+        } else {
+          reject(error || new Error('Spool: transaction aborted'));
+        }
+      };
+      tx.onabort = () => {
+        const error = tx.error;
+        if (error && error.name === 'QuotaExceededError' && !isRetry) {
+          emitMeshMetric('mailbox_quota_exceeded', { store: 'spool' });
+          this.evictAggressive(Math.max(1, Math.floor(this.maxEntries * QUOTA_EVICT_FRACTION)))
+            .then(() => this.putBounded(entry, true))
+            .then(resolve, reject);
+        } else {
+          reject(error || new Error('Spool: transaction aborted'));
+        }
+      };
+    });
+  }
+
+  private evictAggressive(count: number): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const db = this.getDb();
+      const tx = db.transaction(MESH_SPOOL_STORE_NAME, 'readwrite');
+      const index = tx.objectStore(MESH_SPOOL_STORE_NAME).index('addedAtMs');
+      const req = index.openCursor();
+      let deleted = 0;
+      req.onsuccess = (ev) => {
+        const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+        if (!cursor || deleted >= count) {
+          if (deleted > 0) emitMeshMetric('mailbox_evicted', { store: 'spool', count: String(deleted) });
+          resolve(deleted);
+          return;
+        }
+        cursor.delete();
+        deleted++;
+        cursor.continue();
+      };
       req.onerror = () => reject(req.error);
     });
   }
 
+  /**
+   * Return up to `limit` most-recent entries via bounded cursor walk (NOT getAll).
+   *
+   * Walks the addedAtMs index in DESCENDING order (newest first) and collects
+   * up to `limit` entries. This replaces the previous all() which used getAll()
+   * and loaded the entire store into memory (S5 fix). Default limit matches
+   * MESH_SPOOL_MAX_ENTRIES for backward compatibility, but callers SHOULD pass
+   * a smaller limit (e.g. 100) for gossip forwarding.
+   */
+  recent(limit: number = MESH_SPOOL_MAX_ENTRIES): Promise<SpoolEntry[]> {
+    if (limit < 0) throw new Error('Spool: recent limit must be >= 0');
+    return new Promise((resolve, reject) => {
+      const tx = this.getDb().transaction(MESH_SPOOL_STORE_NAME, 'readonly');
+      const index = tx.objectStore(MESH_SPOOL_STORE_NAME).index('addedAtMs');
+      const req = index.openCursor(null, 'prev'); // descending = newest first
+      const results: SpoolEntry[] = [];
+      req.onsuccess = (ev) => {
+        const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+        if (!cursor || results.length >= limit) { resolve(results); return; }
+        results.push(cursor.value as SpoolEntry);
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  /**
+   * Return ALL entries via cursor walk.
+   *
+   * @deprecated Use recent(limit) for gossip forwarding to avoid loading
+   * the entire store into memory. This method is retained for backward
+   * compatibility and tests, but should not be used in production paths
+   * where the store may be large.
+   */
   all(): Promise<SpoolEntry[]> {
     return new Promise((resolve, reject) => {
       const tx = this.getDb().transaction(MESH_SPOOL_STORE_NAME, 'readonly');
@@ -141,16 +278,8 @@ export class Spool {
 
   /**
    * Evict the OLDEST entries (lowest addedAtMs) until the store contains
-   * at most `maxEntries`. Uses the `addedAtMs` index for O(N) cursor walk.
-   *
-   * Proxy for the 50 MB cap claim in mesh-roadmap §B.3 — at expected payload
-   * sizes (1.6 KB average per bundle), 30k entries ≈ 48 MB. Exact byte
-   * accounting deferred (would require a running counter or per-row size
-   * field; entry-count is good enough for the order-of-magnitude bound).
-   *
-   * Best-effort cap: count and cursor-walk are separate IDB transactions;
-   * a concurrent put between them can leave the store at total+k after
-   * eviction (overshoot). The next sweep absorbs the residual.
+   * at most `maxEntries`. Single readwrite transaction for count + cursor-walk
+   * (eliminates the two-transaction race — W6 fix).
    *
    * Returns the number of entries deleted.
    */
@@ -158,30 +287,34 @@ export class Spool {
     if (maxEntries < 0) throw new Error('Spool: evictExcess maxEntries must be >= 0');
     const db = this.getDb();
 
-    // Count first; cheaper than walking when already under cap.
-    const total = await new Promise<number>((resolve, reject) => {
-      const tx = db.transaction(MESH_SPOOL_STORE_NAME, 'readonly');
-      const req = tx.objectStore(MESH_SPOOL_STORE_NAME).count();
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-    if (total <= maxEntries) return 0;
-
-    const toDelete = total - maxEntries;
-    let deleted = 0;
-
     return new Promise<number>((resolve, reject) => {
       const tx = db.transaction(MESH_SPOOL_STORE_NAME, 'readwrite');
-      const index = tx.objectStore(MESH_SPOOL_STORE_NAME).index('addedAtMs');
-      const req = index.openCursor(); // ascending = oldest first
-      req.onsuccess = (ev) => {
-        const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
-        if (!cursor || deleted >= toDelete) { resolve(deleted); return; }
-        cursor.delete();
-        deleted++;
-        cursor.continue();
+      const store = tx.objectStore(MESH_SPOOL_STORE_NAME);
+
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const total = countReq.result;
+        if (total <= maxEntries) { resolve(0); return; }
+
+        const toDelete = total - maxEntries;
+        let deleted = 0;
+
+        const index = store.index('addedAtMs');
+        const cursorReq = index.openCursor(); // ascending = oldest first
+        cursorReq.onsuccess = (ev) => {
+          const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor || deleted >= toDelete) {
+            if (deleted > 0) emitMeshMetric('mailbox_evicted', { store: 'spool', count: String(deleted) });
+            resolve(deleted);
+            return;
+          }
+          cursor.delete();
+          deleted++;
+          cursor.continue();
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
       };
-      req.onerror = () => reject(req.error);
+      countReq.onerror = () => reject(countReq.error);
     });
   }
 

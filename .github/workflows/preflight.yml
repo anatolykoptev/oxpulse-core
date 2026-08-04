@@ -1,0 +1,56 @@
+# Preflight gate for oxpulse-core (public repo → free ubuntu-24.04-arm).
+#
+# Runs on every PR to main and every push to main.
+# Gate: pnpm install → typecheck → vitest (all packages) → build.
+# Tests run with --no-file-parallelism (WebCrypto state isolation, see
+# transport-crypto.test.ts).
+#
+# Per ci-setup skill: public repo → ubuntu-24.04-arm (free unlimited,
+# arm64 = prod-box parity). No self-hosted runner needed.
+
+name: preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        # Do NOT pass `version` — packageManager in package.json (pnpm@10.28.2)
+        # is auto-detected by the action. Passing both is a hard error.
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test (vitest, --no-file-parallelism)
+        run: pnpm -r run test -- --run --no-file-parallelism
+        env:
+          # WebCrypto + fake-indexeddb need Node, not jsdom
+          NODE_ENV: test
+
+      - name: Build
+        run: pnpm run build
