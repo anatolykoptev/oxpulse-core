@@ -42,8 +42,8 @@ importers:
         specifier: ^0.1.0
         version: 0.1.1
       '@oxpulse/wire-codec':
-        specifier: ^0.4.1
-        version: 0.4.1
+        specifier: ^0.6.1
+        version: 0.6.1
       sframe-ratchet:
         specifier: 0.5.0
         version: 0.5.0(@noble/curves@2.2.0)(@noble/hashes@2.2.0)
@@ -192,8 +192,8 @@ packages:
     resolution: {integrity: sha512-1uPOBCs4xWZK/2x7kO8xyqqJIY/kivpJ0bPQrHwYA4zItvstV6kvpS33kWABPyUcy9o98pXdbaFXz21kSK6aTA==}
     engines: {node: '>=18'}
 
-  '@oxpulse/wire-codec@0.4.1':
-    resolution: {integrity: sha512-ApGMadfcr5Bm6YvPnTN4e2r96jXeZIVVUG8AgeyDH7R47+APvGqZJ79J6Mq+gPNbZ8ec4JYHxSmcAQXWKSCSFw==}
+  '@oxpulse/wire-codec@0.6.1':
+    resolution: {integrity: sha512-5GKPH0U+FmxoPrtWskLzT5yBgvNAaoCtx+KGQr9AOpCGC1M6Ggrtj4m0p7YjrffP3h7jn6PFV/x5uMg+VGbqVw==}
     engines: {node: '>=18'}
 
   '@pkgjs/parseargs@0.11.0':
@@ -1090,7 +1090,7 @@ snapshots:
     dependencies:
       '@noble/curves': 2.2.0
 
-  '@oxpulse/wire-codec@0.4.1':
+  '@oxpulse/wire-codec@0.6.1':
     dependencies:
       '@bokuweb/zstd-wasm': 0.0.27
       cbor-x: 1.6.4
