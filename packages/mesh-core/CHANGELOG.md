@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.4...mesh-core-v0.1.5) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** propagate handshake errors to meshState + CryptoState ([#22](https://github.com/anatolykoptev/oxpulse-core/issues/22)) ([64aa28d](https://github.com/anatolykoptev/oxpulse-core/commit/64aa28d32e56665aeac01d36babdad195d167aef))
+
 ## [0.1.4](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.3...mesh-core-v0.1.4) (2026-08-04)
 
 
