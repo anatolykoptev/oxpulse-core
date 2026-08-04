@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.7...mesh-core-v0.1.8) (2026-08-04)
+
+
+### Fixed
+
+* **mesh-core:** verdict state machine + connected-device guard for async bootstrap ([#28](https://github.com/anatolykoptev/oxpulse-core/issues/28)) ([41342b1](https://github.com/anatolykoptev/oxpulse-core/commit/41342b193f9d4c8f865d8f240c99ce6e9daaac40))
+
 ## [0.1.7](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.6...mesh-core-v0.1.7) (2026-08-04)
 
 
