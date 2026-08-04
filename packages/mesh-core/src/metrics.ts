@@ -30,7 +30,10 @@ export type MeshMetric =
   | 'mailbox_quota_exceeded'
   // B.4 router: BLE send failure in dual mode (online+ble). Strategy downgrades to 'online'.
   // label: reason — error message, max 80 chars.
-  | 'ble_send_failed';
+  | 'ble_send_failed'
+  // S3: handshake frame dropped because mesh stopped during identity bootstrap.
+  // The guard correctly prevents processing, but the drop must be observable.
+  | 'handshake_frame_dropped';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;

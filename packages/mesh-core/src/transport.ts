@@ -877,7 +877,15 @@ function handleIncomingChunk(deviceAddress: string, chunk: Uint8Array): void {
           // Guard: mesh may have stopped or device reconnected while we awaited IDB.
           // S1: also check connectedDevices — if the device disconnected while we
           // were waiting for IDB, don't create an orphaned cryptoStates entry.
-          if (!capturedOurPeerId || cryptoStates.has(deviceAddress) || !connectedDevices.has(deviceAddress)) return;
+          // S3: emit a metric when a frame is dropped so the silent loss is observable.
+          if (!capturedOurPeerId || !connectedDevices.has(deviceAddress)) {
+            emitMeshMetric('handshake_frame_dropped', { reason: capturedOurPeerId ? 'disconnected' : 'mesh-stopped' });
+            return;
+          }
+          if (cryptoStates.has(deviceAddress)) {
+            emitMeshMetric('handshake_frame_dropped', { reason: 'duplicate' });
+            return;
+          }
           const csNew: CryptoState = {
             handshake: new NoiseXxHandshake({ role, identity }),
             role,
