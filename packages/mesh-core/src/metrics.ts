@@ -21,7 +21,13 @@ export type MeshMetric =
   | 'handshake_timeout'
   // B.3 mailbox: IDB write failure during inbox.put() (router.ts fire-and-forget path).
   // label: reason — err.name (e.g. QuotaExceededError, InvalidStateError), max 80 chars.
-  | 'inbox_put_failed';
+  | 'inbox_put_failed'
+  // B.3 mailbox: entries evicted by bounded put() or evictExcess() to enforce maxEntries cap.
+  // label: store — 'inbox' | 'spool'. Value is the count evicted (emit once per eviction batch).
+  | 'mailbox_evicted'
+  // B.3 mailbox: QuotaExceededError caught during put(), triggering aggressive eviction + retry.
+  // label: store — 'inbox' | 'spool'.
+  | 'mailbox_quota_exceeded';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;
