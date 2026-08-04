@@ -17,7 +17,7 @@ import { PeerRegistry, generatePeerId } from './peer-registry.js';
 import type { Peer } from './peer-registry.js';
 import { MacRotationTimer } from './mac-rotation.js';
 import { FrameReassembler, chunkFrame, FrameType } from './frame.js';
-import { GATT_MTU_DEFAULT, HANDSHAKE_TIMEOUT_MS, TOFU_MAX_ENTRIES } from './constants.js';
+import { GATT_MTU_DEFAULT, HANDSHAKE_TIMEOUT_MS, TOFU_MAX_ENTRIES, MAX_BLE_CONNECTIONS } from './constants.js';
 import { NoiseXxHandshake, NoiseStateError } from './crypto/noise-xx.js';
 import type { NoiseSplit } from './crypto/noise-xx.js';
 import { Session } from './crypto/session.js';
@@ -310,6 +310,13 @@ export async function startMesh(): Promise<void> {
 
     // B1.1: skip if already actively connected — prevents double-connect.
     if (connectedDevices.has(deviceId)) return;
+
+    // S7: enforce BLE connection limit — Android caps at 7, iOS at 8-15.
+    // Skip new connections when at limit to avoid error 133 hangs.
+    if (connectedDevices.size >= MAX_BLE_CONNECTIONS) {
+      emitMeshMetric('ble_connection_limit_reached', { current: String(connectedDevices.size) });
+      return;
+    }
 
     // B1.1: skip if still within backoff window.
     const retryAt = backoff.get(deviceId) ?? 0;

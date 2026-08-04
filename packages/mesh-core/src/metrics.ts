@@ -33,7 +33,9 @@ export type MeshMetric =
   | 'ble_send_failed'
   // S3: handshake frame dropped because mesh stopped during identity bootstrap.
   // The guard correctly prevents processing, but the drop must be observable.
-  | 'handshake_frame_dropped';
+  | 'handshake_frame_dropped'
+  // S7: BLE connection limit reached — new connection attempt skipped.
+  | 'ble_connection_limit_reached';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;
