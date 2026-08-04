@@ -41,7 +41,11 @@ export type MeshMetric =
   | 'backoff_cleared'
   // #45: Bloom filter params (m, k) changed between sessions — existing bits
   // discarded because they cannot be re-mapped. labels: old_m, new_m, old_k, new_k.
-  | 'bloom_params_changed';
+  | 'bloom_params_changed'
+  // #46: handshakeFailures counter reset to 0 on successful handshake completion.
+  // Enforces the invariant that failures count within a single handshake attempt,
+  // not across the lifetime of a CryptoState. label: device — BLE MAC string.
+  | 'handshake_failures_reset';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;
