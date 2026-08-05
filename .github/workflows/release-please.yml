@@ -91,9 +91,42 @@ jobs:
       # updated a release PR without merging one.
       publish_paths: ${{ steps.release.outputs.paths_released }}
     steps:
+      # ── Release identity ────────────────────────────────────────────────
+      # Fleet standard: releases are opened by the krolik-release-bot GitHub
+      # App (App 4335933), not the built-in GITHUB_TOKEN.
+      #
+      # The concrete reason, not just consistency: GitHub suppresses workflow
+      # runs on a pull request opened by GITHUB_TOKEN, to prevent recursion.
+      # Every release PR here therefore sat at mergeStateStatus UNSTABLE with
+      # its preflight run parked in `action_required`, and was merged either on
+      # a hand-approved run or on nothing at all — #61, #64, #67, #70 and #74
+      # all needed a manual `POST /actions/runs/{id}/approve`. A feature PR was
+      # gated; the release PR that publishes to npm was not. An App-opened PR
+      # gets CI runs normally, so preflight.yml actually gates the artifact
+      # that ships.
+      #
+      # No trigger loop: this workflow never pushes to `main`. release-please
+      # pushes the version bump to the side branch
+      # `release-please--branches--main--components--<pkg>` and opens a PR from
+      # it — a side-branch push cannot match `branches: [main]`. The only push
+      # to main in the cycle is a human merging the release PR.
+      #
+      # Credentials are the repo variable RELEASE_BOT_APP_ID and the secret
+      # RELEASE_BOT_PRIVATE_KEY. The action masks the minted token and revokes
+      # it when the job ends. The npm publish path is untouched by this — it
+      # authenticates with OIDC and never sees a GitHub token.
+      - name: Mint krolik-release-bot token
+        # SHA-pinned. v2.2.2
+        id: bot-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v5
         id: release
         with:
+          token: ${{ steps.bot-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
