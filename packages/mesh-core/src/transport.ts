@@ -669,21 +669,38 @@ export function rejectPeer(peerIdHex: string): void {
  */
 export async function sendFrame(peerIdHex: string, frame: Uint8Array): Promise<void> {
   const peer = registry.list().find((p) => p.idHex === peerIdHex);
-  if (!peer) throw new Error(`sendFrame: unknown peer ${peerIdHex}`);
+
+  // Resolve the BLE device address for this peer. The registry covers peers we
+  // scanned outbound; an inbound-only peer (#80) has no registry entry, and #80
+  // deliberately does not fabricate one — the registry feeds meshState.peers,
+  // which router.ts reads to route frames, and we do not know an inbound-only
+  // peer's advertised 8-byte peer ID, so a fake entry would misroute. Such a
+  // peer can still complete a handshake and be accepted, so sendFrame falls back
+  // to the CryptoState, which is keyed by device address and already holds
+  // everything the send path needs. This does NOT add the peer to the registry,
+  // so the router cannot pick an inbound-only peer as a routing next-hop on the
+  // basis of a MAC-shaped identifier (#82).
+  let deviceId: string | undefined = peer?.mac;
+  if (!deviceId) {
+    for (const [addr, csEntry] of cryptoStates) {
+      if (csEntry.peerIdHex === peerIdHex) { deviceId = addr; break; }
+    }
+  }
+  if (!deviceId) throw new Error(`sendFrame: unknown peer ${peerIdHex}`);
 
   // Find crypto state for this peer.
-  const cs = cryptoStates.get(peer.mac);
+  const cs = cryptoStates.get(deviceId);
   if (!cs || cs.verdict !== 'accepted' || !cs.session) {
     throw new Error(`sendFrame: unknown-peer-key — handshake not complete or not accepted for ${peerIdHex}`);
   }
 
-  const mtu = mtuCache.get(peer.mac) ?? GATT_MTU_DEFAULT;
+  const mtu = mtuCache.get(deviceId) ?? GATT_MTU_DEFAULT;
   const ciphertext = await cs.session.encrypt(frame);
   const chunks = chunkFrame(ciphertext, mtu, FrameType.SessionData);
 
   // Serialize writes per peer to avoid ATT queue overflow.
   for (const chunk of chunks) {
-    await writeRx(peer.mac, chunk);
+    await writeRx(deviceId, chunk);
   }
 }
 
