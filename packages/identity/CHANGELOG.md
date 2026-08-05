@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.5...identity-v0.2.0) (2026-08-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **identity:** `DeviceIdentity.privateKeyBytes` is renamed to `privateKeySeed` and its type changes from `Uint8Array | null` to `OpaquePrivateKey | null`. Callers read the seed with `.bytes()`. The old name was kept in an earlier revision of this branch and dropped: the field stopped being bytes, `privateKeyBytes.bytes()` reads like a mistake, and renaming later would cost consumers a second breaking release for the same field. The plan specified renaming to `privateKey`, which is not possible — that name is already the WebCrypto `CryptoKey` handle on the same interface.
+
+### Added
+
+* **identity:** non-extractable KEK, separate KEK store, shared AES-KW, OpaquePrivateKey ([#104](https://github.com/anatolykoptev/oxpulse-core/issues/104)) ([da81475](https://github.com/anatolykoptev/oxpulse-core/commit/da81475f4771edcc9b7fd9723020790ea6b6fbc1))
+
 ## [0.1.5](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.4...identity-v0.1.5) (2026-08-05)
 
 
