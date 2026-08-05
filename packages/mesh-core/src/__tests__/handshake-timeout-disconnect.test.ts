@@ -84,6 +84,7 @@ vi.mock('@oxpulse/identity', async () => {
 
 import { startMesh, stopMesh, meshState, _resetTofuStore } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 const PEER_ID_BYTES = new Uint8Array(8).fill(0x77);
 const PEER_DEVICE_ID = 'peer-aa:bb:cc';
@@ -96,10 +97,14 @@ function fakeSighting() {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise(r => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// Replaces the fixed wall-clock `drain()`. The disconnect handler is
+// synchronous; initiateHandshake is async (writes msg-1). We wait on the
+// observable (msg-1 sent) rather than a fixed wall-clock sleep.
+
+/** Wait for the initiator to send msg-1 (initiateHandshake ran). */
+async function awaitMsg1Sent(): Promise<void> {
+  await waitFor(() => writeRxSpy.mock.calls.length > 0, 'transport to send msg-1 (initiateHandshake)');
 }
 
 describe('S2: handshake timeout vs disconnect race (issue #11)', () => {
@@ -122,11 +127,11 @@ describe('S2: handshake timeout vs disconnect race (issue #11)', () => {
     try {
       await startMesh();
       scanCbRef.current?.(fakeSighting());
-      await drain(120);
+      await awaitMsg1Sent();
 
       // Simulate disconnect via connection listener.
       connListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, connected: false });
-      await drain(20);
+      await flushMicrotasks();
 
       // Wait for the timeout interval to fire (5s tick — but we can't wait that long).
       // Instead, verify that the disconnect cleaned up connectedDevices.
@@ -143,15 +148,19 @@ describe('S2: handshake timeout vs disconnect race (issue #11)', () => {
   it('M2: disconnect then reconnect does not carry stale timeout state', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     // Disconnect.
     connListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, connected: false });
-    await drain(20);
+    await flushMicrotasks();
 
-    // Reconnect — should not inherit old timeout state.
+    // Reconnect — should not inherit old timeout state. writeRxSpy is cleared
+    // by the disconnect path? No — mockClear is in beforeEach. After reconnect
+    // a new initiateHandshake runs; wait for its msg-1 so we assert on settled
+    // state, not on a coincidentally-null error before the handshake starts.
+    writeRxSpy.mockClear();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     // meshState.error should NOT be 'handshake-failed' from a stale timeout.
     expect(meshState.error).not.toBe('handshake-failed');

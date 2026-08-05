@@ -106,6 +106,7 @@ vi.mock('@oxpulse/identity', async () => {
 
 import { startMesh, stopMesh, meshState, getPendingHandshakes, _resetTofuStore } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 // ── Test constants ─────────────────────────────────────────────────────────
 const TEST_MTU = 247;
@@ -122,10 +123,23 @@ function fakeSighting() {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise(r => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// Replaces the fixed wall-clock `drain()` that asserted on unsettled handshake
+// state under load. Each wait targets the observable the next assertion reads.
+
+/** Wait for the initiator to send msg-1 (initiateHandshake ran). */
+async function awaitMsg1Sent(): Promise<void> {
+  await waitFor(() => writeRxSpy.mock.calls.length > 0, 'transport to send msg-1 (initiateHandshake)');
+}
+
+/** Wait for meshState.error to be set to 'handshake-failed' (failHandshake ran). */
+async function awaitHandshakeFailed(): Promise<void> {
+  await waitFor(() => meshState.error === 'handshake-failed', 'meshState.error to become handshake-failed');
+}
+
+/** Wait for the initiator handshake to complete: msg-3 sent + SAS available. */
+async function awaitHandshakeComplete(): Promise<void> {
+  await waitFor(() => getPendingHandshakes().length > 0, 'initiator handshake to complete (msg-3 sent, SAS available)');
 }
 
 // ── Test suite ─────────────────────────────────────────────────────────────
@@ -166,7 +180,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeFailed();
 
     // M1: if failHandshake is not called, meshState.error stays null.
     // M5: if meshState.error = 'handshake-failed' is removed, error stays null.
@@ -179,7 +193,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeFailed();
 
     const failedMetrics = metrics.filter((m) => m.metric === 'handshake_failed');
     expect(failedMetrics.length).toBeGreaterThanOrEqual(1);
@@ -192,7 +206,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeFailed();
 
     // The peer should NOT appear in getPendingHandshakes (verdict != 'pending').
     const pending = getPendingHandshakes();
@@ -212,7 +226,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     // Collect msg-1, feed to peer, get msg-2.
     const r1 = new FrameReassembler();
@@ -234,7 +248,9 @@ describe('B3: handshake error propagation (issue #7)', () => {
     for (const c of chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2)) {
       txNotifyCb.current?.(c);
     }
-    await drain(120);
+    // msg-3 writeRx failure path sets meshState.error without firing a
+    // handshake state-change event, so this waits by polling the error.
+    await awaitHandshakeFailed();
 
     // M1+M5: error must be set, not swallowed.
     expect(meshState.error).toBe('handshake-failed');
@@ -250,7 +266,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     // Complete the full handshake (msg-1 → msg-2 → msg-3).
     const r1 = new FrameReassembler();
@@ -267,7 +283,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
     for (const c of chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2)) {
       txNotifyCb.current?.(c);
     }
-    await drain(120);
+    await awaitHandshakeComplete();
 
     // Collect msg-3, feed to peer.
     const r2 = new FrameReassembler();
@@ -279,7 +295,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
       if (res && res.frameType === FrameType.HandshakeMsg3) { peerMsgOut = res.payload; }
     }
     if (peerMsgOut) await peerHs.readMessage(peerMsgOut);
-    await drain(60);
+    await flushMicrotasks();
 
     // Happy path: error must NOT be 'handshake-failed'.
     expect(meshState.error).not.toBe('handshake-failed');
@@ -294,7 +310,7 @@ describe('B3: handshake error propagation (issue #7)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeFailed();
 
     const failedMetrics = metrics.filter((m) => m.metric === 'handshake_failed');
     // Should emit exactly 1 metric (not 2 or more).

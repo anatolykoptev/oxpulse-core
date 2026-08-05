@@ -90,6 +90,7 @@ vi.mock('@oxpulse/identity', async () => {
 
 import { startMesh, stopMesh, meshState, _getBackoffSize, _getBackoffCountsSize, _resetTofuStore } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 const PEER_ID_BYTES = new Uint8Array(8).fill(0x77);
 
@@ -101,10 +102,18 @@ function fakeSighting(deviceId: string) {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise(r => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// Replaces the fixed wall-clock `drain()`. Only Date is faked (setTimeout and
+// performance stay real), so waitFor's polling + real-timer fallback works.
+// The connect-failure → backoff-arming chain is microtask-based; the disconnect
+// handler (clearBackoff) is synchronous.
+
+/** Wait for backoff and backoffCounts Maps to reach the given sizes. */
+async function awaitBackoff(backoff: number, counts: number): Promise<void> {
+  await waitFor(
+    () => _getBackoffSize() === backoff && _getBackoffCountsSize() === counts,
+    `backoff size=${backoff}, backoffCounts size=${counts}`,
+  );
 }
 
 describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survives)', () => {
@@ -138,16 +147,17 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
 
       scanCbRef.current?.(fakeSighting('dev-01'));
       scanCbRef.current?.(fakeSighting('dev-02'));
-      await drain(40);
+      await awaitBackoff(2, 2);
 
       expect(_getBackoffSize()).toBe(2);
       expect(_getBackoffCountsSize()).toBe(2);
 
       // Disconnect while windows are still armed (~0ms of 5s elapsed) —
       // F1: the armed windows MUST survive (no hot reconnect loop).
+      // The disconnect handler (clearBackoff) is synchronous.
       connListenerCb.current?.({ deviceAddress: 'dev-01', connected: false });
       connListenerCb.current?.({ deviceAddress: 'dev-02', connected: false });
-      await drain(20);
+      await flushMicrotasks();
 
       expect(_getBackoffSize(), 'armed backoff window was wiped by disconnect').toBe(2);
       expect(_getBackoffCountsSize(), 'armed backoffCounts was wiped by disconnect').toBe(2);
@@ -161,7 +171,7 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
       // Disconnect again — expired entries are cleared (#44 memory-leak fix).
       connListenerCb.current?.({ deviceAddress: 'dev-01', connected: false });
       connListenerCb.current?.({ deviceAddress: 'dev-02', connected: false });
-      await drain(20);
+      await awaitBackoff(0, 0);
 
       expect(_getBackoffSize()).toBe(0);
       expect(_getBackoffCountsSize()).toBe(0);
@@ -179,8 +189,10 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
       await startMesh();
 
       // Disconnect a device that never had backoff entries.
+      // The disconnect handler is synchronous; flush microtasks to let any
+      // pending work from startMesh quiesce before asserting.
       connListenerCb.current?.({ deviceAddress: 'dev-never-failed', connected: false });
-      await drain(10);
+      await flushMicrotasks();
 
       const cleared = metrics.filter(m => m.metric === 'backoff_cleared');
       expect(cleared).toHaveLength(0);
@@ -199,7 +211,7 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
       await startMesh();
 
       scanCbRef.current?.(fakeSighting('dev-cb'));
-      await drain(40);
+      await awaitBackoff(1, 1);
 
       expect(_getBackoffSize()).toBe(1);
       expect(_getBackoffCountsSize()).toBe(1);
@@ -207,7 +219,7 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
       // Disconnect via the connection-state listener (handler #2 path, same
       // clearBackoff call). Window still armed -> MUST survive.
       connListenerCb.current?.({ deviceAddress: 'dev-cb', connected: false });
-      await drain(20);
+      await flushMicrotasks();
 
       expect(_getBackoffSize(), 'armed backoff window was wiped by disconnect').toBe(1);
       expect(_getBackoffCountsSize()).toBe(1);
@@ -216,7 +228,7 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
       // Advance past the 5s window -> expired -> cleared on next disconnect.
       vi.setSystemTime(new Date(6_000));
       connListenerCb.current?.({ deviceAddress: 'dev-cb', connected: false });
-      await drain(20);
+      await awaitBackoff(0, 0);
 
       expect(_getBackoffSize()).toBe(0);
       expect(_getBackoffCountsSize()).toBe(0);
