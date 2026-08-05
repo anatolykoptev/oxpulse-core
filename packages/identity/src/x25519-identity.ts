@@ -106,7 +106,7 @@ export async function getOrCreateX25519Identity(
 	signedBytes.set(PKBIND_PREFIX, 0);
 	signedBytes.set(kp.publicKey, PKBIND_PREFIX.length);
 
-	const selfSig = ed25519.sign(signedBytes, identity.privateKeyBytes);
+	const selfSig = ed25519.sign(signedBytes, identity.privateKeyBytes.bytes());
 
 	const x25519Id: X25519Identity = {
 		priv: kp.secretKey,

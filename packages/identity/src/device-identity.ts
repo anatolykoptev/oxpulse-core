@@ -25,6 +25,7 @@ import { createIdbStore, IDBUnavailableError } from './idb-store.js';
 import { toArrayBuffer } from './crypto-utils.js';
 import { toBase64url, fromBase64url } from './base64url.js';
 import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw } from './aes-kw.js';
+import { OpaquePrivateKey } from './opaque-private-key.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
 // Structure: SEQUENCE { version=0, AlgorithmIdentifier { OID 1.3.101.112 }, OCTET STRING { OCTET STRING { seed } } }
@@ -83,21 +84,24 @@ export interface DeviceIdentity {
 	 */
 	privateKey: CryptoKey | null;
 	/**
-	 * 32-byte raw Ed25519 private key seed. For @noble/curves sign() usage.
-	 * null for pre-W7-P2b1 identities that lack the raw-bytes IDB entry.
-	 * Callers MUST check for null and show migration banner + disable sealed send.
-	 * DO NOT use zero-byte sentinel — noble/curves signs known-key deterministically.
+	 * Opaque wrapper around the 32-byte raw Ed25519 private key seed.
+	 * For @noble/curves sign() usage — callers use `.bytes()` to obtain the
+	 * raw 32-byte seed. null for pre-W7-P2b1 identities that lack the
+	 * raw-bytes IDB entry. Callers MUST check for null and show migration
+	 * banner + disable sealed send. DO NOT use zero-byte sentinel —
+	 * noble/curves signs known-key deterministically.
 	 *
-	 * SECURITY NOTE — raw seed resident in JS heap (accepted limitation):
-	 * @noble/curves requires the raw 32-byte seed to be present in memory for
-	 * Ed25519 signing. Unlike the non-extractable WebCrypto CryptoKey (which
-	 * shields the key material from JS access), this raw Uint8Array is GC-tracked
-	 * but cannot be explicitly zeroed in JS (no zeroize equivalent). The risk is
-	 * accepted per operator decision #10 (W7-P2b1 plan): signing happens at send
-	 * time and the key does not leave the tab or get serialised. HyperOS/HarmonyOS
-	 * support (the original motivation) requires noble, so this tradeoff is load-bearing.
+	 * SECURITY NOTE — OpaquePrivateKey hardening (ADR-5):
+	 * The raw seed is wrapped in OpaquePrivateKey to prevent accidental
+	 * exfiltration through logging (toString redacts, toJSON throws,
+	 * util.inspect redacts). `.bytes()` returns a fresh copy on every call
+	 * so callers cannot retain an alias. The raw bytes remain resident in
+	 * the JS heap and cannot be explicitly zeroed (no zeroize equivalent) —
+	 * the wrapper stops *accidental* exfiltration, not a determined in-process
+	 * attacker. @noble/curves requires the raw seed for Ed25519 signing;
+	 * HyperOS/HarmonyOS support requires noble, so this tradeoff is load-bearing.
 	 */
-	privateKeyBytes: Uint8Array | null;
+	privateKeyBytes: OpaquePrivateKey | null;
 }
 
 interface StoredIdentity {
@@ -384,7 +388,7 @@ export async function generateDeviceIdentity(): Promise<DeviceIdentity> {
 		publicKeyB64,
 		publicKey,
 		privateKey,
-		privateKeyBytes,
+		privateKeyBytes: new OpaquePrivateKey(privateKeyBytes),
 	};
 }
 
@@ -414,7 +418,7 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 	// best-effort. Wire format changed from the old inline AES-256-import trick;
 	// old entries still unwrap correctly because AES-KW ciphertext is
 	// independent of the wrapped key's declared algorithm.
-	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, identity.privateKeyBytes);
+	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, identity.privateKeyBytes.bytes());
 	await idb.save(DEVICE_PRIV_RAW_NAME, wrappedRawSeed);
 
 	// PKCS8 wrap path: only possible when WebCrypto Ed25519 is available (non-null
@@ -542,7 +546,7 @@ async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
 		// trick) and new entries (wrapped with wrapSecretBytes) — AES-KW
 		// ciphertext is independent of the wrapped key's declared algorithm.
 		const privateKeyBytes = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
-		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeyBytes };
+		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeyBytes: new OpaquePrivateKey(privateKeyBytes) };
 	} else {
 		// Pre-W7-P2b1 identity: raw seed unavailable.
 		// Return null so callers can show migration banner + disable sealed send.
@@ -583,7 +587,7 @@ export async function signWithDeviceIdentity(
 		throw new Error('[identity] signWithDeviceIdentity: privateKeyBytes is null — identity migration required');
 	}
 	const msg = new TextEncoder().encode(message);
-	const sig = nobleEd25519.sign(msg, identity.privateKeyBytes);
+	const sig = nobleEd25519.sign(msg, identity.privateKeyBytes.bytes());
 	return toBase64url(sig);
 }
 

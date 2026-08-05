@@ -12,6 +12,7 @@ import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { ed25519 as nobleEd25519 } from '@noble/curves/ed25519.js';
 import { toBase64url } from '../base64url.js';
+import { OpaquePrivateKey } from '../opaque-private-key.js';
 
 type DeviceIdentityModule = typeof import('../device-identity.js');
 
@@ -49,16 +50,18 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
 		expect(id.privateKeyBytes).not.toBeNull();
-		// must be a 32-byte Uint8Array (raw Ed25519 seed)
-		expect(id.privateKeyBytes).toBeInstanceOf(Uint8Array);
-		expect((id.privateKeyBytes as Uint8Array).byteLength).toBe(32);
+		// Duck-type: vi.resetModules() creates a fresh OpaquePrivateKey class,
+		// so toBeInstanceOf would fail on class identity. Check .bytes() instead.
+		expect(typeof id.privateKeyBytes?.bytes).toBe('function');
+		expect(id.privateKeyBytes!.bytes()).toBeInstanceOf(Uint8Array);
+		expect(id.privateKeyBytes!.bytes().byteLength).toBe(32);
 	});
 
 	it('new identity privateKeyBytes is NOT all-zero sentinel', async () => {
 		if (!ed25519Supported) return;
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
-		const bytes = id.privateKeyBytes as Uint8Array;
+		const bytes = id.privateKeyBytes!.bytes();
 		const allZero = bytes.every((b) => b === 0);
 		expect(allZero).toBe(false);
 	});
@@ -96,16 +99,18 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 		expect(id.privateKeyBytes).toBeNull();
 	});
 
-	it('DeviceIdentity type: privateKeyBytes is Uint8Array | null', async () => {
+	it('DeviceIdentity type: privateKeyBytes is OpaquePrivateKey | null', async () => {
 		// Type-level check: the compile-time type must allow null.
 		// If this test compiles, the type is correct; if privateKeyBytes is
-		// typed as Uint8Array (non-nullable), this assignment would error.
+		// typed as OpaquePrivateKey (non-nullable), this assignment would error.
 		if (!ed25519Supported) return;
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
-		// Accept both null and Uint8Array without TS error:
-		const bytes: Uint8Array | null = id.privateKeyBytes;
-		expect(bytes === null || bytes instanceof Uint8Array).toBe(true);
+		// Accept both null and OpaquePrivateKey without TS error:
+		const bytes: OpaquePrivateKey | null = id.privateKeyBytes;
+		// Duck-type: vi.resetModules() creates a fresh class, so instanceof
+		// would fail on class identity. Check .bytes() method presence instead.
+		expect(bytes === null || typeof bytes?.bytes === 'function').toBe(true);
 	});
 });
 
@@ -278,15 +283,15 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 		try {
 			const first = await freshImport();
 			const a = await first.getOrCreateDeviceIdentity();
-			expect(a.privateKeyBytes).toBeInstanceOf(Uint8Array);
-			expect(a.privateKeyBytes!.byteLength).toBe(32);
+			expect(typeof a.privateKeyBytes?.bytes).toBe('function');
+			expect(a.privateKeyBytes!.bytes().byteLength).toBe(32);
 
 			// Simulate reload: fresh import (probe cache reset, structuredClone still mocked).
 			const second = await freshImport();
 			const b = await second.getOrCreateDeviceIdentity();
 
 			expect(b.publicKeyB64).toBe(a.publicKeyB64);
-			expect(Array.from(b.privateKeyBytes!)).toEqual(Array.from(a.privateKeyBytes!));
+			expect(Array.from(b.privateKeyBytes!.bytes())).toEqual(Array.from(a.privateKeyBytes!.bytes()));
 		} finally {
 			(globalThis as { structuredClone: typeof structuredClone }).structuredClone = originalSC;
 		}
@@ -344,6 +349,6 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 		const b = await second.getOrCreateDeviceIdentity();
 
 		expect(b.publicKeyB64).toBe(a.publicKeyB64);
-		expect(Array.from(b.privateKeyBytes!)).toEqual(Array.from(a.privateKeyBytes!));
+		expect(Array.from(b.privateKeyBytes!.bytes())).toEqual(Array.from(a.privateKeyBytes!.bytes()));
 	});
 });

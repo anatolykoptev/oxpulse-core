@@ -135,7 +135,8 @@ describe('no_webcrypto_ed25519_still_creates_identity', () => {
 		const identity = await mod.getOrCreateDeviceIdentity();
 		expect(identity.publicKeyB64).toMatch(/^[A-Za-z0-9_-]+$/);
 		expect(identity.privateKeyBytes).not.toBeNull();
-		expect(identity.privateKeyBytes!.byteLength).toBe(32);
+		expect(typeof identity.privateKeyBytes?.bytes).toBe('function');
+		expect(identity.privateKeyBytes!.bytes().byteLength).toBe(32);
 
 		// Must NOT classify as ed25519_unsupported (the error we're fixing)
 		// i.e., no error thrown at all

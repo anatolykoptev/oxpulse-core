@@ -57,6 +57,10 @@ export {
 	type X25519Identity,
 } from './x25519-identity.js';
 
+// OpaquePrivateKey — wrapper that prevents accidental exfiltration of raw
+// secret bytes through logging/serialization (ADR-5).
+export { OpaquePrivateKey } from './opaque-private-key.js';
+
 // base64url helpers (canonical, single copy across workspace)
 export { toBase64url, fromBase64url } from './base64url.js';
 

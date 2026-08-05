@@ -747,7 +747,7 @@ async function getLocalIdentity(): Promise<import('./crypto/noise-xx.js').NoiseX
       if (!identity.privateKeyBytes) {
         throw new Error('[identity] Noise XX sign: privateKeyBytes null — identity migration required');
       }
-      return nobleEd25519.sign(msg, identity.privateKeyBytes);
+      return nobleEd25519.sign(msg, identity.privateKeyBytes.bytes());
     },
     async getX25519PublicKey() { return x25519Kp.publicKey; },
     async dhX25519(remotePub: Uint8Array) { return identityDhX25519(remotePub); },

@@ -104,6 +104,7 @@ vi.mock('@capacitor-community/bluetooth-le', () => ({
 }));
 
 vi.mock('@oxpulse/identity', async () => {
+  const { OpaquePrivateKey } = await import('../../../identity/src/opaque-private-key.js');
   const { ed25519: ed, x25519: x } = await import('@noble/curves/ed25519.js');
   const edSk = ed.utils.randomSecretKey();
   const edPk = ed.getPublicKey(edSk);
@@ -122,7 +123,7 @@ vi.mock('@oxpulse/identity', async () => {
         publicKeyB64: b64pk,
         publicKey: {} as CryptoKey,
         privateKey: {} as CryptoKey,
-        privateKeyBytes: edSk,
+        privateKeyBytes: new OpaquePrivateKey(edSk),
       };
     }),
     getOrCreateX25519Keypair: vi.fn(async () => ({ publicKey: xPk, privateKey: {} as CryptoKey, privateKeyBytes: xSk })),

@@ -21,6 +21,7 @@ import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ed25519, x25519 } from '@noble/curves/ed25519.js';
+import { OpaquePrivateKey } from '../opaque-private-key.js';
 
 // ── MAJOR: getOrCreateX25519Identity rejects pre-W7-P2b1 identity ────────────
 //
@@ -70,7 +71,7 @@ describe('MAJOR: getOrCreateX25519Identity contract for migration gate', () => {
 			publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
 			publicKey: null,
 			privateKey: null,
-			privateKeyBytes: seed, // <-- W7-P2b1+: raw 32-byte seed available
+			privateKeyBytes: new OpaquePrivateKey(seed), // <-- W7-P2b1+: raw 32-byte seed available
 		} as Parameters<typeof getOrCreateX25519Identity>[0];
 
 		const kp = await getOrCreateX25519Identity(mockPostMigrationIdentity);
