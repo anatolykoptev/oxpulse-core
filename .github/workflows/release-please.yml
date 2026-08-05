@@ -73,7 +73,20 @@ name: release-please
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+  # Manual recovery path. A publish can fail AFTER release-please has already
+  # created the tag and GitHub Release — that happened on mesh-core 0.1.15, whose
+  # publish was rejected 422 for missing `repository.url`. Without this input the
+  # only way forward would be to burn a fresh version number, permanently leaving
+  # a tag with no registry artifact. Instead: fix the cause, then re-publish the
+  # SAME version from a tree whose package.json still carries it.
+  workflow_dispatch:
+    inputs:
+      publish_path:
+        description: >-
+          Re-publish this package path (e.g. packages/mesh-core) without cutting a
+          new version. Leave blank to only run release-please.
+        required: false
+        default: ''
 
 # Least privilege by default; each job grants only what it needs.
 permissions: {}
@@ -86,10 +99,10 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      # JSON array of the package paths released this run, e.g.
-      # ["packages/mesh-core"]. Empty ("[]") on a run that only opened or
-      # updated a release PR without merging one.
-      paths_released: ${{ steps.release.outputs.paths_released }}
+      # JSON array of package paths to publish this run — either what
+      # release-please just released, or the single path a manual re-publish
+      # named. Empty ("[]") on a run that only opened or updated a release PR.
+      publish_paths: ${{ steps.targets.outputs.paths }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
@@ -97,13 +110,34 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      - name: Decide what to publish
+        id: targets
+        env:
+          # JSON array, e.g. ["packages/mesh-core"], or empty on a non-release run.
+          RELEASED: ${{ steps.release.outputs.paths_released }}
+          MANUAL: ${{ inputs.publish_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$MANUAL" ]; then
+            # Fail closed on a typo rather than starting a job that cannot work.
+            if [ ! -f "$MANUAL/package.json" ]; then
+              echo "::error::publish_path '$MANUAL' has no package.json"
+              exit 1
+            fi
+            echo "manual re-publish: $MANUAL"
+            printf 'paths=["%s"]\n' "$MANUAL" >> "$GITHUB_OUTPUT"
+          else
+            echo "release-please released: ${RELEASED:-[]}"
+            echo "paths=${RELEASED:-[]}" >> "$GITHUB_OUTPUT"
+          fi
+
   publish:
     name: Publish ${{ matrix.path }}
     needs: release-please
     # Gate: only when a release was actually cut this run. Without this the job
     # would run on every push to main and try to republish an existing version.
-    if: needs.release-please.outputs.paths_released != ''
-      && needs.release-please.outputs.paths_released != '[]'
+    if: needs.release-please.outputs.publish_paths != ''
+      && needs.release-please.outputs.publish_paths != '[]'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
@@ -115,7 +149,7 @@ jobs:
       # pair that is harder to reason about than two independent failures.
       fail-fast: false
       matrix:
-        path: ${{ fromJson(needs.release-please.outputs.paths_released) }}
+        path: ${{ fromJson(needs.release-please.outputs.publish_paths) }}
 
     steps:
       - uses: actions/checkout@v7
