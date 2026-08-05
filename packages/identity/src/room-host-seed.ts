@@ -74,10 +74,12 @@ async function probeStructuredClone(): Promise<boolean> {
  * the raw bytes are persisted (extractable during the bootstrap window only)
  * and re-imported as non-extractable on load.
  *
- * One-shot copy-only migration: if the KEK entry exists as legacy raw bytes
- * (ArrayBuffer — the pre-Phase-5 storage form), it is imported as
- * non-extractable and persisted as a CryptoKey. The seed entry is never
- * touched by the migration.
+ * There is NO migration and no re-persist. This store did once hold raw bytes
+ * only — its first version had no CryptoKey branch at all — so the legacy
+ * ArrayBuffer form is real history here in a way it never was for
+ * device-identity. classifyKekEntry routes it to the raw branch, which reads
+ * it correctly and leaves it as it is. An entry of any OTHER shape is a hard
+ * error, not something to repair in place.
  */
 async function getWrappingKey(): Promise<CryptoKey> {
 	if (cachedWrappingKey) return cachedWrappingKey;
@@ -110,8 +112,8 @@ async function getWrappingKey(): Promise<CryptoKey> {
 	// Fresh generation: no KEK yet. Generate non-extractable and persist as a
 	// CryptoKey when structured-clone is supported; otherwise persist raw bytes
 	// (extractable during the bootstrap window only) and re-import non-extractable.
-	const kek = await generateAesKwKey(false);
 	if (canClone) {
+		const kek = await generateAesKwKey(false);
 		await idb.save(WRAPPING_KEY, kek);
 		cachedWrappingKey = kek;
 	} else {

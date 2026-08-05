@@ -143,8 +143,18 @@ export type KekEntry =
  *     Keying off it routes real KEK bytes into the CryptoKey branch and makes a
  *     READABLE key undecryptable — strictly worse than the bug it replaced.
  *
- * `Object.prototype.toString` and `ArrayBuffer.isView` are internal-slot brand
- * checks, so both are realm-safe. The CryptoKey side is validated POSITIVELY
+ * `ArrayBuffer.isView` IS an internal-slot brand check. `Object.prototype.toString`
+ * is not — for an ArrayBuffer it resolves through
+ * `ArrayBuffer.prototype[Symbol.toStringTag]`, so a value with its prototype
+ * replaced reports `[object Object]`, and a plain object carrying that symbol
+ * would classify as raw. What it IS, and all this code needs, is realm-STABLE:
+ * every realm's `ArrayBuffer.prototype` carries the same tag string. The spoof is
+ * unreachable on this path — structured serialization copies own string-keyed
+ * properties only, so a `Symbol.toStringTag` never survives the trip through
+ * IndexedDB (measured: 0 symbols after round-trip). Do not reuse this helper on
+ * input that did NOT come through structured clone.
+ *
+ * The CryptoKey side is validated POSITIVELY
  * rather than inferred by elimination: an entry of an unexpected shape must not
  * become the process-lifetime `cachedWrappingKey`, and it should fail at the KEK
  * layer with a name that says so instead of surfacing later as `unwrap_failed`.
@@ -162,7 +172,7 @@ export function classifyKekEntry(existing: unknown): KekEntry | null {
 		key !== null &&
 		key.type === 'secret' &&
 		key.algorithm?.name === 'AES-KW' &&
-		key.extractable === false
+		key.extractable !== true
 	) {
 		return { kind: 'key', key };
 	}
