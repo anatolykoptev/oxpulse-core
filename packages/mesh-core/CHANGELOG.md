@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.15](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.14...mesh-core-v0.1.15) (2026-08-05)
+
+
+### Fixed
+
+* **mesh-core:** restore exponential backoff + unblock the inbound responder handshake ([#56](https://github.com/anatolykoptev/oxpulse-core/issues/56)) ([d971248](https://github.com/anatolykoptev/oxpulse-core/commit/d9712489e64f4862c1258bdf8fc84bd9d5bc79d6))
+
+
+### Changed
+
+* **mesh-core:** delete the two remaining uncalled evictExcess copies ([#57](https://github.com/anatolykoptev/oxpulse-core/issues/57)) ([15f8c95](https://github.com/anatolykoptev/oxpulse-core/commit/15f8c952c24722c42690801fab5de0e367d0b712))
+
+
+### Documentation
+
+* rewrite both package READMEs for their npm pages ([#63](https://github.com/anatolykoptev/oxpulse-core/issues/63)) ([72a479e](https://github.com/anatolykoptev/oxpulse-core/commit/72a479ea2d6ccf12f968c34adde52f418ab097c2))
+
 ## [0.1.14](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.13...mesh-core-v0.1.14) (2026-08-04)
 
 
