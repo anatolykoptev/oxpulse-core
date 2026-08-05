@@ -24,7 +24,7 @@ import { emit as track } from './tracker-shim.js';
 import { createIdbStore, IDBUnavailableError } from './idb-store.js';
 import { toArrayBuffer } from './crypto-utils.js';
 import { toBase64url, fromBase64url } from './base64url.js';
-import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw } from './aes-kw.js';
+import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw, classifyKekEntry } from './aes-kw.js';
 import { OpaquePrivateKey } from './opaque-private-key.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
@@ -181,22 +181,35 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	// a brand-new device.
 	const existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
 	if (existing) {
-		if (canClone && existing instanceof CryptoKey) {
-			// Persisted as a non-extractable CryptoKey — use directly.
-			cachedWrappingKey = existing;
-		} else {
-			// Persisted as raw bytes (fallback path) — re-import non-extractable.
-			cachedWrappingKey = await importAesKwRaw(existing as ArrayBuffer, false);
+		// Shape classification is realm-safe and shared with room-host-seed — see
+		// classifyKekEntry for why neither `instanceof CryptoKey` (#108) nor
+		// `instanceof ArrayBuffer` can be used here.
+		//
+		// `canClone` deliberately plays no part: it measures what THIS runtime can
+		// WRITE, and this branch reads what a PREVIOUS session wrote.
+		const entry = classifyKekEntry(existing);
+		if (!entry) {
+			throw new Error(
+				'[device-identity] KEK entry is neither an AES-KW CryptoKey nor raw bytes',
+			);
 		}
+		cachedWrappingKey =
+			entry.kind === 'raw'
+				// Persisted as raw bytes (fallback path) — re-import non-extractable.
+				? await importAesKwRaw(entry.bytes, false)
+				// Persisted as a non-extractable CryptoKey — use directly.
+				: entry.key;
 		return cachedWrappingKey;
 	}
 
 	// No KEK yet — first run on this device.
-	const kek = await generateAesKwKey(false);
 	if (canClone) {
 		// Persist the non-extractable CryptoKey directly — raw bytes never
 		// touch the JS heap.
+		const kek = await generateAesKwKey(false);
 		await kekIdb.save(KEK_KEY_NAME, kek);
+		cachedWrappingKey = kek;
+		return cachedWrappingKey;
 	} else {
 		// Fallback: export raw bytes to persist, then re-import as
 		// non-extractable for the cached handle. The extractable handle is
@@ -207,8 +220,6 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 		cachedWrappingKey = await importAesKwRaw(raw, false);
 		return cachedWrappingKey;
 	}
-	cachedWrappingKey = kek;
-	return cachedWrappingKey;
 }
 
 /**

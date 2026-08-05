@@ -101,7 +101,7 @@ export async function generateAesKwKey(extractable: boolean): Promise<CryptoKey>
  * AES-KW keys must be 16, 24, or 32 bytes (AES-128/192/256-KW).
  */
 export async function importAesKwRaw(
-	bytes: ArrayBuffer,
+	bytes: BufferSource,
 	extractable: boolean,
 ): Promise<CryptoKey> {
 	return crypto.subtle.importKey(
@@ -111,4 +111,70 @@ export async function importAesKwRaw(
 		extractable,
 		['wrapKey', 'unwrapKey'],
 	);
+}
+
+/**
+ * A KEK entry as read back from IndexedDB, classified by shape.
+ *
+ * Both KEK stores persist exactly two shapes: a non-extractable AES-KW CryptoKey
+ * (on runtimes that can structured-clone one) or its raw 32 bytes.
+ */
+export type KekEntry =
+	| { kind: 'raw'; bytes: BufferSource }
+	| { kind: 'key'; key: CryptoKey };
+
+/**
+ * Classify a stored KEK entry. Returns null for anything that is neither shape —
+ * callers must treat that as a hard error rather than caching it as a key handle.
+ *
+ * Telling the two apart must NOT use `instanceof` on either side. Both halves of
+ * that were measured, not reasoned about:
+ *
+ *   - `existing instanceof CryptoKey` throws ReferenceError wherever the
+ *     constructor is not bound as a global (#108). It fires only on a SECOND
+ *     load, once a KEK exists, so first run looks healthy.
+ *   - `existing instanceof ArrayBuffer` is realm-local, and under jsdom it is
+ *     FALSE for a genuine 32-byte export — `crypto.subtle` hands back a
+ *     Node-realm buffer while the global is jsdom's. Measured:
+ *
+ *         PROBE exported  toString= [object ArrayBuffer] | instanceof = false
+ *         PROBE roundtrip toString= [object ArrayBuffer] | instanceof = false
+ *
+ *     Keying off it routes real KEK bytes into the CryptoKey branch and makes a
+ *     READABLE key undecryptable — strictly worse than the bug it replaced.
+ *
+ * `ArrayBuffer.isView` IS an internal-slot brand check. `Object.prototype.toString`
+ * is not — for an ArrayBuffer it resolves through
+ * `ArrayBuffer.prototype[Symbol.toStringTag]`, so a value with its prototype
+ * replaced reports `[object Object]`, and a plain object carrying that symbol
+ * would classify as raw. What it IS, and all this code needs, is realm-STABLE:
+ * every realm's `ArrayBuffer.prototype` carries the same tag string. The spoof is
+ * unreachable on this path — structured serialization copies own string-keyed
+ * properties only, so a `Symbol.toStringTag` never survives the trip through
+ * IndexedDB (measured: 0 symbols after round-trip). Do not reuse this helper on
+ * input that did NOT come through structured clone.
+ *
+ * The CryptoKey side is validated POSITIVELY
+ * rather than inferred by elimination: an entry of an unexpected shape must not
+ * become the process-lifetime `cachedWrappingKey`, and it should fail at the KEK
+ * layer with a name that says so instead of surfacing later as `unwrap_failed`.
+ */
+export function classifyKekEntry(existing: unknown): KekEntry | null {
+	if (
+		ArrayBuffer.isView(existing) ||
+		Object.prototype.toString.call(existing) === '[object ArrayBuffer]'
+	) {
+		return { kind: 'raw', bytes: existing as BufferSource };
+	}
+	const key = existing as CryptoKey | null;
+	if (
+		typeof key === 'object' &&
+		key !== null &&
+		key.type === 'secret' &&
+		key.algorithm?.name === 'AES-KW' &&
+		key.extractable !== true
+	) {
+		return { kind: 'key', key };
+	}
+	return null;
 }
