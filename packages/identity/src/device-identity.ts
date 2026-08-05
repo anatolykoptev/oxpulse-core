@@ -181,22 +181,37 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	// a brand-new device.
 	const existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
 	if (existing) {
-		if (canClone && existing instanceof CryptoKey) {
-			// Persisted as a non-extractable CryptoKey — use directly.
-			cachedWrappingKey = existing;
-		} else {
+		// Discriminate on the RAW-BYTES shape, never on `instanceof CryptoKey` (#108).
+		//
+		// `CryptoKey` is not a guaranteed global. jsdom — which is what every
+		// consumer tests under — provides crypto.subtle and structuredClone but no
+		// CryptoKey constructor binding, so `existing instanceof CryptoKey` threw
+		// ReferenceError. It detonated on the SECOND load only, because the first
+		// run never reaches this branch. This repo could not see it: vitest runs
+		// `environment: 'node'`, where the global does exist.
+		//
+		// `canClone` is also the wrong question here. It measures what THIS runtime
+		// can WRITE; this branch is reading what a PREVIOUS session wrote. Raw bytes
+		// are the only other shape the writer below ever persists, and an
+		// ArrayBuffer/TypedArray is identifiable without reaching for a global that
+		// may not be bound.
+		const isRawBytes = existing instanceof ArrayBuffer || ArrayBuffer.isView(existing);
+		cachedWrappingKey = isRawBytes
 			// Persisted as raw bytes (fallback path) — re-import non-extractable.
-			cachedWrappingKey = await importAesKwRaw(existing as ArrayBuffer, false);
-		}
+			? await importAesKwRaw(existing as ArrayBuffer, false)
+			// Persisted as a non-extractable CryptoKey — use directly.
+			: (existing as CryptoKey);
 		return cachedWrappingKey;
 	}
 
 	// No KEK yet — first run on this device.
-	const kek = await generateAesKwKey(false);
 	if (canClone) {
 		// Persist the non-extractable CryptoKey directly — raw bytes never
 		// touch the JS heap.
+		const kek = await generateAesKwKey(false);
 		await kekIdb.save(KEK_KEY_NAME, kek);
+		cachedWrappingKey = kek;
+		return cachedWrappingKey;
 	} else {
 		// Fallback: export raw bytes to persist, then re-import as
 		// non-extractable for the cached handle. The extractable handle is
@@ -207,8 +222,6 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 		cachedWrappingKey = await importAesKwRaw(raw, false);
 		return cachedWrappingKey;
 	}
-	cachedWrappingKey = kek;
-	return cachedWrappingKey;
 }
 
 /**
