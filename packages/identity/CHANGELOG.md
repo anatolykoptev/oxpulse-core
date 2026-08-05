@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.4...identity-v0.1.5) (2026-08-05)
+
+
+### Documentation
+
+* rewrite both package READMEs for their npm pages ([#63](https://github.com/anatolykoptev/oxpulse-core/issues/63)) ([72a479e](https://github.com/anatolykoptev/oxpulse-core/commit/72a479ea2d6ccf12f968c34adde52f418ab097c2))
+
 ## [0.1.4](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.3...identity-v0.1.4) (2026-08-04)
 
 
