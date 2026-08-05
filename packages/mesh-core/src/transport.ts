@@ -953,12 +953,19 @@ function handleIncomingChunk(deviceAddress: string, chunk: Uint8Array): void {
       // Look up peerIdHex from the registry (peer may not be registered yet).
       const peer = registry.list().find((p) => p.mac === deviceAddress);
       const peerIdHex = peer?.idHex ?? deviceAddress;
-      if (peerId && peer) {
+      // #59: an inbound-only peer (never connected outbound) has no registry
+      // entry, so `peer` is undefined. The responder role does not logically
+      // require a prior outbound sighting — receiving a handshake frame with no
+      // existing CryptoState means the peer is the initiator and we are the
+      // responder. Use the device address as the peerIdHex fallback rather than
+      // polluting the registry with a fabricated peer ID (the registry feeds
+      // meshState.peers and the router; a fake ID would misroute frames).
+      if (peerId) {
         const peerIdBytes = peer ? Uint8Array.from(
           // peer.idHex is hex string → convert back to bytes
           (peer.idHex.match(/.{2}/g) ?? []).map(h => parseInt(h, 16))
         ) : new Uint8Array(8);
-        const role = roleFor(peerId, peerIdBytes);
+        const role = peer ? roleFor(peerId, peerIdBytes) : 'responder';
         // C1: peer initiated before our scan callback fired getLocalIdentity().
         // Await identity resolution instead of null-asserting localIdentityProvider!
         // to avoid a crash when the IDB read hasn't completed yet.
@@ -998,7 +1005,8 @@ function handleIncomingChunk(deviceAddress: string, chunk: Uint8Array): void {
           failHandshake(undefined, deviceAddress, err);
         });
       } else {
-        console.warn('[mesh] handshake frame from unknown device (no registry entry)', deviceAddress);
+        // peerId is null — mesh hasn't completed bootstrap (getLocalIdentity).
+        console.warn('[mesh] handshake frame before mesh bootstrap completed', deviceAddress);
       }
       return;
     }
