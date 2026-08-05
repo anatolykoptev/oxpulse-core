@@ -145,3 +145,46 @@ describe('S5: Spool.recent() bounded cursor walk', () => {
     expect(() => spool.recent(-1)).toThrow('limit must be >= 0');
   });
 });
+
+// ─── W6: evictExcess single-transaction ───────────────────────────────────────
+
+describe('W6: Spool.evictExcess single-transaction', () => {
+  let spool: Spool;
+
+  beforeEach(async () => {
+    spool = new Spool('test-spool-evict-race-' + Math.random(), 100);
+    await spool.open();
+  });
+
+  afterEach(() => spool.close());
+
+  it('evicts correct count to reach exactly maxEntries', async () => {
+    const now = Date.now();
+    for (let i = 0; i < 10; i++) {
+      await spool.put(spoolEntry(`s-${i}`, now - (10 - i) * 1000));
+    }
+    const deleted = await spool.evictExcess(4);
+    expect(deleted).toBe(6);
+    expect(await spool.size()).toBe(4);
+  });
+
+  it('returns 0 when already under cap', async () => {
+    const now = Date.now();
+    await spool.put(spoolEntry('s-a', now));
+    expect(await spool.evictExcess(10)).toBe(0);
+  });
+
+  it('handles maxEntries=0 (evict everything)', async () => {
+    const now = Date.now();
+    for (let i = 0; i < 5; i++) {
+      await spool.put(spoolEntry(`s-${i}`, now + i));
+    }
+    const deleted = await spool.evictExcess(0);
+    expect(deleted).toBe(5);
+    expect(await spool.size()).toBe(0);
+  });
+
+  it('throws on negative maxEntries', async () => {
+    await expect(spool.evictExcess(-1)).rejects.toThrow('maxEntries must be >= 0');
+  });
+});

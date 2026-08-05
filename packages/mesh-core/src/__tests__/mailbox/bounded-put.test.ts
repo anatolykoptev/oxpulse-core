@@ -179,3 +179,46 @@ describe('S4: Inbox.unconsumed() cursor-based walk', () => {
     expect(unconsumed).toHaveLength(10);
   });
 });
+
+// ─── W6: evictExcess single-transaction (no race) ─────────────────────────────
+
+describe('W6: Inbox.evictExcess single-transaction', () => {
+  let inbox: Inbox;
+
+  beforeEach(async () => {
+    inbox = new Inbox('test-inbox-evict-race-' + Math.random(), 100);
+    await inbox.open();
+  });
+
+  afterEach(() => inbox.close());
+
+  it('evicts correct count to reach exactly maxEntries', async () => {
+    const now = Date.now();
+    for (let i = 0; i < 10; i++) {
+      await inbox.put(entry(`msg-${i}`, now - (10 - i) * 1000));
+    }
+    const deleted = await inbox.evictExcess(4);
+    expect(deleted).toBe(6);
+    expect(await inbox.unconsumed()).toHaveLength(4);
+  });
+
+  it('returns 0 when already under cap', async () => {
+    const now = Date.now();
+    await inbox.put(entry('msg-a', now));
+    expect(await inbox.evictExcess(10)).toBe(0);
+  });
+
+  it('handles maxEntries=0 (evict everything)', async () => {
+    const now = Date.now();
+    for (let i = 0; i < 5; i++) {
+      await inbox.put(entry(`msg-${i}`, now + i));
+    }
+    const deleted = await inbox.evictExcess(0);
+    expect(deleted).toBe(5);
+    expect(await inbox.unconsumed()).toHaveLength(0);
+  });
+
+  it('throws on negative maxEntries', async () => {
+    await expect(inbox.evictExcess(-1)).rejects.toThrow('maxEntries must be >= 0');
+  });
+});

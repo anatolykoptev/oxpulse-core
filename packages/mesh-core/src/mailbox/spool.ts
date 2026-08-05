@@ -273,6 +273,61 @@ export class Spool {
     });
   }
 
+    /**
+   * EXTERNAL API — has no caller inside this repository, and that is expected.
+   * The consumer is oxpulse-chat's periodic eviction sweep
+   * (web/src/lib/chat/mesh-dedup.ts), which calls this on an interval with its
+   * OWN cap constant and reports the returned count to analytics.
+   *
+   * Do NOT delete it as dead code on the strength of a repo-scoped search: this
+   * package is published to npm, so its callers live in other repositories. It
+   * was deleted once on exactly that reasoning and broke the consumer's build.
+   *
+   * It is not redundant with the bounded put(): put() enforces the cap at
+   * INSERT time using the package default, while this sweeps to a
+   * caller-supplied cap on a schedule and returns how many entries went.
+   *
+   * Evict the OLDEST entries (lowest addedAtMs) until the store contains
+   * at most `maxEntries`. Single readwrite transaction for count + cursor-walk
+   * (eliminates the two-transaction race — W6 fix).
+   *
+   * Returns the number of entries deleted.
+   */
+  async evictExcess(maxEntries: number): Promise<number> {
+    if (maxEntries < 0) throw new Error('Spool: evictExcess maxEntries must be >= 0');
+    const db = this.getDb();
+
+    return new Promise<number>((resolve, reject) => {
+      const tx = db.transaction(MESH_SPOOL_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(MESH_SPOOL_STORE_NAME);
+
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const total = countReq.result;
+        if (total <= maxEntries) { resolve(0); return; }
+
+        const toDelete = total - maxEntries;
+        let deleted = 0;
+
+        const index = store.index('addedAtMs');
+        const cursorReq = index.openCursor(); // ascending = oldest first
+        cursorReq.onsuccess = (ev) => {
+          const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor || deleted >= toDelete) {
+            if (deleted > 0) emitMeshMetric('mailbox_evicted', { store: 'spool', count: String(deleted) });
+            resolve(deleted);
+            return;
+          }
+          cursor.delete();
+          deleted++;
+          cursor.continue();
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      };
+      countReq.onerror = () => reject(countReq.error);
+    });
+  }
+
   evictOlderThan(ttlMs: number): Promise<void> {
     const cutoff = Date.now() - ttlMs;
     return new Promise((resolve, reject) => {
