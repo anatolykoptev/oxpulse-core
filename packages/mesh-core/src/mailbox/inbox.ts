@@ -16,9 +16,8 @@
  * Bounded storage: put() enforces MESH_INBOX_MAX_ENTRIES atomically —
  * count + evict-oldest + put in a single readwrite transaction. This
  * eliminates the count-then-cursor-walk race (two separate transactions)
- * and ensures the cap is enforced on every insert without relying on
- * callers to invoke evictExcess(). QuotaExceededError triggers aggressive
- * eviction (drop 10% of oldest) + retry.
+ * and ensures the cap is enforced on every insert. QuotaExceededError
+ * triggers aggressive eviction (drop 10% of oldest) + retry.
  *
  * TTL eviction uses receivedAtMs (wall-time, not hop count). Default budget
  * is set by callers (mesh-roadmap §B.3 suggests 7 days).
@@ -238,54 +237,6 @@ export class Inbox {
         put.onerror = () => reject(put.error);
       };
       get.onerror = () => reject(get.error);
-    });
-  }
-
-  /**
-   * Evict the OLDEST entries (lowest receivedAtMs) until the store contains
-   * at most `maxEntries`. Uses the `receivedAtMs` index for O(N) cursor walk.
-   *
-   * This is now a TWO-PHASE operation on a SINGLE readwrite transaction:
-   * count + cursor-walk-delete are on the same tx, eliminating the
-   * count-then-cursor race (W6 fix). The previous two-transaction pattern
-   * could leave the store at total+k after eviction (overshoot) due to a
-   * concurrent put between the count and the cursor walk.
-   *
-   * Returns the number of entries deleted.
-   */
-  async evictExcess(maxEntries: number): Promise<number> {
-    if (maxEntries < 0) throw new Error('Inbox: evictExcess maxEntries must be >= 0');
-    const db = this.getDb();
-
-    return new Promise<number>((resolve, reject) => {
-      const tx = db.transaction(MESH_INBOX_STORE_NAME, 'readwrite');
-      const store = tx.objectStore(MESH_INBOX_STORE_NAME);
-
-      // Count on the SAME transaction as the cursor walk — no race.
-      const countReq = store.count();
-      countReq.onsuccess = () => {
-        const total = countReq.result;
-        if (total <= maxEntries) { resolve(0); return; }
-
-        const toDelete = total - maxEntries;
-        let deleted = 0;
-
-        const index = store.index('receivedAtMs');
-        const cursorReq = index.openCursor(); // ascending = oldest first
-        cursorReq.onsuccess = (ev) => {
-          const cursor = (ev.target as IDBRequest<IDBCursorWithValue | null>).result;
-          if (!cursor || deleted >= toDelete) {
-            if (deleted > 0) emitMeshMetric('mailbox_evicted', { store: 'inbox', count: String(deleted) });
-            resolve(deleted);
-            return;
-          }
-          cursor.delete();
-          deleted++;
-          cursor.continue();
-        };
-        cursorReq.onerror = () => reject(cursorReq.error);
-      };
-      countReq.onerror = () => reject(countReq.error);
     });
   }
 
