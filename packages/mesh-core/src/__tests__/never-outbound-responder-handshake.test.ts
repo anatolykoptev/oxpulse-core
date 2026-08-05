@@ -173,17 +173,12 @@ import {
 } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
 import { chunkFrame, FrameType } from '../frame.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 // ── Test constants ─────────────────────────────────────────────────────────
 const TEST_MTU = 247;
 // A device address that was NEVER seen via scan → no registry entry.
 const PEER_DEVICE_ID = 'peer-never-outbound-dd:ee:ff';
-
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
-}
 
 /** Inject a HandshakeMsg1 frame from the peer via the GATT-server RX path. */
 function injectMsg1ViaRx(deviceAddress: string) {
@@ -227,7 +222,7 @@ describe('#59: never-outbound peer (no registry entry) can start responder hands
 
   it('an inbound-only peer with NO registry entry starts the responder handshake (no frame dropped)', async () => {
     await startMesh();
-    await drain();
+    await flushMicrotasks();
 
     // 1. Do NOT fire the scan callback — the peer is never seen outbound.
     //    There is no registry entry for PEER_DEVICE_ID.
@@ -235,14 +230,20 @@ describe('#59: never-outbound peer (no registry entry) can start responder hands
     // 2. The peer connects INBOUND via the native connection listener.
     //    F2 registers it in connectedDevices.
     connListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, connected: true });
-    await drain(30);
+    await flushMicrotasks();
 
     // 3. Deliver a HandshakeMsg1 through the GATT-server RX listener (the path
     //    inbound peers use). Without #59's fix, the `if (peerId && peer)`
     //    guard blocks this — `peer` is undefined (no registry entry) and the
     //    frame is silently dropped with a console.warn.
     injectMsg1ViaRx(PEER_DEVICE_ID);
-    await drain(60);
+    // Wait on the observable the assertion reads, not on a wall-clock guess (#58).
+    // If the guard drops the frame the CryptoState is never created and this
+    // throws naming exactly that, instead of a bare `expected false to be true`.
+    await waitFor(
+      () => _hasCryptoState(PEER_DEVICE_ID),
+      'responder CryptoState for the inbound-only peer to be created',
+    );
 
     // Core assertions — observable state, not log strings.
     // (a) The responder handshake actually started: a CryptoState was created.
