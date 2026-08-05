@@ -682,9 +682,25 @@ export async function sendFrame(peerIdHex: string, frame: Uint8Array): Promise<v
   // basis of a MAC-shaped identifier (#82).
   let deviceId: string | undefined = peer?.mac;
   if (!deviceId) {
+    // Prefer a match that is still CONNECTED. Two cryptoStates entries can hold
+    // the same peerIdHex under different device addresses when a peer rotates
+    // its MAC and reconnects before the old entry is reaped — cryptoStates is
+    // deleted on a disconnect event, and that event is not guaranteed to
+    // arrive. Taking the first match in insertion order could then encrypt
+    // under the stale session and write to a dead address, and
+    // writeWithoutResponse has no ACK, so the frame would be lost in silence.
+    //
+    // Inbound-only peers cannot be ambiguous here (peerIdHex IS the device
+    // address, so it is the Map key), but a caller holding a long-lived 8-byte
+    // peer ID can be. Falling back to a disconnected match preserves the old
+    // behaviour rather than throwing when nothing is connected.
+    let stale: string | undefined;
     for (const [addr, csEntry] of cryptoStates) {
-      if (csEntry.peerIdHex === peerIdHex) { deviceId = addr; break; }
+      if (csEntry.peerIdHex !== peerIdHex) continue;
+      if (connectedDevices.has(addr)) { deviceId = addr; break; }
+      stale ??= addr;
     }
+    deviceId ??= stale;
   }
   if (!deviceId) throw new Error(`sendFrame: unknown peer ${peerIdHex}`);
 

@@ -24,6 +24,45 @@
 import { onHandshakeStateChange } from '../transport.js';
 
 /**
+ * Real timer and clock, captured at module load before any test body can call
+ * `vi.useFakeTimers()`.
+ *
+ * `waitFor` checks its deadline only BEFORE awaiting the wake promise, so it
+ * has TWO ways to wait forever, and both must be closed:
+ *
+ *   - a faked `setTimeout` that is never advanced means the wake promise never
+ *     settles, so the deadline is never re-reached;
+ *   - a faked `realNow()` means the deadline never ARRIVES, however
+ *     real the timer is.
+ *
+ * An earlier version captured only `setTimeout` and claimed that made hanging
+ * impossible. Review falsified it: `vi.useFakeTimers()` with no `toFake` list
+ * fakes `performance` too, and the wait still never returned. Both are captured
+ * now, which is what that claim actually required.
+ *
+ * Measured, so as not to overstate it in the other direction: without the clock
+ * capture the test does not hang forever — vitest's own 5s per-test timeout
+ * ends it. What is lost is the DIAGNOSTIC. The failure reads
+ *
+ *     Error: Test timed out in 5000ms.
+ *
+ * instead of
+ *
+ *     waitFor: <what> never became true within 300ms
+ *
+ * which is the entire reason this helper exists: #58 was hard to diagnose
+ * precisely because the failure never said what had not settled.
+ *
+ * Caveat, currently unreachable: imports are evaluated before test bodies, so
+ * this beats `beforeEach`, but vitest `setupFiles` run BEFORE test-file imports.
+ * A setup file calling `vi.useFakeTimers()` at top level would be captured here
+ * instead. `packages/mesh-core/vitest.config.ts` declares no `setupFiles`;
+ * adding one that fakes timers would reopen this.
+ */
+const realSetTimeout: typeof globalThis.setTimeout = globalThis.setTimeout.bind(globalThis);
+const realNow: () => number = performance.now.bind(performance);
+
+/**
  * Wait until `predicate` returns true.
  *
  * Drives the wait by (a) draining microtasks, (b) waking early when the
@@ -32,7 +71,7 @@ import { onHandshakeStateChange } from '../transport.js';
  * correct when the condition is not handshake-state-driven. The wall-clock
  * `timeout` is a safety bound only; the condition is what we wait on.
  *
- * Uses `performance.now()` (not `Date.now()`) for the deadline so it is robust
+ * Uses `realNow()` (not `Date.now()`) for the deadline so it is robust
  * in tests that fake `Date`/`setInterval` but leave `performance` and
  * `setTimeout` real.
  */
@@ -41,26 +80,27 @@ export async function waitFor(
   description: string,
   { timeout = 2000, interval = 5 }: { timeout?: number; interval?: number } = {},
 ): Promise<void> {
-  const deadline = performance.now() + timeout;
+  const deadline = realNow() + timeout;
   let resolveWake: () => void = () => {};
   const unsub = onHandshakeStateChange(() => resolveWake());
   try {
     for (;;) {
       if (predicate()) return;
-      if (performance.now() >= deadline) {
+      if (realNow() >= deadline) {
         throw new Error(`waitFor: ${description} never became true within ${timeout}ms`);
       }
       // Drain a batch of microtasks — the mocked crypto is microtask-based, so
       // this alone settles most handshake state without any wall-clock wait.
       for (let i = 0; i < 64; i++) await Promise.resolve();
       if (predicate()) return;
-      if (performance.now() >= deadline) {
+      if (realNow() >= deadline) {
         throw new Error(`waitFor: ${description} never became true within ${timeout}ms`);
       }
       // Wait for either a handshake state-change event or a short real timer.
       await new Promise<void>((resolve) => {
         resolveWake = resolve;
-        setTimeout(resolve, interval);
+        // realSetTimeout, not setTimeout — see the note at the top of this file.
+        realSetTimeout(resolve, interval);
       });
     }
   } finally {
