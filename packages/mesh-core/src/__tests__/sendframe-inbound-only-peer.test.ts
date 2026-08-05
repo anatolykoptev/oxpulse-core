@@ -163,20 +163,16 @@ import {
   acceptPeer,
   getPendingHandshakes,
   _resetTofuStore,
+  _hasCryptoState,
 } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
 import { chunkFrame, FrameType } from '../frame.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 // ── Test constants ─────────────────────────────────────────────────────────
 const TEST_MTU = 247;
 // A device address that was NEVER seen via scan → no registry entry.
 const PEER_DEVICE_ID = 'peer-inbound-only-aa:bb:cc';
-
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
-}
 
 /** Inject a handshake frame from the peer via the GATT-server RX path. */
 function injectHandshakeFrame(deviceAddress: string, frameType: number) {
@@ -220,24 +216,30 @@ describe('#82: sendFrame reaches an accepted inbound-only peer (no registry entr
 
   it('inbound-only peer: handshake completes → acceptPeer → sendFrame writes the frame', async () => {
     await startMesh();
-    await drain();
+    await flushMicrotasks();
 
     // 1. Do NOT fire the scan callback — the peer is never seen outbound.
     //    There is NO registry entry for PEER_DEVICE_ID.
 
     // 2. The peer connects INBOUND via the native connection listener.
     connListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, connected: true });
-    await drain(30);
+    await flushMicrotasks();
 
     // 3. Deliver HandshakeMsg1 — responder bootstrap creates a CryptoState,
     //    reads msg-1, writes msg-2 (out via writeRx spy).
     injectHandshakeFrame(PEER_DEVICE_ID, FrameType.HandshakeMsg1);
-    await drain(60);
+    await waitFor(
+      () => _hasCryptoState(PEER_DEVICE_ID),
+      'responder CryptoState for the inbound-only peer to be created',
+    );
 
     // 4. Deliver HandshakeMsg3 — responder reads msg-3, handshake completes
     //    (split → session, sas, verdict stays pending, notify).
     injectHandshakeFrame(PEER_DEVICE_ID, FrameType.HandshakeMsg3);
-    await drain(60);
+    await waitFor(
+      () => getPendingHandshakes().length > 0,
+      'handshake to complete and surface in getPendingHandshakes (SAS available)',
+    );
 
     // 5. The peer surfaces in getPendingHandshakes with the MAC-fallback idHex.
     const pending = getPendingHandshakes();
@@ -247,7 +249,7 @@ describe('#82: sendFrame reaches an accepted inbound-only peer (no registry entr
 
     // 6. The user accepts the peer after SAS verification.
     acceptPeer(PEER_DEVICE_ID);
-    await drain(10);
+    await flushMicrotasks();
 
     // 7. sendFrame to the accepted inbound-only peer. Against current code this
     //    throws (registry miss). After the fix it must resolve AND write.
@@ -256,7 +258,10 @@ describe('#82: sendFrame reaches an accepted inbound-only peer (no registry entr
     writeRxSpy.mockClear();
     const frame = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
     await expect(sendFrame(PEER_DEVICE_ID, frame)).resolves.toBeUndefined();
-    await drain(10);
+    await waitFor(
+      () => writeRxSpy.mock.calls.length > 0,
+      'sendFrame to write at least one SessionData chunk to the GATT characteristic',
+    );
 
     // 8. Observable: the frame was actually WRITTEN via the GATT write spy —
     //    not merely that no exception escaped. A sendFrame that silently
