@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.17...mesh-core-v0.2.0) (2026-08-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **mesh-core:** traffic is encrypted under a per-frame AEAD key ratchet instead of a single static AEAD key for the session lifetime. Both peers must be on 0.2.0+ to interoperate — an old peer and a new peer cannot communicate. There is deliberately no dual-mode and no fallback: supporting both would double the crypto surface and give an attacker a downgrade path.
+
+### Added
+
+* **mesh-core:** replace static-key Session with per-frame RatchetSession ([#72](https://github.com/anatolykoptev/oxpulse-core/issues/72)) ([ce1fdb3](https://github.com/anatolykoptev/oxpulse-core/commit/ce1fdb323957446142548f5b4726312c669d870c))
+
 ## [0.1.17](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.16...mesh-core-v0.1.17) (2026-08-05)
 
 
