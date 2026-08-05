@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.15...mesh-core-v0.1.16) (2026-08-05)
+
+
+### Fixed
+
+* **mesh-core:** drop unused sframe-ratchet dependency, revert manual publish path ([#66](https://github.com/anatolykoptev/oxpulse-core/issues/66)) ([3b4017f](https://github.com/anatolykoptev/oxpulse-core/commit/3b4017f64d8c4b2b06b1d33e7ad36b78eaf24e47))
+
 ## [0.1.15](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.14...mesh-core-v0.1.15) (2026-08-05)
 
 
