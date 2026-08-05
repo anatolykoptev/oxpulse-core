@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.2.0...mesh-core-v0.2.1) (2026-08-05)
+
+
+### Fixed
+
+* **ci:** build mesh-core against the workspace identity, not a registry copy ([#86](https://github.com/anatolykoptev/oxpulse-core/issues/86)) ([e994c31](https://github.com/anatolykoptev/oxpulse-core/commit/e994c319825b8c2ca5b62a99a4a4a3750d9c6de2))
+* **mesh-core:** let never-outbound peers complete a responder handshake ([a0d9c87](https://github.com/anatolykoptev/oxpulse-core/commit/a0d9c8719ba825844255a270690a2877fd13dba7))
+* **mesh-core:** sendFrame reaches accepted inbound-only peers ([#87](https://github.com/anatolykoptev/oxpulse-core/issues/87)) ([27fc68e](https://github.com/anatolykoptev/oxpulse-core/commit/27fc68e53140f2b8fe9e8a895ddc0be2066b8a65))
+
 ## [0.2.0](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.17...mesh-core-v0.2.0) (2026-08-05)
 
 
