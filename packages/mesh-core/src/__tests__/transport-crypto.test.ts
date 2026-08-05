@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 import { NoiseXxHandshake } from '../crypto/noise-xx.js';
-import { Session } from '../crypto/session.js';
+import { RatchetSession } from '../crypto/session-ratchet.js';
 import { chunkFrame, FrameReassembler, FrameType } from '../frame.js';
 
 // ── Hoist mutable state needed by vi.mock factories ───────────────────────
@@ -295,9 +295,9 @@ describe('transport crypto (B.2 Task 11)', () => {
 
     // Build peer session (responder side).
     const peerSplit = peerHs.split();
-    const peerSession = new Session({
-      sendKey: peerSplit.sendKey,
-      recvKey: peerSplit.recvKey,
+    const peerSession = new RatchetSession({
+      sendChainKey: peerSplit.sendKey,
+      recvChainKey: peerSplit.recvKey,
       direction: 'responder',
     });
 
@@ -349,9 +349,9 @@ describe('transport crypto (B.2 Task 11)', () => {
 
     // Peer session (responder side).
     const peerSplit = peerHs.split();
-    const peerSession = new Session({
-      sendKey: peerSplit.sendKey,
-      recvKey: peerSplit.recvKey,
+    const peerSession = new RatchetSession({
+      sendChainKey: peerSplit.sendKey,
+      recvChainKey: peerSplit.recvKey,
       direction: 'responder',
     });
 
@@ -516,5 +516,174 @@ describe('transport crypto (B.2 Task 11)', () => {
 
     // meshState.error must not be 'handshake-failed' due to identity null crash.
     expect(meshState.error).not.toBe('handshake-failed');
+  });
+
+  // ── Test 8: per-frame key ratchet — two consecutive frames use different keys
+  it('two consecutive frames on one session are encrypted under different keys', async () => {
+    await startAndConnect();
+
+    // Complete handshake.
+    const r1 = new FrameReassembler();
+    let { newIdx, peerMsgOut } = drainWritesToPeer(r1, 0);
+    await peerHs.readMessage(peerMsgOut!);
+    const m2 = await peerHs.writeMessage(new Uint8Array(0));
+    injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
+    await drain(120);
+
+    const r2 = new FrameReassembler();
+    ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
+    await peerHs.readMessage(peerMsgOut!);
+    expect(peerHs.isComplete()).toBe(true);
+
+    const peerIdHex = Array.from(PEER_ID_BYTES).map(b => b.toString(16).padStart(2, '0')).join('');
+    acceptPeer(peerIdHex);
+
+    // Build peer session (responder side).
+    const peerSplit = peerHs.split();
+    const peerSession = new RatchetSession({
+      sendChainKey: peerSplit.sendKey,
+      recvChainKey: peerSplit.recvKey,
+      direction: 'responder',
+    });
+
+    // Send two frames from our side through the transport.
+    const pt0 = new TextEncoder().encode('frame-zero');
+    const pt1 = new TextEncoder().encode('frame-one');
+    await sendFrame(peerIdHex, pt0);
+    await drain(10);
+    await sendFrame(peerIdHex, pt1);
+    await drain(10);
+
+    // Collect both encrypted SessionData frames.
+    const r3 = new FrameReassembler();
+    const encryptedFrames: Uint8Array[] = [];
+    for (let i = newIdx; i < writeRxSpy.mock.calls.length; i++) {
+      const chunk = extractChunk(writeRxSpy.mock.calls[i]!);
+      const res = r3.pushWithType(chunk);
+      if (res && res.frameType === FrameType.SessionData) {
+        encryptedFrames.push(res.payload);
+      }
+    }
+    expect(encryptedFrames.length).toBe(2);
+
+    // Peer decrypts both in order. If the send side didn't advance the chain
+    // (same key for both), the peer's recv chain would advance after frame 0
+    // and derive a different key for frame 1 → AEAD failure on second decrypt.
+    const recovered0 = await peerSession.decrypt(encryptedFrames[0]!);
+    expect(recovered0).toEqual(pt0);
+    const recovered1 = await peerSession.decrypt(encryptedFrames[1]!);
+    expect(recovered1).toEqual(pt1);
+  });
+
+  // ── Test 9: out-of-order delivery within 64-frame window still decrypts
+  it('out-of-order delivery within the 64-frame window still decrypts', async () => {
+    await startAndConnect();
+
+    // Complete handshake.
+    const r1 = new FrameReassembler();
+    let { newIdx, peerMsgOut } = drainWritesToPeer(r1, 0);
+    await peerHs.readMessage(peerMsgOut!);
+    const m2 = await peerHs.writeMessage(new Uint8Array(0));
+    injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
+    await drain(120);
+
+    const r2 = new FrameReassembler();
+    ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
+    await peerHs.readMessage(peerMsgOut!);
+    expect(peerHs.isComplete()).toBe(true);
+
+    const peerIdHex = Array.from(PEER_ID_BYTES).map(b => b.toString(16).padStart(2, '0')).join('');
+    acceptPeer(peerIdHex);
+
+    // Build peer session (responder side).
+    const peerSplit = peerHs.split();
+    const peerSession = new RatchetSession({
+      sendChainKey: peerSplit.sendKey,
+      recvChainKey: peerSplit.recvKey,
+      direction: 'responder',
+    });
+
+    // Send two frames from our side.
+    const pt0 = new TextEncoder().encode('out-of-order-0');
+    const pt1 = new TextEncoder().encode('out-of-order-1');
+    await sendFrame(peerIdHex, pt0);
+    await drain(10);
+    await sendFrame(peerIdHex, pt1);
+    await drain(10);
+
+    // Collect both encrypted frames.
+    const r3 = new FrameReassembler();
+    const encryptedFrames: Uint8Array[] = [];
+    for (let i = newIdx; i < writeRxSpy.mock.calls.length; i++) {
+      const chunk = extractChunk(writeRxSpy.mock.calls[i]!);
+      const res = r3.pushWithType(chunk);
+      if (res && res.frameType === FrameType.SessionData) {
+        encryptedFrames.push(res.payload);
+      }
+    }
+    expect(encryptedFrames.length).toBe(2);
+
+    // Peer decrypts frame 1 FIRST (reorder), then frame 0.
+    // Both must succeed — keys for both counters are retained within the
+    // 64-frame window. If pruneOlderThan evicted frame 0's key after
+    // decrypting frame 1, frame 0 would fail.
+    const recovered1 = await peerSession.decrypt(encryptedFrames[1]!);
+    expect(recovered1).toEqual(pt1);
+    const recovered0 = await peerSession.decrypt(encryptedFrames[0]!);
+    expect(recovered0).toEqual(pt0);
+  });
+
+  // ── Test 10: a frame older than the 64-frame window is rejected
+  it('a frame older than the 64-frame window is rejected with replay-rejected', async () => {
+    await startAndConnect();
+
+    // Complete handshake.
+    const r1 = new FrameReassembler();
+    let { newIdx, peerMsgOut } = drainWritesToPeer(r1, 0);
+    await peerHs.readMessage(peerMsgOut!);
+    const m2 = await peerHs.writeMessage(new Uint8Array(0));
+    injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
+    await drain(120);
+
+    const r2 = new FrameReassembler();
+    ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
+    await peerHs.readMessage(peerMsgOut!);
+    expect(peerHs.isComplete()).toBe(true);
+
+    const peerIdHex = Array.from(PEER_ID_BYTES).map(b => b.toString(16).padStart(2, '0')).join('');
+    acceptPeer(peerIdHex);
+
+    // Build peer session (responder side) — peer will encrypt toward us.
+    const peerSplit = peerHs.split();
+    const peerSession = new RatchetSession({
+      sendChainKey: peerSplit.sendKey,
+      recvChainKey: peerSplit.recvKey,
+      direction: 'responder',
+    });
+
+    // Peer encrypts 70 frames and sends them to our transport.
+    const firstWire = await peerSession.encrypt(new Uint8Array([0x42]));
+    const firstChunks = chunkFrame(firstWire, TEST_MTU, FrameType.SessionData);
+    injectFromPeer(firstChunks);
+    await drain(30);
+
+    // Send 69 more frames to push counter 0 outside the 64-frame window.
+    for (let i = 1; i < 70; i++) {
+      const wire = await peerSession.encrypt(new Uint8Array([i]));
+      injectFromPeer(chunkFrame(wire, TEST_MTU, FrameType.SessionData));
+      await drain(5);
+    }
+    await drain(30);
+
+    // All 70 frames should have been accepted — no error.
+    expect(meshState.error).toBeNull();
+
+    // Now re-inject the first frame (counter 0) — outside the 64-frame window.
+    injectFromPeer(firstChunks);
+    await drain(30);
+
+    // Must be rejected with 'replay-rejected' — the observable behaviour that
+    // must survive the ratchet migration.
+    expect(meshState.error).toBe('replay-rejected');
   });
 });

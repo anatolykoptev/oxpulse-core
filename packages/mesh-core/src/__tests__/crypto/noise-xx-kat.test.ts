@@ -175,8 +175,8 @@ describe('Noise XX KAT — handshake session key symmetry + uniqueness', () => {
     const iSplit = initiator.split();
     const rSplit = responder.split();
 
-    expect(iSplit.sendKey.length).toBe(16); // AES-128
-    expect(iSplit.recvKey.length).toBe(16);
+    expect(iSplit.sendKey.length).toBe(32); // 32-byte chain keys for per-frame ratchet
+    expect(iSplit.recvKey.length).toBe(32);
     expect(toHex(iSplit.sendKey)).toBe(toHex(rSplit.recvKey));
     expect(toHex(iSplit.recvKey)).toBe(toHex(rSplit.sendKey));
     expect(iSplit.sendKey).not.toEqual(iSplit.recvKey); // distinct directions

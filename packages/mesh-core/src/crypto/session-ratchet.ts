@@ -31,31 +31,29 @@
  * • Chain key size: 32 bytes (deliberately wider than AEAD key so the
  *   ratchet and key derivation draw from non-overlapping HKDF output).
  * • AEAD: AES-128-GCM via WebCrypto. Nonce = direction_byte || u64
- *   counter, big-endian, zero-padded to 12 bytes — same layout as
- *   Session in session.ts for consistency.
- * • Replay window: 64-entry bitmap identical to Session. Frames behind
- *   the window are rejected regardless of key generation.
+ *   counter, big-endian, zero-padded to 12 bytes.
+ * • Replay window: 64-entry bitmap. Frames behind the window are rejected
+ *   regardless of key generation.
  * • Out-of-order delivery: the receiver maintains a key cache covering
  *   the same 64-counter window as the replay bitmap. Frames that arrive
  *   reordered within the window can be decrypted. Keys for counters
  *   more than RECV_WINDOW_SIZE (64) frames behind the highest decrypted
  *   counter are pruned — forward secrecy beyond the window.
  *
- * Wire format (same as Session):
+ * Wire format:
  *   [u64 counter big-endian][AES-128-GCM ciphertext+tag]
  *
  * Wire incompatibility
  * --------------------
- * RatchetSession is NOT compatible with the static-key Session class.
- * Old B.2 peers that run Session cannot interoperate with RatchetSession
- * peers. At the time this ships there are no Session peers in production,
- * so this is a clean break.
+ * RatchetSession replaces the former static-key Session class entirely.
+ * Peers running the old static-key Session cannot interoperate with
+ * RatchetSession peers — both sides must be on the same version. This is
+ * a breaking wire change (MINOR bump under bump-minor-pre-major).
  */
 
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { AEAD_NONCE_BYTES, REPLAY_WINDOW_SIZE } from '../constants.generated.js';
-import { ReplayWindow } from './session.js';
 import { toBufferSource } from './buffer.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -81,6 +79,58 @@ const RECV_WINDOW_SIZE = REPLAY_WINDOW_SIZE; // parity with ReplayWindow bitmap
 const RECV_LOOKAHEAD = 8;
 
 export type Direction = 'initiator' | 'responder';
+
+// ─── Replay window ───────────────────────────────────────────────────────────
+
+/**
+ * Sliding-window replay bitmap shared by the ratchet and the legacy session.
+ * bit i set iff (highest - i) has been seen, 0 ≤ i < REPLAY_WINDOW_SIZE.
+ *
+ * Two-phase check (canAccept before AEAD, commit after AEAD success) prevents
+ * the DoS gadget where a spoofed frame with a valid counter but bad AEAD tag
+ * poisons the bitmap so the legitimate frame at that counter is rejected.
+ */
+export class ReplayWindow {
+  private highest: bigint = -1n;
+  private bitmap = 0n;
+
+  canAccept(counter: bigint): boolean {
+    if (counter < 0n) return false;
+    if (this.highest < 0n) return true;
+    if (counter > this.highest) return true;
+    const offset = this.highest - counter;
+    if (offset >= BigInt(REPLAY_WINDOW_SIZE)) return false;
+    return (this.bitmap & (1n << offset)) === 0n;
+  }
+
+  commit(counter: bigint): void {
+    if (this.highest < 0n) {
+      this.highest = counter;
+      this.bitmap = 1n;
+      return;
+    }
+    if (counter > this.highest) {
+      const shift = counter - this.highest;
+      if (shift >= BigInt(REPLAY_WINDOW_SIZE)) {
+        this.bitmap = 1n;
+      } else {
+        this.bitmap = (this.bitmap << shift) | 1n;
+      }
+      this.highest = counter;
+      const mask = (1n << BigInt(REPLAY_WINDOW_SIZE)) - 1n;
+      this.bitmap &= mask;
+    } else {
+      const offset = this.highest - counter;
+      this.bitmap |= (1n << offset);
+    }
+  }
+
+  checkAndAccept(counter: bigint): boolean {
+    if (!this.canAccept(counter)) return false;
+    this.commit(counter);
+    return true;
+  }
+}
 
 // ─── Options ─────────────────────────────────────────────────────────────────
 
