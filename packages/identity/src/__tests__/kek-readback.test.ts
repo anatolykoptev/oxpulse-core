@@ -146,6 +146,63 @@ describe.each(STORES)('KEK read-back — $name (#108)', (S) => {
 		}
 	});
 
+	it('re-imports a raw-bytes KEK as NON-EXTRACTABLE', async () => {
+		// The `false` argument on the read-back `importAesKwRaw(entry.bytes, false)`
+		// is the last enforcement of #95 on the raw-bytes path, and nothing
+		// asserted it: flipping it to `true` left 131/131 green. The existing
+		// extractable assertions all check the PERSISTED IDB entry on the
+		// CREATION path; this is the cached in-memory handle on the READ path,
+		// and the persisted bytes are identical either way.
+		//
+		// The oracle is the argument itself, not behaviour, because an extractable
+		// KEK wraps and unwraps exactly like a non-extractable one — the only
+		// difference is that `exportKey` would succeed on a handle this module
+		// never exposes. So the assertion observes what production actually
+		// passed to WebCrypto.
+		const savedClone = globalThis.structuredClone;
+		const savedImport = crypto.subtle.importKey.bind(crypto.subtle);
+		const aesKwImports: boolean[] = [];
+
+		const isCryptoKey = (v: unknown) =>
+			Object.prototype.toString.call(v) === '[object CryptoKey]';
+		globalThis.structuredClone = ((v: unknown, opts?: unknown) => {
+			if (isCryptoKey(v)) throw new Error('cannot clone CryptoKey');
+			return (savedClone as (a: unknown, b?: unknown) => unknown)(v, opts);
+		}) as typeof structuredClone;
+
+		(crypto.subtle as { importKey: unknown }).importKey = ((
+			format: string,
+			keyData: BufferSource,
+			algorithm: { name?: string } | string,
+			extractable: boolean,
+			usages: string[],
+		) => {
+			const name = typeof algorithm === 'string' ? algorithm : algorithm?.name;
+			if (name === 'AES-KW') aesKwImports.push(extractable);
+			return savedImport(
+				format as 'raw',
+				keyData,
+				algorithm as AlgorithmIdentifier,
+				extractable,
+				usages as KeyUsage[],
+			);
+		}) as typeof crypto.subtle.importKey;
+
+		try {
+			reload();
+			await S.load();          // creates, persisting raw bytes
+			aesKwImports.length = 0; // only the READ-BACK path is under test
+			reload();
+			await S.load();          // reads them back
+
+			expect(aesKwImports.length).toBeGreaterThan(0);
+			expect(aesKwImports).not.toContain(true);
+		} finally {
+			(crypto.subtle as { importKey: unknown }).importKey = savedImport;
+			globalThis.structuredClone = savedClone;
+		}
+	});
+
 	it('refuses a KEK entry that is neither shape', async () => {
 		// The classifier validates the CryptoKey side POSITIVELY rather than by
 		// elimination, so a corrupted or unexpected entry fails at the KEK layer
