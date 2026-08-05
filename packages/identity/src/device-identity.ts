@@ -149,33 +149,37 @@ async function probeStructuredClone(): Promise<boolean> {
  * persisted (extractable during the bootstrap window only) and re-imported as
  * non-extractable on load.
  *
- * One-shot copy-only migration: if the new KEK DB is empty but a legacy KEK
- * exists in the identity DB under `WRAPPING_KEY_NAME` (raw bytes), it is
- * imported as non-extractable and copied to the new DB. The old entry is NEVER
- * deleted — copy-only migration, zero irreversibility.
+ * There is deliberately NO migration from the pre-#98 layout. Nothing has this
+ * package installed in the field yet, so a legacy KEK cannot exist on any
+ * device that is not a developer's own browser profile. Carrying a migration
+ * for that would mean permanently keeping the most delicate code in this file
+ * — and both HIGH findings in the review of #95-#98 were in the migration and
+ * fallback paths, not in the primitives. Complexity that protects nobody is
+ * still complexity that can be wrong.
+ *
+ * If a developer has a pre-#98 identity in their profile, clear site data.
+ * When this ships to real devices, a migration written against a format that
+ * actually exists in the field is a different and much better-founded change.
  */
 async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	if (cachedWrappingKey) return cachedWrappingKey;
 
 	const canClone = await probeStructuredClone();
 
-	// 1. Try to load the KEK from the new dedicated DB.
+	// Load the KEK. A read can throw: IndexedDB deserialises a stored CryptoKey
+	// on READ, so a runtime that could structured-clone one when it was written
+	// may fail to reconstruct it later (WebView downgrade, OS update). We do
+	// NOT swallow that. There is no second copy of this key by design — keeping
+	// a raw-bytes duplicate as a safety net is exactly what #95 removed, and a
+	// net that defeats the thing it protects is not a net. So an unreadable KEK
+	// is a hard error, and the identity it wrapped is gone.
 	//
-	// The load itself can throw. IndexedDB deserialises a stored CryptoKey on
-	// READ, so a runtime that could structured-clone one when it was written
-	// may fail to reconstruct it later — a WebView downgrade, an OS update, a
-	// different engine on the same device. Letting that propagate would lock
-	// the user out of their own identity while a perfectly usable legacy KEK
-	// sits in the old DB: the key material is present, only the handle is
-	// unreadable. So a read failure degrades to the migration path instead of
-	// aborting.
-	let existing: CryptoKey | ArrayBuffer | null = null;
-	let kekLoadFailed = false;
-	try {
-		existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
-	} catch {
-		kekLoadFailed = true;
-	}
+	// That is the honest trade for non-extractable key storage, and it is the
+	// same one every platform keystore makes. What must never happen is
+	// silently generating a fresh KEK on top of an unreadable one: the wrapped
+	// seed would stay in IDB, permanently undecryptable, while the app reported
+	// a brand-new device.
+	const existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
 	if (existing) {
 		if (canClone && existing instanceof CryptoKey) {
 			// Persisted as a non-extractable CryptoKey — use directly.
@@ -187,42 +191,7 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 		return cachedWrappingKey;
 	}
 
-	// 2. Migration: new DB empty — check for a legacy KEK in the identity DB.
-	const legacyRaw = await idb.load<ArrayBuffer>(WRAPPING_KEY_NAME);
-	if (legacyRaw) {
-		// Copy-only migration: import non-extractable, persist to new DB.
-		// NEVER delete the old entry (zero irreversibility).
-		const kek = await importAesKwRaw(legacyRaw, false);
-		// `!kekLoadFailed`: if reading a stored CryptoKey just failed on THIS
-		// runtime, persisting another one would reproduce the same failure on
-		// the next boot. Fall back to raw bytes instead — the recovery path
-		// must not re-enter the state it is recovering from.
-		if (canClone && !kekLoadFailed) {
-			await kekIdb.save(KEK_KEY_NAME, kek);
-		} else {
-			// Fallback: persist raw bytes. The handle we cached is already
-			// non-extractable; the raw bytes in IDB are the bootstrap-window
-			// tradeoff accepted for WebViews without structured-clone.
-			await kekIdb.save(KEK_KEY_NAME, legacyRaw);
-		}
-		cachedWrappingKey = kek;
-		return cachedWrappingKey;
-	}
-
-	// 3. Fresh generation: no KEK anywhere.
-	//
-	// Only legitimate when no KEK has ever existed. If the stored KEK was
-	// present but unreadable AND no legacy copy survives, generating a fresh
-	// one would silently orphan the existing identity — the wrapped seed stays
-	// in IDB and becomes permanently undecryptable, with the app cheerfully
-	// reporting a brand-new device. Fail loudly instead; an error the operator
-	// can see beats data loss that looks like a fresh install.
-	if (kekLoadFailed) {
-		throw new Error(
-			'[identity] stored KEK could not be deserialised and no legacy KEK is available — ' +
-			'refusing to generate a fresh one, which would permanently orphan the existing identity',
-		);
-	}
+	// No KEK yet — first run on this device.
 	const kek = await generateAesKwKey(false);
 	if (canClone) {
 		// Persist the non-extractable CryptoKey directly — raw bytes never

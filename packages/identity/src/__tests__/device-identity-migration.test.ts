@@ -234,43 +234,7 @@ async function seedPreMigrationIDB(): Promise<Uint8Array> {
 	return seed;
 }
 
-describe('KEK migration (#98): separate KEK IDB database', () => {
-	it('pre-migration: old wrapping-key in identity DB → KEK migrated to new DB, old entry preserved (copy-only)', async () => {
-		if (!ed25519Supported) return;
-
-		const originalSeed = await seedPreMigrationIDB();
-
-		const mod = await freshImport();
-		const identity = await mod.getOrCreateDeviceIdentity();
-
-		// KEK exists in new DB.
-		const kekEntry = await idbRead(KEK_DB_NAME, KEK_STORE_NAME, KEK_KEY_NAME);
-		expect(kekEntry).not.toBeNull();
-
-		// ...and is NON-EXTRACTABLE, which is the whole point of #95. Without
-		// this the migration could import the KEK extractable and every
-		// assertion here would still pass — verified by mutating
-		// `importAesKwRaw(legacyRaw, false)` to `true`, which went GREEN before
-		// this line existed.
-		expect(
-			(kekEntry as CryptoKey).extractable,
-			'migrated KEK is extractable — #95 is not actually enforced',
-		).toBe(false);
-
-		// Old entry still present (copy-only migration — NEVER deleted).
-		const oldEntry = await idbRead(LEGACY_DB_NAME, LEGACY_STORE_NAME, LEGACY_WRAPPING_KEY_NAME);
-		expect(oldEntry).not.toBeNull();
-
-		// The acceptance criterion for the whole migration: an identity created
-		// BEFORE this change still unwraps to the IDENTICAL seed through the
-		// normal signing path. Everything else here checks where the KEK lives;
-		// this checks that the user still owns their account.
-		expect(identity.privateKeySeed, 'identity did not unwrap after migration').not.toBeNull();
-		expect(
-			Array.from(identity.privateKeySeed!.bytes()),
-			'migrated identity unwrapped to DIFFERENT bytes — silent account loss',
-		).toEqual(Array.from(originalSeed));
-	});
+describe('KEK storage (#98): dedicated KEK IDB database', () => {
 
 	it('new code: KEK in new DB, old DB has NO wrapping-key entry', async () => {
 		if (!ed25519Supported) return;
@@ -281,6 +245,17 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 		// KEK exists in new DB.
 		const kekEntry = await idbRead(KEK_DB_NAME, KEK_STORE_NAME, KEK_KEY_NAME);
 		expect(kekEntry).not.toBeNull();
+
+		// ...and is NON-EXTRACTABLE, which is the whole of #95. With the legacy
+		// migration gone, creation is the ONLY path that produces a KEK here, so
+		// this is the only place the invariant can be caught. Verified by
+		// mutating generateAesKwKey(false) to true: without this line only
+		// room-host-seed's tests went red, and device-identity would have
+		// shipped an extractable KEK unnoticed.
+		expect(
+			(kekEntry as CryptoKey).extractable,
+			'device KEK is extractable — #95 is not enforced on the creation path',
+		).toBe(false);
 
 		// Old DB has NO wrapping-key entry (fresh install on new code).
 		const oldEntry = await idbRead(LEGACY_DB_NAME, LEGACY_STORE_NAME, LEGACY_WRAPPING_KEY_NAME);
@@ -338,25 +313,6 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 		expect(oldKekAfter).toBeNull();
 		const devKeyAfter = await idbRead(LEGACY_DB_NAME, LEGACY_STORE_NAME, LEGACY_DEVICE_KEY_NAME);
 		expect(devKeyAfter).toBeNull();
-	});
-
-	it('exportRawDeviceSecret returns same 32 bytes before and after migration', async () => {
-		if (!ed25519Supported) return;
-
-		const originalSeed = await seedPreMigrationIDB();
-
-		// Before migration (triggers migration as a side effect of getOrCreateWrappingKey).
-		const mod1 = await freshImport();
-		const result1 = await mod1.exportRawDeviceSecret();
-		expect(result1.secret.byteLength).toBe(32);
-		expect(Array.from(result1.secret)).toEqual(Array.from(originalSeed));
-
-		// After migration (KEK now in new DB, loaded from there on fresh import).
-		const mod2 = await freshImport();
-		const result2 = await mod2.exportRawDeviceSecret();
-		expect(result2.secret.byteLength).toBe(32);
-		expect(Array.from(result2.secret)).toEqual(Array.from(result1.secret));
-		expect(result2.publicB64u).toBe(result1.publicB64u);
 	});
 
 	it('identity persists across reload (round-trip with new KEK DB)', async () => {
