@@ -54,6 +54,15 @@ describe('RatchetSession crypto-internal compliance — repo-wide', () => {
     expect(hits, `Production code calls snapshotRecvChain: ${hits.join('\n')}`).toEqual([]);
   });
 
+  // recvCounter exposes lowestCounter, the forward-secrecy boundary. Added
+  // after a review found the enumeration below was incomplete: a guard whose
+  // ground truth is a hand-written list cannot catch what is missing from it.
+  it('recvCounter not referenced outside __tests__', () => {
+    const files = walkSrc(repoRoot);
+    const hits = files.filter(f => readFileSync(f, 'utf8').includes('recvCounter'));
+    expect(hits, `Production code reads recvCounter: ${hits.join('\n')}`).toEqual([]);
+  });
+
   it('fromCompromisedState not referenced outside __tests__', () => {
     const files = walkSrc(repoRoot);
     const hits = files.filter(f => readFileSync(f, 'utf8').includes('fromCompromisedState'));

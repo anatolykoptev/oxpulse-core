@@ -33,8 +33,16 @@ retroactively decryptable by a future quantum adversary — the same constructio
 and Apple's PQ3.
 
 Transport AEAD is **AES-128-GCM** via WebCrypto (hardware-accelerated on modern ARM), with the nonce
-built from a direction byte plus a 64-bit counter, and a sliding replay window that rejects
-duplicated or replayed frames.
+built from a direction byte plus a 64-bit counter. Each frame is encrypted under a **distinct AEAD
+key** derived from the previous frame's chain key via one HKDF-SHA-256 step; after the key is used
+the chain advances irreversibly, so compromise of the sender's state at frame *T* cannot retroactively
+decrypt frames it already sent. A sliding **64-frame replay window** rejects duplicated or replayed
+frames, and a matching 64-entry key cache on the receiver retains keys for the trailing 64 counters so
+that BLE GATT notifications reordered under congestion still decrypt. This is **window forward
+secrecy**, not per-frame forward secrecy: compromise of the receiver's state at frame *T* reveals
+frames in *[T−63, T]*; frames older than *T−64* are unrecoverable because their keys and chain state
+have been evicted. Per-frame forward secrecy (strict in-order, no key retention) was rejected because
+BLE reorders under congestion and strict in-order delivery dropped legitimate frames.
 
 Peer authentication is **TOFU** (trust on first use) plus an out-of-band **SAS** check: the first
 time you meet a peer its static public key is pinned, a short authentication string is derived, and

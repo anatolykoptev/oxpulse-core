@@ -63,7 +63,7 @@ const { disconnectSpy, writeRxSpy, txNotifyCb, rxListenerCb, connListenerCb, sca
 
     isComplete(): boolean { return this.msgIdx >= 3; }
     split(): { sendKey: Uint8Array; recvKey: Uint8Array } {
-      return { sendKey: new Uint8Array(16), recvKey: new Uint8Array(16) };
+      return { sendKey: new Uint8Array(32), recvKey: new Uint8Array(32) };
     }
     sas(): string { return '12345'; }
     peerStaticPublicKey(): Uint8Array | null { return new Uint8Array(32); }

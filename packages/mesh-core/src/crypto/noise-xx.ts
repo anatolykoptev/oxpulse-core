@@ -61,6 +61,12 @@ import { toBufferSource } from './buffer.js';
 const PROTOCOL_NAME = 'Noise_XX_25519_AESGCM_SHA256_OXPULSE_MESH_B2_V1';
 const HKDF_INFO = new TextEncoder().encode('oxpulse-mesh-b2-v1');
 
+// Split output size: 32-byte chain keys consumed by the per-frame ratchet
+// (RatchetSession). Wider than the 16-byte internal Noise cipher key so the
+// ratchet's key derivation and chain advancement draw from non-overlapping
+// HKDF output.
+const CHAIN_KEY_BYTES = 32;
+
 // ─── AES-GCM via WebCrypto (browser + Node 22+) ──────────────────────────────
 
 async function aesGcmEncrypt(
@@ -251,7 +257,7 @@ export class NoiseXxHandshake {
     throw new NoiseStateError(`readMessage: invalid state role=${this.role} idx=${this.msgIdx}`);
   }
 
-  /** After isComplete(): derive AEAD send/recv keys hybridised with ML-KEM. */
+  /** After isComplete(): derive 32-byte send/recv chain keys hybridised with ML-KEM. */
   split(): NoiseSplit {
     if (this.msgIdx !== 3) throw new Error('split: handshake incomplete');
     if (!this.mlkemSharedSecret) throw new Error('split: missing mlkem shared secret');
@@ -261,9 +267,9 @@ export class NoiseXxHandshake {
     ikm.set(this.state.ck, 0);
     ikm.set(this.mlkemSharedSecret, this.state.ck.length);
 
-    const okm = hkdf(sha256, ikm, this.state.h, HKDF_INFO, AEAD_KEY_BYTES * 2);
-    const k1 = okm.slice(0, AEAD_KEY_BYTES);
-    const k2 = okm.slice(AEAD_KEY_BYTES, AEAD_KEY_BYTES * 2);
+    const okm = hkdf(sha256, ikm, this.state.h, HKDF_INFO, CHAIN_KEY_BYTES * 2);
+    const k1 = okm.slice(0, CHAIN_KEY_BYTES);
+    const k2 = okm.slice(CHAIN_KEY_BYTES, CHAIN_KEY_BYTES * 2);
 
     return this.role === 'initiator'
       ? { sendKey: k1, recvKey: k2 }

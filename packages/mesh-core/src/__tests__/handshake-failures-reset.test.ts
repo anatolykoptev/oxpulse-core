@@ -62,7 +62,7 @@ const { disconnectSpy, writeRxSpy, txNotifyCb, rxListenerCb, connListenerCb, sca
     }
 
     split(): { sendKey: Uint8Array; recvKey: Uint8Array } {
-      return { sendKey: new Uint8Array(16), recvKey: new Uint8Array(16) };
+      return { sendKey: new Uint8Array(32), recvKey: new Uint8Array(32) };
     }
 
     sas(): string {

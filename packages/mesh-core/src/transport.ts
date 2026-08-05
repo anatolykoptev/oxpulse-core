@@ -20,7 +20,7 @@ import { FrameReassembler, chunkFrame, FrameType } from './frame.js';
 import { GATT_MTU_DEFAULT, HANDSHAKE_TIMEOUT_MS, TOFU_MAX_ENTRIES, MAX_BLE_CONNECTIONS } from './constants.js';
 import { NoiseXxHandshake, NoiseStateError } from './crypto/noise-xx.js';
 import type { NoiseSplit } from './crypto/noise-xx.js';
-import { Session } from './crypto/session.js';
+import { RatchetSession } from './crypto/session-ratchet.js';
 import { toBufferSource } from './crypto/buffer.js';
 import { getOrCreateDeviceIdentity, fromBase64url, getOrCreateX25519Keypair, dhX25519 as identityDhX25519 } from '@oxpulse/identity';
 import { ed25519 as nobleEd25519 } from '@noble/curves/ed25519.js';
@@ -112,7 +112,7 @@ function transitionVerdict(cs: CryptoState, next: CryptoVerdict): boolean {
 interface CryptoState {
   handshake: NoiseXxHandshake;
   role: 'initiator' | 'responder';
-  session: Session | null;
+  session: RatchetSession | null;
   sas: string | null;
   verdict: CryptoVerdict;
   /** Peer's long-term Ed25519 pubkey (set after handshake complete). */
@@ -880,9 +880,9 @@ async function advanceHandshake(
 
     // Session direction: initiator and responder nonces are scoped by direction.
     // cs.role determines which direction label to use.
-    const direction: import('./crypto/session.js').Direction = cs.role;
+    const direction: import('./crypto/session-ratchet.js').Direction = cs.role;
 
-    cs.session = new Session({ sendKey: split.sendKey, recvKey: split.recvKey, direction });
+    cs.session = new RatchetSession({ sendChainKey: split.sendKey, recvChainKey: split.recvKey, direction });
     cs.sas = hs.sas();
 
     // #46: reset handshakeFailures on successful session establishment.

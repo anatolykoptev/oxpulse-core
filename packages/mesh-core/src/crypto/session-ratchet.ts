@@ -31,31 +31,29 @@
  * • Chain key size: 32 bytes (deliberately wider than AEAD key so the
  *   ratchet and key derivation draw from non-overlapping HKDF output).
  * • AEAD: AES-128-GCM via WebCrypto. Nonce = direction_byte || u64
- *   counter, big-endian, zero-padded to 12 bytes — same layout as
- *   Session in session.ts for consistency.
- * • Replay window: 64-entry bitmap identical to Session. Frames behind
- *   the window are rejected regardless of key generation.
+ *   counter, big-endian, zero-padded to 12 bytes.
+ * • Replay window: 64-entry bitmap. Frames behind the window are rejected
+ *   regardless of key generation.
  * • Out-of-order delivery: the receiver maintains a key cache covering
  *   the same 64-counter window as the replay bitmap. Frames that arrive
  *   reordered within the window can be decrypted. Keys for counters
  *   more than RECV_WINDOW_SIZE (64) frames behind the highest decrypted
  *   counter are pruned — forward secrecy beyond the window.
  *
- * Wire format (same as Session):
+ * Wire format:
  *   [u64 counter big-endian][AES-128-GCM ciphertext+tag]
  *
  * Wire incompatibility
  * --------------------
- * RatchetSession is NOT compatible with the static-key Session class.
- * Old B.2 peers that run Session cannot interoperate with RatchetSession
- * peers. At the time this ships there are no Session peers in production,
- * so this is a clean break.
+ * RatchetSession replaces the former static-key Session class entirely.
+ * Peers running the old static-key Session cannot interoperate with
+ * RatchetSession peers — both sides must be on the same version. This is
+ * a breaking wire change (MINOR bump under bump-minor-pre-major).
  */
 
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { AEAD_NONCE_BYTES, REPLAY_WINDOW_SIZE } from '../constants.generated.js';
-import { ReplayWindow } from './session.js';
 import { toBufferSource } from './buffer.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -81,6 +79,58 @@ const RECV_WINDOW_SIZE = REPLAY_WINDOW_SIZE; // parity with ReplayWindow bitmap
 const RECV_LOOKAHEAD = 8;
 
 export type Direction = 'initiator' | 'responder';
+
+// ─── Replay window ───────────────────────────────────────────────────────────
+
+/**
+ * Sliding-window replay bitmap shared by the ratchet and the legacy session.
+ * bit i set iff (highest - i) has been seen, 0 ≤ i < REPLAY_WINDOW_SIZE.
+ *
+ * Two-phase check (canAccept before AEAD, commit after AEAD success) prevents
+ * the DoS gadget where a spoofed frame with a valid counter but bad AEAD tag
+ * poisons the bitmap so the legitimate frame at that counter is rejected.
+ */
+export class ReplayWindow {
+  private highest: bigint = -1n;
+  private bitmap = 0n;
+
+  canAccept(counter: bigint): boolean {
+    if (counter < 0n) return false;
+    if (this.highest < 0n) return true;
+    if (counter > this.highest) return true;
+    const offset = this.highest - counter;
+    if (offset >= BigInt(REPLAY_WINDOW_SIZE)) return false;
+    return (this.bitmap & (1n << offset)) === 0n;
+  }
+
+  commit(counter: bigint): void {
+    if (this.highest < 0n) {
+      this.highest = counter;
+      this.bitmap = 1n;
+      return;
+    }
+    if (counter > this.highest) {
+      const shift = counter - this.highest;
+      if (shift >= BigInt(REPLAY_WINDOW_SIZE)) {
+        this.bitmap = 1n;
+      } else {
+        this.bitmap = (this.bitmap << shift) | 1n;
+      }
+      this.highest = counter;
+      const mask = (1n << BigInt(REPLAY_WINDOW_SIZE)) - 1n;
+      this.bitmap &= mask;
+    } else {
+      const offset = this.highest - counter;
+      this.bitmap |= (1n << offset);
+    }
+  }
+
+  checkAndAccept(counter: bigint): boolean {
+    if (!this.canAccept(counter)) return false;
+    this.commit(counter);
+    return true;
+  }
+}
 
 // ─── Options ─────────────────────────────────────────────────────────────────
 
@@ -150,6 +200,20 @@ function makeNonce(direction: Direction, counter: bigint): Uint8Array {
  * `lowestCounter`, allowing snapshotRecvChain() to return a compact
  * representation of the current key-schedule position.
  */
+/**
+ * Best-effort zeroization of key material before it is released to GC.
+ *
+ * JS gives no `zeroize` guarantee: the engine may have copied the buffer, and
+ * the wipe only takes effect once this reference is the last one. It narrows
+ * the window in which a process memory dump can recover a superseded chain
+ * key; it does not close it. Every caller below wipes state it OWNS — the
+ * constructors `.slice()` their inputs, so no caller-supplied buffer is ever
+ * touched.
+ */
+function wipe(buf: Uint8Array): void {
+  buf.fill(0);
+}
+
 class RecvKeyCache {
   /** counter → 16-byte AEAD key material */
   private readonly keys = new Map<bigint, Uint8Array>();
@@ -179,7 +243,9 @@ class RecvKeyCache {
     while (this.highestDerived < upTo) {
       const ctr = this.highestDerived + 1n;
       this.keys.set(ctr, deriveFrameKey(this.chain));
-      this.chain = ratchetChain(this.chain);
+      const nextChain = ratchetChain(this.chain);
+      wipe(this.chain);
+      this.chain = nextChain;
       this.highestDerived = ctr;
     }
   }
@@ -213,8 +279,12 @@ class RecvKeyCache {
 
     // Prune and advance chainAtLowest.
     for (let c = this.lowestCounter; c < pruneBelow; c += 1n) {
+      const prunedKey = this.keys.get(c);
+      if (prunedKey) wipe(prunedKey);
       this.keys.delete(c);
-      this.chainAtLowest = ratchetChain(this.chainAtLowest);
+      const nextAtLowest = ratchetChain(this.chainAtLowest);
+      wipe(this.chainAtLowest);
+      this.chainAtLowest = nextAtLowest;
     }
     if (pruneBelow > this.lowestCounter) {
       this.lowestCounter = pruneBelow;
@@ -300,8 +370,14 @@ export class RatchetSession {
     this.sendCounter += 1n;
 
     const rawKey = deriveFrameKey(this.sendChain);
-    // Advance chain immediately — old key material becomes unrecoverable.
-    this.sendChain = ratchetChain(this.sendChain);
+    // Advance the chain immediately and wipe the superseded key. Wiping is
+    // best-effort (see wipe()): it does NOT make the old key unrecoverable, it
+    // shortens how long a memory dump could recover it. An earlier version of
+    // this comment claimed unrecoverability outright, which is not something JS
+    // can promise and is exactly the kind of guarantee a reader will trust.
+    const nextSendChain = ratchetChain(this.sendChain);
+    wipe(this.sendChain);
+    this.sendChain = nextSendChain;
 
     const nonce = makeNonce(this.localDir, counter);
     const key = await crypto.subtle.importKey('raw', toBufferSource(rawKey), 'AES-GCM', false, ['encrypt']);

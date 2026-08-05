@@ -3,7 +3,7 @@
  *
  * Edge-case / property tests for ReplayWindow.
  * ReplayWindow is already implemented; these tests are a regression guard
- * for future modifications to session.ts crypto.
+ * for future modifications to session-ratchet.ts crypto.
  *
  * REPLAY_WINDOW_SIZE = 64 (from constants.generated.ts).
  * Invariants verified:
@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { ReplayWindow } from '../../crypto/session.js';
+import { ReplayWindow } from '../../crypto/session-ratchet.js';
 
 const WINDOW = 64n; // must match REPLAY_WINDOW_SIZE in constants.generated.ts
 
