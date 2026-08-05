@@ -75,6 +75,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Required, not optional. mesh-core imports @oxpulse/identity, which is
+      # linked from the workspace (#85) and whose package `main` points at
+      # dist/. Without this the suite fails at import on every one of the N
+      # runs — a flake detector that is red for an unrelated reason detects
+      # nothing. Same ordering as preflight.yml.
+      - name: Build
+        run: pnpm run build
+
       - name: Run the suite N times, fail if ANY run fails
         env:
           NODE_ENV: test
