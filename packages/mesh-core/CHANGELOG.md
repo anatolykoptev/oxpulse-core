@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.2.1...mesh-core-v0.2.2) (2026-08-05)
+
+
+### Fixed
+
+* **mesh-core:** do not create a CryptoState for a device that disconnected mid-handshake ([#93](https://github.com/anatolykoptev/oxpulse-core/issues/93)) ([741d53f](https://github.com/anatolykoptev/oxpulse-core/commit/741d53f060a7451c99dca0a85588fbf1b49b8f16))
+* **mesh-core:** review follow-ups + guard against the wall-clock sleep returning ([#90](https://github.com/anatolykoptev/oxpulse-core/issues/90)) ([b403212](https://github.com/anatolykoptev/oxpulse-core/commit/b40321292aa9f4aaef8c27a748791882c7dc5716))
+
 ## [0.2.1](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.2.0...mesh-core-v0.2.1) (2026-08-05)
 
 
