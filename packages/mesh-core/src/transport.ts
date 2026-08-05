@@ -254,9 +254,22 @@ function nextBackoffMs(deviceId: string): number {
  * #44: Clear backoff/backoffCounts entries for a device on disconnect.
  * Prevents unbounded Map growth in high-churn environments where devices
  * repeatedly connect/disconnect without ever succeeding.
- * Emits a `backoff_cleared` metric when entries existed (observability).
+ *
+ * F1 (2026-08-04 audit): an ARMED retry window (retryAt > now) must survive a
+ * disconnect event — otherwise a device that fails to connect and then emits a
+ * disconnect is retried on the very next scan sighting, a hot reconnect loop
+ * that defeats exponential backoff (the exact churn scenario #44 was filed
+ * about). Only entries whose window has already expired are dropped here; the
+ * 30s GC interval (see startMesh) prunes any expired entries left behind when a
+ * device disappears without emitting a post-expiry disconnect, so growth stays
+ * bounded. Emits a `backoff_cleared` metric only when entries were actually
+ * removed (honest semantics).
  */
 function clearBackoff(deviceId: string): void {
+  // An armed window is still cooling down — keep it so the next scan sighting
+  // is still suppressed. The expired-entry case is handled below + by the GC.
+  const retryAt = backoff.get(deviceId) ?? 0;
+  if (retryAt > Date.now()) return;
   const had = backoff.has(deviceId) || backoffCounts.has(deviceId);
   backoff.delete(deviceId);
   backoffCounts.delete(deviceId);
@@ -278,6 +291,11 @@ export function _getBackoffCountsSize(): number {
 /** Expose handshakeFailures for a device's CryptoState (issue #46). @internal */
 export function _getHandshakeFailures(deviceId: string): number {
   return cryptoStates.get(deviceId)?.handshakeFailures ?? 0;
+}
+
+/** Expose whether a CryptoState exists for a device (F2 audit). @internal */
+export function _hasCryptoState(deviceId: string): boolean {
+  return cryptoStates.has(deviceId);
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +428,20 @@ export async function startMesh(): Promise<void> {
       cryptoStates.delete(e.deviceAddress);
       // #44: clear backoff entries to prevent unbounded Map growth on churn.
       clearBackoff(e.deviceAddress);
+    } else {
+      // F2 (2026-08-04 audit): register INBOUND connections — peers that
+      // connect TO our GATT server without us also connecting outbound to
+      // them. Without this, the responder-handshake guards in
+      // handleIncomingChunk (connectedDevices.has) and checkHandshakeTimeouts
+      // drop every inbound handshake frame and never time out, so a peer
+      // reachable only inbound (connection cap hit, backoff window, MAC
+      // rotation) can never complete a handshake. The entry shape matches the
+      // outbound path ({ unsubscribe }); an inbound device has no outbound
+      // subscription, so unsubscribe is a no-op (stopMesh calls it in a
+      // try/catch). Guard against clobbering an existing outbound entry.
+      if (!connectedDevices.has(e.deviceAddress)) {
+        connectedDevices.set(e.deviceAddress, { unsubscribe: async () => {} });
+      }
     }
   });
   listenerRemovers.push(async () => connHandle.remove());
@@ -418,6 +450,16 @@ export async function startMesh(): Promise<void> {
   gcInterval = setInterval(() => {
     registry.gc();
     meshState.peers = registry.list();
+    // F1/#44: prune expired backoff entries so the Maps don't grow without
+    // bound when a device fails to connect and then disappears without ever
+    // emitting a post-expiry disconnect. Armed windows are left untouched.
+    const now = Date.now();
+    for (const [id, retryAt] of backoff) {
+      if (retryAt <= now) {
+        backoff.delete(id);
+        backoffCounts.delete(id);
+      }
+    }
   }, 30_000);
 
   // B.2-handshake-timeout: check for stalled handshakes every 5s.
