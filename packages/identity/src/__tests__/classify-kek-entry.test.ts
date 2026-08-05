@@ -11,7 +11,7 @@
 // a maintainer can read.
 
 import { describe, expect, it } from 'vitest';
-import { classifyKekEntry } from '../aes-kw.js';
+import { classifyKekEntry, generateAesKwKey } from '../aes-kw.js';
 
 async function aesKw(extractable: boolean): Promise<CryptoKey> {
 	return crypto.subtle.generateKey({ name: 'AES-KW', length: 256 }, extractable, [
@@ -19,6 +19,29 @@ async function aesKw(extractable: boolean): Promise<CryptoKey> {
 		'unwrapKey',
 	]);
 }
+
+describe('generateAesKwKey', () => {
+	it('generates a 256-bit KEK', async () => {
+		// Measured: mutating the length to 128 passed the entire suite. Nothing
+		// pinned the strength — classifyKekEntry checks the algorithm NAME but
+		// deliberately not the length, and an AES-128-KW key wraps and unwraps a
+		// 256-bit seed perfectly well.
+		//
+		// The check stays here rather than in classifyKekEntry on purpose. Adding
+		// a length clause to the classifier would make every stored KEK of an
+		// unexpected strength a hard error, and a read-side predicate that can
+		// reject a legitimately stored key is how permanent secret loss happens —
+		// the same trap as `extractable === false`. Generation is the right place
+		// to pin strength; the read side should stay permissive about it.
+		const kek = await generateAesKwKey(false);
+		expect((kek.algorithm as AesKeyAlgorithm).length).toBe(256);
+		expect(kek.extractable).toBe(false);
+	});
+
+	it('honours the extractable argument', async () => {
+		expect((await generateAesKwKey(true)).extractable).toBe(true);
+	});
+});
 
 describe('classifyKekEntry', () => {
 	it('accepts a non-extractable AES-KW key as { kind: "key" }', async () => {

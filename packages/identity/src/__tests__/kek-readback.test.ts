@@ -146,13 +146,22 @@ describe.each(STORES)('KEK read-back — $name (#108)', (S) => {
 		}
 	});
 
-	it('re-imports a raw-bytes KEK as NON-EXTRACTABLE', async () => {
-		// The `false` argument on the read-back `importAesKwRaw(entry.bytes, false)`
-		// is the last enforcement of #95 on the raw-bytes path, and nothing
-		// asserted it: flipping it to `true` left 131/131 green. The existing
-		// extractable assertions all check the PERSISTED IDB entry on the
-		// CREATION path; this is the cached in-memory handle on the READ path,
-		// and the persisted bytes are identical either way.
+	it('re-imports a raw-bytes KEK as NON-EXTRACTABLE, on BOTH create and read-back', async () => {
+		// The raw-bytes path re-imports the KEK TWICE, and each `false` is the
+		// enforcement of #95 on its half:
+		//   create:    generate extractable -> export -> persist -> re-import false
+		//   read-back: load bytes -> re-import false
+		// Both were unasserted. Measured, each flipped independently to `true`
+		// while the whole suite stayed green — the read-back one at 131/131, and
+		// the creation one at 133/133 even AFTER the read-back was gated, because
+		// the first version of this test cleared the creation-half observation
+		// before asserting. That clear is gone: the spy now covers both halves,
+		// with a separate anti-vacuous guard for each so neither can pass on the
+		// other's calls.
+		//
+		// Every pre-existing extractable assertion checks the PERSISTED IDB entry;
+		// these are the cached in-memory handles, and the persisted bytes are
+		// byte-identical either way, so none of them can see this.
 		//
 		// The oracle is the argument itself, not behaviour, because an extractable
 		// KEK wraps and unwraps exactly like a non-extractable one — the only
@@ -190,12 +199,16 @@ describe.each(STORES)('KEK read-back — $name (#108)', (S) => {
 
 		try {
 			reload();
-			await S.load();          // creates, persisting raw bytes
-			aesKwImports.length = 0; // only the READ-BACK path is under test
+			await S.load();                       // creates, persisting raw bytes
+			const afterCreate = aesKwImports.length;
 			reload();
-			await S.load();          // reads them back
+			await S.load();                       // reads them back
 
-			expect(aesKwImports.length).toBeGreaterThan(0);
+			// Anti-vacuous, per half: each must actually have re-imported, so a
+			// mutation that skips either path fails here rather than sliding
+			// past a `not.toContain(true)` over an empty array.
+			expect(afterCreate).toBeGreaterThan(0);
+			expect(aesKwImports.length).toBeGreaterThan(afterCreate);
 			expect(aesKwImports).not.toContain(true);
 		} finally {
 			(crypto.subtle as { importKey: unknown }).importKey = savedImport;
