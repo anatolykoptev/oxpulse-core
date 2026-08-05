@@ -24,6 +24,21 @@
 import { onHandshakeStateChange } from '../transport.js';
 
 /**
+ * Captured at module load, before any test body can call `vi.useFakeTimers()`.
+ *
+ * `waitFor` checks its deadline only BEFORE awaiting the wake promise. If
+ * `setTimeout` were faked and never advanced, that promise would never settle
+ * and `waitFor` would wait forever — and a hung suite emits nothing, so in CI
+ * it reads as a slow job until the workflow timeout kills it, not as a failure.
+ * That is the same shape as the flake this helper was written to remove, so it
+ * is worth spending one captured reference to make it impossible.
+ *
+ * Imports are evaluated before test bodies run, so this is the real timer even
+ * in a file that fakes timers in `beforeEach`.
+ */
+const realSetTimeout: typeof globalThis.setTimeout = globalThis.setTimeout.bind(globalThis);
+
+/**
  * Wait until `predicate` returns true.
  *
  * Drives the wait by (a) draining microtasks, (b) waking early when the
@@ -60,7 +75,8 @@ export async function waitFor(
       // Wait for either a handshake state-change event or a short real timer.
       await new Promise<void>((resolve) => {
         resolveWake = resolve;
-        setTimeout(resolve, interval);
+        // realSetTimeout, not setTimeout — see the note at the top of this file.
+        realSetTimeout(resolve, interval);
       });
     }
   } finally {

@@ -123,9 +123,9 @@ describe('#44: backoff/backoffMaps cleanup on disconnect (F1: armed window survi
     connListenerCb.current = null; scanCbRef.current = null;
     if (typeof localStorage !== 'undefined') localStorage.clear();
     _resetTofuStore();
-    // Fake only Date so drain()'s real setTimeout still drives the microtask
+    // Fake only Date so waitFor's real setTimeout still drives its polling
     // loop, while we can advance the clock past the 5s backoff window to test
-    // the expired-entry clear path.
+    // the expired-entry clear path. Faking setTimeout here would hang waitFor.
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(0));
   });

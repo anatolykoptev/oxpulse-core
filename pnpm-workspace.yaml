@@ -21,6 +21,14 @@ packages:
 # file and ignores the same keys in .npmrc, so a fix applied there looks
 # applied and does nothing. Verified on pnpm 10.28.2.
 linkWorkspacePackages: true
+
+# Not load-bearing for the bug above — linkWorkspacePackages alone already links
+# correctly while the workspace version satisfies the range, and neither key
+# rescues the range-break case (verified: with identity at 0.2.0 against a
+# ^0.1.0 range, both flags set, pnpm still falls back to the registry — which is
+# why workspace-linkage.test.ts exists). This only decides the tie when a
+# registry version NEWER than the workspace one also satisfies the range, and we
+# want the local one then.
 preferWorkspacePackages: true
 
 # Keep the published specifier a real semver range. With this true (the
