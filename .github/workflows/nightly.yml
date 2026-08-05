@@ -1,0 +1,143 @@
+# Nightly gate for oxpulse-core — the two things preflight.yml structurally cannot catch.
+#
+# ── Why this exists ─────────────────────────────────────────────────────────
+#
+# 1. NONDETERMINISM. preflight runs the suite once. Issue #58 was a handshake
+#    flake whose rate tracked box load — about 1 in 5 full runs on an idle box,
+#    2 in 3 under load. Every one of the ~15 PRs merged during the 2026-08-04
+#    fix arc passed that single-run gate, so "CI was green" was not evidence
+#    about any of them. A gate that runs once cannot distinguish a passing
+#    suite from a suite that passes 80% of the time.
+#
+#    The repeat job below runs the suite N times and fails if ANY run fails.
+#    That is its whole reason to exist: the acceptance criterion is a RATE, and
+#    a rate needs a sample. Loosening it to "fail if most runs fail" would put
+#    back exactly the blind spot it was built to close.
+#
+# 2. NEWLY-DISCLOSED CVEs. A dependency advisory published today makes an
+#    unchanged tree vulnerable, and no pull_request event will ever fire for
+#    it. mesh-core ships @noble/curves, @noble/hashes and @noble/post-quantum
+#    to npm as runtime deps of a cryptographic transport, so a vulnerable
+#    transitive dep reaches consumers directly.
+#
+# Both are scheduled rather than per-PR because both cost minutes and neither
+# is caused by the diff under review. Public repo → ubuntu-24.04-arm, free and
+# unlimited, arm64 = prod-box parity.
+#
+# ── Verify it actually fires ────────────────────────────────────────────────
+#
+# GitHub disables scheduled workflows in a repo with no pushes for 60 days, and
+# it does so silently — a dead nightly reads exactly like a passing one. Check
+# `gh run list --workflow=nightly.yml` has a run newer than 48h before trusting
+# a quiet week. workflow_dispatch is here so the job can be proven on demand
+# rather than waited on.
+
+name: nightly
+
+on:
+  schedule:
+    # 03:17 UTC — off the hour, where the runner queue is shortest.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: 'How many times to run the suite in the repeat job'
+        required: false
+        default: '10'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Nondeterminism detector ───────────────────────────────────────────────
+  repeat:
+    name: Suite x${{ github.event.inputs.repeats || 10 }} (flake detector)
+    runs-on: ubuntu-24.04-arm
+    # 10 runs at ~30s plus install headroom. Generous: a slow box must cost
+    # latency, not a false red — the same principle the #58 fix applied to the
+    # tests themselves.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run the suite N times, fail if ANY run fails
+        env:
+          NODE_ENV: test
+          REPEATS: ${{ github.event.inputs.repeats || '10' }}
+        run: |
+          set -u
+          failed=0
+          for i in $(seq 1 "$REPEATS"); do
+            echo "::group::run $i/$REPEATS"
+            # Never pipe the suite through tail/grep: a hung run emits nothing
+            # and reads as slow, and $? after a pipe is the pipe's.
+            if pnpm -r run test -- --run --no-file-parallelism > "/tmp/run-$i.log" 2>&1; then
+              echo "run $i: pass"
+            else
+              failed=$((failed + 1))
+              echo "run $i: FAIL"
+              cat "/tmp/run-$i.log"
+            fi
+            echo "::endgroup::"
+          done
+          echo "flake rate: $failed/$REPEATS runs failed"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::$failed of $REPEATS suite runs failed — the suite is nondeterministic. A single green run is not evidence; see issue #58."
+            exit 1
+          fi
+          echo "OK: $REPEATS/$REPEATS runs passed"
+
+  # ── Dependency advisories ─────────────────────────────────────────────────
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Reported in full first so the log always shows the whole picture,
+      # including the moderate/low findings the gate below deliberately does
+      # not fail on. `|| true` because this call is the REPORT, not the gate —
+      # the next step is the gate.
+      - name: Report all advisories
+        run: pnpm audit --json > /tmp/audit-all.json 2>&1 || true
+
+      # Gate on runtime dependencies only, high and critical. Those are what a
+      # consumer installing @oxpulse/mesh-core actually receives; a dev-only
+      # advisory does not reach them and must not be able to block a release.
+      - name: Fail on high/critical in runtime dependencies
+        run: |
+          set -u
+          pnpm audit --prod --audit-level high > /tmp/audit-prod.log 2>&1 && rc=0 || rc=$?
+          cat /tmp/audit-prod.log
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::high or critical advisory in a RUNTIME dependency — this ships to every consumer of @oxpulse/mesh-core"
+            exit 1
+          fi
+          echo "OK: no high/critical advisories in runtime dependencies"
