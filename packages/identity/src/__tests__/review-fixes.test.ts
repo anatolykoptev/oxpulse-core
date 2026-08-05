@@ -4,7 +4,7 @@
 //
 // Findings covered:
 //   MAJOR   — getOrCreateX25519Identity throws for pre-W7-P2b1 identities
-//             (privateKeyBytes=null); call must NOT happen before migration gate.
+//             (privateKeySeed=null); call must NOT happen before migration gate.
 //   SEC-CR-001 — Cross-impl X25519 KAT: noble↔RFC 7748 test vector confirms
 //                client produces the spec-mandated shared secret.
 //   SEC-CR-002 — ed25519.verify must use {zip215:false} (strict, matching server
@@ -21,13 +21,14 @@ import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ed25519, x25519 } from '@noble/curves/ed25519.js';
+import { OpaquePrivateKey } from '../opaque-private-key.js';
 
 // ── MAJOR: getOrCreateX25519Identity rejects pre-W7-P2b1 identity ────────────
 //
-// The function throws when privateKeyBytes=null, but SealedChatPage called it
+// The function throws when privateKeySeed=null, but SealedChatPage called it
 // BEFORE checking the migration gate — causing unhandled rejection for old users.
-// Correct usage: call ONLY after confirming privateKeyBytes !== null.
-// This test locks the contract: null privateKeyBytes → throws, non-null → resolves.
+// Correct usage: call ONLY after confirming privateKeySeed !== null.
+// This test locks the contract: null privateKeySeed → throws, non-null → resolves.
 
 describe('MAJOR: getOrCreateX25519Identity contract for migration gate', () => {
 	beforeEach(() => {
@@ -38,8 +39,8 @@ describe('MAJOR: getOrCreateX25519Identity contract for migration gate', () => {
 		vi.restoreAllMocks();
 	});
 
-	it('throws when privateKeyBytes is null (pre-W7-P2b1 identity)', async () => {
-		// Simulate a pre-W7-P2b1 DeviceIdentity: publicKeyB64 present, privateKeyBytes null.
+	it('throws when privateKeySeed is null (pre-W7-P2b1 identity)', async () => {
+		// Simulate a pre-W7-P2b1 DeviceIdentity: publicKeyB64 present, privateKeySeed null.
 		// SealedChatPage.svelte called getOrCreateX25519Identity BEFORE the migration gate;
 		// this test confirms the call throws — proving the gate must come first.
 		const { getOrCreateX25519Identity } = await import('../x25519-identity.js');
@@ -48,17 +49,17 @@ describe('MAJOR: getOrCreateX25519Identity contract for migration gate', () => {
 			publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', // dummy b64url
 			publicKey: null,
 			privateKey: null,
-			privateKeyBytes: null, // <-- pre-W7-P2b1: no raw seed in IDB
+			privateKeySeed: null, // <-- pre-W7-P2b1: no raw seed in IDB
 		} as Parameters<typeof getOrCreateX25519Identity>[0];
 
-		// MUST throw — caller (SealedChatPage) must gate on privateKeyBytes !== null first.
+		// MUST throw — caller (SealedChatPage) must gate on privateKeySeed !== null first.
 		await expect(getOrCreateX25519Identity(mockPreMigrationIdentity)).rejects.toThrow(
-			/privateKeyBytes null.*migration/i,
+			/privateKeySeed null.*migration/i,
 		);
 	});
 
-	it('resolves when privateKeyBytes is non-null (W7-P2b1+ identity)', async () => {
-		// Post-migration identity: privateKeyBytes is a valid 32-byte seed.
+	it('resolves when privateKeySeed is non-null (W7-P2b1+ identity)', async () => {
+		// Post-migration identity: privateKeySeed is a valid 32-byte seed.
 		// This path must work — no throw.
 		vi.resetModules();
 		(globalThis as { indexedDB: IDBFactory }).indexedDB = new IDBFactory();
@@ -70,7 +71,7 @@ describe('MAJOR: getOrCreateX25519Identity contract for migration gate', () => {
 			publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
 			publicKey: null,
 			privateKey: null,
-			privateKeyBytes: seed, // <-- W7-P2b1+: raw 32-byte seed available
+			privateKeySeed: new OpaquePrivateKey(seed), // <-- W7-P2b1+: raw 32-byte seed available
 		} as Parameters<typeof getOrCreateX25519Identity>[0];
 
 		const kp = await getOrCreateX25519Identity(mockPostMigrationIdentity);

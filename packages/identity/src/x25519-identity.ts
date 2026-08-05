@@ -88,17 +88,17 @@ export async function getOrCreateX25519Identity(
 	if (cached) return cached;
 
 	// Generate fresh X25519 keypair and self-sign with @noble/curves ed25519.
-	// privateKeyBytes is the raw 32-byte Ed25519 seed — always available for
+	// privateKeySeed is the raw 32-byte Ed25519 seed — always available for
 	// W7-P2b1+ identities (which include all new enrollments after the noble-universal
-	// swap). Pre-W7-P2b1 identities have privateKeyBytes=null and cannot produce
+	// swap). Pre-W7-P2b1 identities have privateKeySeed=null and cannot produce
 	// a self-sig — they show a migration banner instead.
 	//
 	// Previously this path called crypto.subtle.sign() with identity.privateKey
 	// (CryptoKey). That is now unnecessary: noble ed25519.sign() works on all
 	// runtimes including HyperOS/HarmonyOS where WebCrypto Ed25519 is absent,
 	// and produces byte-identical signatures. The workaround comment is removed.
-	if (!identity.privateKeyBytes) {
-		throw new Error('[x25519-identity] getOrCreateX25519Identity: privateKeyBytes null — identity migration required');
+	if (!identity.privateKeySeed) {
+		throw new Error('[x25519-identity] getOrCreateX25519Identity: privateKeySeed null — identity migration required');
 	}
 	const kp = x25519.keygen();
 
@@ -106,7 +106,7 @@ export async function getOrCreateX25519Identity(
 	signedBytes.set(PKBIND_PREFIX, 0);
 	signedBytes.set(kp.publicKey, PKBIND_PREFIX.length);
 
-	const selfSig = ed25519.sign(signedBytes, identity.privateKeyBytes);
+	const selfSig = ed25519.sign(signedBytes, identity.privateKeySeed.bytes());
 
 	const x25519Id: X25519Identity = {
 		priv: kp.secretKey,

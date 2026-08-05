@@ -163,23 +163,26 @@ describe('device-identity', () => {
 		expect(Array.from(round)).toEqual(Array.from(bytes));
 	});
 
-	// ── privateKeyBytes tests (W7-P2b1 followup) ────────────────────────────
+	// ── privateKeySeed tests (W7-P2b1 followup) ────────────────────────────
 	// Plan: SDK chat route plan, W7-P2b1 limitation #10.
 	// sendSealedMessage needs raw 32-byte Ed25519 seed for @noble/curves signing.
 	// WebCrypto privateKey is non-extractable — no path from CryptoKey → raw bytes.
 	// Fix: store raw seed in IDB alongside the wrapped CryptoKey form.
 
-	it('privateKeyBytes: getOrCreateDeviceIdentity returns Uint8Array(32)', async () => {
+	it('privateKeySeed: getOrCreateDeviceIdentity returns OpaquePrivateKey with 32-byte seed', async () => {
 		if (!ed25519Supported) return;
 
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
 
-		expect(id.privateKeyBytes).toBeInstanceOf(Uint8Array);
-		expect(id.privateKeyBytes.byteLength).toBe(32);
+		// Duck-type: vi.resetModules() creates a fresh OpaquePrivateKey class,
+		// so toBeInstanceOf would fail on class identity. Check .bytes() instead.
+		expect(typeof id.privateKeySeed?.bytes).toBe('function');
+		expect(id.privateKeySeed!.bytes()).toBeInstanceOf(Uint8Array);
+		expect(id.privateKeySeed!.bytes().byteLength).toBe(32);
 	});
 
-	it('privateKeyBytes: round-trips across IDB restart (simulated reload)', async () => {
+	it('privateKeySeed: round-trips across IDB restart (simulated reload)', async () => {
 		if (!ed25519Supported) return;
 
 		const first = await freshImport();
@@ -189,12 +192,12 @@ describe('device-identity', () => {
 		const second = await freshImport();
 		const b = await second.getOrCreateDeviceIdentity();
 
-		expect(Array.from(b.privateKeyBytes)).toEqual(Array.from(a.privateKeyBytes));
+		expect(Array.from(b.privateKeySeed!.bytes())).toEqual(Array.from(a.privateKeySeed!.bytes()));
 	});
 
-	it('privateKeyBytes: signs valid Ed25519 signature verifiable with publicKey', async () => {
+	it('privateKeySeed: signs valid Ed25519 signature verifiable with publicKey', async () => {
 		// This is the core invariant: raw bytes must match the CryptoKey identity.
-		// ed25519.sign(msg, privKeyBytes) must verify against identity.publicKey.
+		// ed25519.sign(msg, privKeyBytes.bytes()) must verify against identity.publicKey.
 		if (!ed25519Supported) return;
 
 		const { ed25519 } = await import('@noble/curves/ed25519.js');
@@ -202,7 +205,7 @@ describe('device-identity', () => {
 		const id = await mod.getOrCreateDeviceIdentity();
 
 		const msg = new Uint8Array([1, 2, 3, 4, 5]);
-		const sig = ed25519.sign(msg, id.privateKeyBytes);
+		const sig = ed25519.sign(msg, id.privateKeySeed!.bytes());
 
 		// Verify via @noble/curves using raw pubkey bytes
 		const pubBytes = mod.fromBase64url(id.publicKeyB64);
@@ -210,7 +213,7 @@ describe('device-identity', () => {
 		expect(valid).toBe(true);
 	});
 
-	it('privateKeyBytes: clearDeviceIdentity also removes raw bytes from IDB', async () => {
+	it('privateKeySeed: clearDeviceIdentity also removes raw bytes from IDB', async () => {
 		if (!ed25519Supported) return;
 
 		const mod = await freshImport();
@@ -218,9 +221,9 @@ describe('device-identity', () => {
 
 		await mod.clearDeviceIdentity();
 
-		// After clear, fresh call mints new identity with new privateKeyBytes.
+		// After clear, fresh call mints new identity with new privateKeySeed.
 		const after = await mod.getOrCreateDeviceIdentity();
-		expect(after.privateKeyBytes).toBeInstanceOf(Uint8Array);
-		expect(after.privateKeyBytes.byteLength).toBe(32);
+		expect(typeof after.privateKeySeed?.bytes).toBe('function');
+		expect(after.privateKeySeed!.bytes().byteLength).toBe(32);
 	});
 });

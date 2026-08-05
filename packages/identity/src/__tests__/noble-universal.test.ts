@@ -72,8 +72,8 @@ describe('noble_sign_verify_roundtrip', () => {
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
 
-		// identity.privateKeyBytes is the raw seed — must be non-null post-swap
-		expect(id.privateKeyBytes).not.toBeNull();
+		// identity.privateKeySeed is the raw seed — must be non-null post-swap
+		expect(id.privateKeySeed).not.toBeNull();
 
 		const payload = `room-abc:${btoa(String.fromCharCode(...new Uint8Array(16).fill(1))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')}:1748124000`;
 		const sigB64 = await mod.signWithDeviceIdentity(id, payload);
@@ -134,8 +134,9 @@ describe('no_webcrypto_ed25519_still_creates_identity', () => {
 		// Must NOT throw — noble path takes over
 		const identity = await mod.getOrCreateDeviceIdentity();
 		expect(identity.publicKeyB64).toMatch(/^[A-Za-z0-9_-]+$/);
-		expect(identity.privateKeyBytes).not.toBeNull();
-		expect(identity.privateKeyBytes!.byteLength).toBe(32);
+		expect(identity.privateKeySeed).not.toBeNull();
+		expect(typeof identity.privateKeySeed?.bytes).toBe('function');
+		expect(identity.privateKeySeed!.bytes().byteLength).toBe(32);
 
 		// Must NOT classify as ed25519_unsupported (the error we're fixing)
 		// i.e., no error thrown at all
@@ -163,7 +164,7 @@ describe('no_webcrypto_ed25519_still_creates_identity', () => {
 		const mod2 = await freshImport();
 		const identity = await mod2.getOrCreateDeviceIdentity();
 		expect(identity.publicKeyB64).toMatch(/^[A-Za-z0-9_-]+$/);
-		expect(identity.privateKeyBytes).not.toBeNull();
+		expect(identity.privateKeySeed).not.toBeNull();
 	});
 });
 

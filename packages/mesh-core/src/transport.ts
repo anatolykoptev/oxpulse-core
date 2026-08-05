@@ -742,12 +742,12 @@ async function getLocalIdentity(): Promise<import('./crypto/noise-xx.js').NoiseX
     async getPublicKey() { return pubkeyBytes; },
     async sign(msg: Uint8Array) {
       // Use @noble/curves for signing — works on all runtimes including HyperOS/HarmonyOS
-      // where WebCrypto Ed25519 is absent (Chrome <137). identity.privateKeyBytes is the
+      // where WebCrypto Ed25519 is absent (Chrome <137). identity.privateKeySeed is the
       // raw 32-byte Ed25519 seed; identity.privateKey CryptoKey may be null on old WebViews.
-      if (!identity.privateKeyBytes) {
-        throw new Error('[identity] Noise XX sign: privateKeyBytes null — identity migration required');
+      if (!identity.privateKeySeed) {
+        throw new Error('[identity] Noise XX sign: privateKeySeed null — identity migration required');
       }
-      return nobleEd25519.sign(msg, identity.privateKeyBytes);
+      return nobleEd25519.sign(msg, identity.privateKeySeed.bytes());
     },
     async getX25519PublicKey() { return x25519Kp.publicKey; },
     async dhX25519(remotePub: Uint8Array) { return identityDhX25519(remotePub); },
