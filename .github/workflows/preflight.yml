@@ -43,6 +43,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build BEFORE typecheck. packages/mesh-core imports @oxpulse/identity,
+      # which is now linked from the workspace (pnpm-workspace.yaml,
+      # linkWorkspacePackages) rather than downloaded from npm. The registry
+      # tarball ships a built dist/ with .d.ts files; the workspace checkout
+      # does not until it is compiled. Typechecking first therefore fails with
+      # "Cannot find module '@oxpulse/identity'". `pnpm -r run build` walks the
+      # workspace graph, so identity compiles before mesh-core.
+      - name: Build
+        run: pnpm run build
+
       - name: Typecheck
         run: pnpm run typecheck
 
@@ -51,6 +61,3 @@ jobs:
         env:
           # WebCrypto + fake-indexeddb need Node, not jsdom
           NODE_ENV: test
-
-      - name: Build
-        run: pnpm run build

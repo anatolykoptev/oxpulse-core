@@ -1,3 +1,32 @@
 packages:
   - packages/*
 
+# ── Workspace linking (issue #85) ──────────────────────────────────────────
+#
+# pnpm 10 defaults linkWorkspacePackages to FALSE, so a sibling package
+# declared with a plain semver range resolves from the REGISTRY rather than
+# from this repo. packages/mesh-core declares "@oxpulse/identity": "^0.1.0",
+# so every gate here was building and testing mesh-core against
+# @oxpulse/identity@0.1.1 downloaded from npm while packages/identity sat at
+# 0.1.5 — two identity-keystore changes ahead. Consumers got 0.1.5. We tested
+# a pairing we never shipped.
+#
+# Nothing failed, which is why it went unnoticed for the whole 2026-08-04 fix
+# arc. workspace-linkage.test.ts now asserts the linkage so it cannot go quiet
+# again — these three keys alone are not enough, because linking silently stops
+# the moment packages/identity no longer satisfies the range in
+# packages/mesh-core/package.json.
+#
+# These belong HERE and not in .npmrc: pnpm 10 moved its own settings into this
+# file and ignores the same keys in .npmrc, so a fix applied there looks
+# applied and does nothing. Verified on pnpm 10.28.2.
+linkWorkspacePackages: true
+preferWorkspacePackages: true
+
+# Keep the published specifier a real semver range. With this true (the
+# default), pnpm rewrites packages/mesh-core's dependency to "workspace:^" on
+# any update — and the publish job runs `npm publish`, which does NOT rewrite
+# that protocol the way `pnpm publish` does. The package would reach npm
+# declaring a literal "workspace:^" dependency and be uninstallable.
+# Migrating to the workspace protocol properly is tracked separately.
+saveWorkspaceProtocol: false

@@ -197,6 +197,12 @@ jobs:
       #
       # Mirrors preflight.yml exactly, including --no-file-parallelism (WebCrypto
       # state isolation — see transport-crypto.test.ts). Keep them in sync.
+      # Build first — identity is linked from the workspace and must be
+      # compiled before mesh-core can typecheck against it. Same ordering as
+      # preflight.yml; keep them in sync.
+      - name: Build
+        run: pnpm run build
+
       - name: Typecheck
         run: pnpm run typecheck
 
@@ -204,9 +210,6 @@ jobs:
         run: pnpm -r run test -- --run --no-file-parallelism
         env:
           NODE_ENV: test
-
-      - name: Build
-        run: pnpm run build
 
       - name: Publish to npm (OIDC trusted publishing)
         working-directory: ${{ matrix.path }}
