@@ -24,7 +24,7 @@ import { emit as track } from './tracker-shim.js';
 import { createIdbStore, IDBUnavailableError } from './idb-store.js';
 import { toArrayBuffer } from './crypto-utils.js';
 import { toBase64url, fromBase64url } from './base64url.js';
-import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw } from './aes-kw.js';
+import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw, classifyKekEntry } from './aes-kw.js';
 import { OpaquePrivateKey } from './opaque-private-key.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
@@ -181,26 +181,24 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	// a brand-new device.
 	const existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
 	if (existing) {
-		// Discriminate on the RAW-BYTES shape, never on `instanceof CryptoKey` (#108).
+		// Shape classification is realm-safe and shared with room-host-seed — see
+		// classifyKekEntry for why neither `instanceof CryptoKey` (#108) nor
+		// `instanceof ArrayBuffer` can be used here.
 		//
-		// `CryptoKey` is not a guaranteed global. jsdom — which is what every
-		// consumer tests under — provides crypto.subtle and structuredClone but no
-		// CryptoKey constructor binding, so `existing instanceof CryptoKey` threw
-		// ReferenceError. It detonated on the SECOND load only, because the first
-		// run never reaches this branch. This repo could not see it: vitest runs
-		// `environment: 'node'`, where the global does exist.
-		//
-		// `canClone` is also the wrong question here. It measures what THIS runtime
-		// can WRITE; this branch is reading what a PREVIOUS session wrote. Raw bytes
-		// are the only other shape the writer below ever persists, and an
-		// ArrayBuffer/TypedArray is identifiable without reaching for a global that
-		// may not be bound.
-		const isRawBytes = existing instanceof ArrayBuffer || ArrayBuffer.isView(existing);
-		cachedWrappingKey = isRawBytes
-			// Persisted as raw bytes (fallback path) — re-import non-extractable.
-			? await importAesKwRaw(existing as ArrayBuffer, false)
-			// Persisted as a non-extractable CryptoKey — use directly.
-			: (existing as CryptoKey);
+		// `canClone` deliberately plays no part: it measures what THIS runtime can
+		// WRITE, and this branch reads what a PREVIOUS session wrote.
+		const entry = classifyKekEntry(existing);
+		if (!entry) {
+			throw new Error(
+				'[device-identity] KEK entry is neither an AES-KW CryptoKey nor raw bytes',
+			);
+		}
+		cachedWrappingKey =
+			entry.kind === 'raw'
+				// Persisted as raw bytes (fallback path) — re-import non-extractable.
+				? await importAesKwRaw(entry.bytes, false)
+				// Persisted as a non-extractable CryptoKey — use directly.
+				: entry.key;
 		return cachedWrappingKey;
 	}
 

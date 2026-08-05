@@ -20,7 +20,7 @@
  */
 
 import { createIdbStore } from './idb-store.js';
-import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw } from './aes-kw.js';
+import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw, classifyKekEntry } from './aes-kw.js';
 
 // LOAD-BEARING: dedicated IDB database — separate from oxpulse-device-id
 // so the room-host root secret is isolated from the device identity store.
@@ -89,13 +89,21 @@ async function getWrappingKey(): Promise<CryptoKey> {
 	// stores the very bytes #95 exists to remove is not a net.
 	const existing = await idb.load<CryptoKey | ArrayBuffer>(WRAPPING_KEY);
 	if (existing) {
-		if (canClone && existing instanceof CryptoKey) {
-			cachedWrappingKey = existing;
-		} else {
-			// Raw bytes — the fallback form on runtimes without CryptoKey
-			// structured-clone. Re-imported non-extractable.
-			cachedWrappingKey = await importAesKwRaw(existing as ArrayBuffer, false);
+		// Same classification as device-identity, from the same helper — this file
+		// carried a verbatim copy of the #108 defect and shipped it in 0.2.0.
+		// Fixing one call site and leaving the sibling is how that class recurs.
+		const entry = classifyKekEntry(existing);
+		if (!entry) {
+			throw new Error(
+				'[room-host-seed] KEK entry is neither an AES-KW CryptoKey nor raw bytes',
+			);
 		}
+		cachedWrappingKey =
+			entry.kind === 'raw'
+				// Raw bytes — the fallback form on runtimes without CryptoKey
+				// structured-clone. Re-imported non-extractable.
+				? await importAesKwRaw(entry.bytes, false)
+				: entry.key;
 		return cachedWrappingKey;
 	}
 
