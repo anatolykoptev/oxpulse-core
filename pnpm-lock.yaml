@@ -44,9 +44,6 @@ importers:
       '@oxpulse/wire-codec':
         specifier: ^0.6.1
         version: 0.6.1
-      sframe-ratchet:
-        specifier: 0.5.0
-        version: 0.5.0(@noble/curves@2.2.0)(@noble/hashes@2.2.0)
     devDependencies:
       '@capacitor-community/bluetooth-le':
         specifier: ^6.1.0
@@ -701,13 +698,6 @@ packages:
   saxes@6.0.0:
     resolution: {integrity: sha512-xAg7SOnEhrm5zI3puOOKyy1OMcMlIJZYNJY7xLBwSze0UjhPLnWfj2GF2EpT0jmzaJKIWKHLsaSSajf35bcYnA==}
     engines: {node: '>=v12.22.7'}
-
-  sframe-ratchet@0.5.0:
-    resolution: {integrity: sha512-U8bQak8cII8RaqJ1Z9Hn84c39XZj3qZdxM1AdDr/cNVbkdpmX6NFzabQfHT/ywIQIEJ1ecpkskcCpH/iLaGFKA==}
-    engines: {node: '>=20'}
-    peerDependencies:
-      '@noble/curves': ^2.2.0
-      '@noble/hashes': ^2.2.0
 
   shebang-command@2.0.0:
     resolution: {integrity: sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA==}
@@ -1556,11 +1546,6 @@ snapshots:
   saxes@6.0.0:
     dependencies:
       xmlchars: 2.2.0
-
-  sframe-ratchet@0.5.0(@noble/curves@2.2.0)(@noble/hashes@2.2.0):
-    dependencies:
-      '@noble/curves': 2.2.0
-      '@noble/hashes': 2.2.0
 
   shebang-command@2.0.0:
     dependencies:

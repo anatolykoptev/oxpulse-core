@@ -39,8 +39,7 @@
     "@noble/hashes": "^2.2.0",
     "@noble/post-quantum": "^0.6.1",
     "@oxpulse/identity": "^0.1.0",
-    "@oxpulse/wire-codec": "^0.6.1",
-    "sframe-ratchet": "0.5.0"
+    "@oxpulse/wire-codec": "^0.6.1"
   },
   "peerDependencies": {
     "@capacitor/core": "^6.2.1",
