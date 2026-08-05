@@ -200,6 +200,20 @@ function makeNonce(direction: Direction, counter: bigint): Uint8Array {
  * `lowestCounter`, allowing snapshotRecvChain() to return a compact
  * representation of the current key-schedule position.
  */
+/**
+ * Best-effort zeroization of key material before it is released to GC.
+ *
+ * JS gives no `zeroize` guarantee: the engine may have copied the buffer, and
+ * the wipe only takes effect once this reference is the last one. It narrows
+ * the window in which a process memory dump can recover a superseded chain
+ * key; it does not close it. Every caller below wipes state it OWNS — the
+ * constructors `.slice()` their inputs, so no caller-supplied buffer is ever
+ * touched.
+ */
+function wipe(buf: Uint8Array): void {
+  buf.fill(0);
+}
+
 class RecvKeyCache {
   /** counter → 16-byte AEAD key material */
   private readonly keys = new Map<bigint, Uint8Array>();
@@ -229,7 +243,9 @@ class RecvKeyCache {
     while (this.highestDerived < upTo) {
       const ctr = this.highestDerived + 1n;
       this.keys.set(ctr, deriveFrameKey(this.chain));
-      this.chain = ratchetChain(this.chain);
+      const nextChain = ratchetChain(this.chain);
+      wipe(this.chain);
+      this.chain = nextChain;
       this.highestDerived = ctr;
     }
   }
@@ -263,8 +279,12 @@ class RecvKeyCache {
 
     // Prune and advance chainAtLowest.
     for (let c = this.lowestCounter; c < pruneBelow; c += 1n) {
+      const prunedKey = this.keys.get(c);
+      if (prunedKey) wipe(prunedKey);
       this.keys.delete(c);
-      this.chainAtLowest = ratchetChain(this.chainAtLowest);
+      const nextAtLowest = ratchetChain(this.chainAtLowest);
+      wipe(this.chainAtLowest);
+      this.chainAtLowest = nextAtLowest;
     }
     if (pruneBelow > this.lowestCounter) {
       this.lowestCounter = pruneBelow;
@@ -350,8 +370,14 @@ export class RatchetSession {
     this.sendCounter += 1n;
 
     const rawKey = deriveFrameKey(this.sendChain);
-    // Advance chain immediately — old key material becomes unrecoverable.
-    this.sendChain = ratchetChain(this.sendChain);
+    // Advance the chain immediately and wipe the superseded key. Wiping is
+    // best-effort (see wipe()): it does NOT make the old key unrecoverable, it
+    // shortens how long a memory dump could recover it. An earlier version of
+    // this comment claimed unrecoverability outright, which is not something JS
+    // can promise and is exactly the kind of guarantee a reader will trust.
+    const nextSendChain = ratchetChain(this.sendChain);
+    wipe(this.sendChain);
+    this.sendChain = nextSendChain;
 
     const nonce = makeNonce(this.localDir, counter);
     const key = await crypto.subtle.importKey('raw', toBufferSource(rawKey), 'AES-GCM', false, ['encrypt']);
