@@ -800,6 +800,15 @@ function roleFor(ourPeerId: Uint8Array, peerPeerIdBytes: Uint8Array): 'initiator
 async function initiateHandshake(deviceId: string, peerIdBytes: Uint8Array): Promise<void> {
   const identity = await getLocalIdentity();
   if (!peerId) return;
+  // #91: re-check the device is still connected after the async gap. A
+  // disconnect landing during getLocalIdentity() deletes
+  // connectedDevices[deviceId] but finds no cryptoStates entry to delete
+  // (it doesn't exist yet); without this guard we would create a CryptoState
+  // for a device that is already gone, leaking a live NoiseXxHandshake
+  // (handshake key material) that no reaper touches — the disconnect handler
+  // already fired, and checkHandshakeTimeouts skips disconnected entries by
+  // design. Bail before creating any state.
+  if (!connectedDevices.has(deviceId)) return;
 
   const peerIdHex = toHex(peerIdBytes);
   const role = roleFor(peerId, peerIdBytes);
