@@ -45,7 +45,21 @@ export type MeshMetric =
   // #46: handshakeFailures counter reset to 0 on successful handshake completion.
   // Enforces the invariant that failures count within a single handshake attempt,
   // not across the lifetime of a CryptoState. label: device — BLE MAC string.
-  | 'handshake_failures_reset';
+  | 'handshake_failures_reset'
+  // #91: outbound handshake init aborted because the peer disconnected during
+  // the getLocalIdentity() await. Creating the CryptoState anyway would leak a
+  // live NoiseXxHandshake — handshake key material for a connection that is
+  // already gone, which nothing reaps before stopMesh().
+  //
+  // PAIRS WITH handshake_frame_dropped{reason=disconnected}, which the RESPONDER
+  // path emits for the identical condition. An operator asking "how often does a
+  // handshake abort because the peer vanished mid-bootstrap" must read BOTH:
+  // this one counts handshakes we initiated, that one counts handshakes the peer
+  // initiated. They are deliberately separate because that metric means an
+  // inbound FRAME was discarded, and conflating the two would mislead anyone
+  // debugging inbound frame loss.
+  // label: device — BLE MAC string.
+  | 'handshake_init_aborted';
 
 /** A function that receives each emitted metric (plus optional bounded labels). */
 export type MetricSink = (metric: MeshMetric, labels?: Record<string, string>) => void;
