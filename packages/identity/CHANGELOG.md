@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.0...identity-v0.2.1) (2026-08-05)
+
+
+### Fixed
+
+* **identity:** read the KEK back without touching the CryptoKey global ([#109](https://github.com/anatolykoptev/oxpulse-core/issues/109)) ([07a6810](https://github.com/anatolykoptev/oxpulse-core/commit/07a681048d3ffef5784b14160c1fe54ff1ffa184))
+
 ## [0.2.0](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.1.5...identity-v0.2.0) (2026-08-05)
 
 
