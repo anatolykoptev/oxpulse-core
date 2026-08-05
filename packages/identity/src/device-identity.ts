@@ -24,6 +24,7 @@ import { emit as track } from './tracker-shim.js';
 import { createIdbStore, IDBUnavailableError } from './idb-store.js';
 import { toArrayBuffer } from './crypto-utils.js';
 import { toBase64url, fromBase64url } from './base64url.js';
+import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw } from './aes-kw.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
 // Structure: SEQUENCE { version=0, AlgorithmIdentifier { OID 1.3.101.112 }, OCTET STRING { OCTET STRING { seed } } }
@@ -57,6 +58,15 @@ export const IDB_DB_NAME = 'oxpulse-device-id'; // LOAD-BEARING — DO NOT RENAM
 export const IDB_STORE_NAME = 'identity';        // LOAD-BEARING — DO NOT RENAME, see ADR §3.4
 
 const idb = createIdbStore({ dbName: IDB_DB_NAME, storeName: IDB_STORE_NAME });
+
+// KEK lives in a separate IDB database for rotation/corruption isolation (#98).
+// The identity record store and the KEK have different lifecycles — a corrupted
+// identity store must not take the KEK with it. Dedicated-DB pattern per
+// room-host-seed.ts:17-18 precedent.
+const KEK_DB_NAME = 'oxpulse-device-id-kek';
+const KEK_STORE_NAME = 'kek';
+const KEK_KEY_NAME = 'wrapping-key';
+const kekIdb = createIdbStore({ dbName: KEK_DB_NAME, storeName: KEK_STORE_NAME });
 
 export interface DeviceIdentity {
 	publicKeyB64: string; // base64url, 32 bytes Ed25519 public key
@@ -100,57 +110,99 @@ let cachedIdentity: DeviceIdentity | null = null;
 let cachedWrappingKey: CryptoKey | null = null;
 
 /**
- * Get or create the AES-KW wrapping key.
+ * Cached probe result for CryptoKey structured-clone support.
  *
- * Persisted as raw 32-byte AES-256-KW key material in IDB. The previous
- * implementation wrapped this key with an HKDF-derived "master key" sourced
- * from `crypto.getRandomValues` per call — every page load produced a fresh
- * master, so the persisted wrapping key never decrypted on reload and the
- * device identity was effectively ephemeral. Threat-surface argument per
- * plan §B.1: IDB compromise = identity compromise either way; an extra
- * wrap layer rooted in non-persisted entropy adds no security and breaks
- * the persistence invariant the plan calls for.
+ * Some WebViews (older Android WebView, HarmonyOS ArkWeb) cannot structured-clone
+ * a CryptoKey, which means it cannot be persisted to IDB as a CryptoKey object.
+ * On those runtimes we fall back to persisting the raw KEK bytes (extractable
+ * during the bootstrap window only) and re-importing as non-extractable on load.
+ * The probe is run once per process; the result is cached.
+ */
+let structuredCloneSupported: boolean | null = null;
+
+async function probeStructuredClone(): Promise<boolean> {
+	if (structuredCloneSupported !== null) return structuredCloneSupported;
+	try {
+		const throwaway = await crypto.subtle.generateKey(
+			{ name: 'AES-KW', length: 256 }, true, ['wrapKey', 'unwrapKey'],
+		);
+		structuredClone(throwaway); // throws on WebViews without CryptoKey structured-clone
+		structuredCloneSupported = true;
+	} catch {
+		structuredCloneSupported = false;
+	}
+	return structuredCloneSupported;
+}
+
+/**
+ * Get or create the AES-KW wrapping key (KEK).
+ *
+ * The KEK lives in a dedicated IDB database (`oxpulse-device-id-kek`) separate
+ * from the identity records, for rotation/corruption isolation (#98). When the
+ * runtime supports CryptoKey structured-clone, the KEK is persisted as a
+ * non-extractable CryptoKey — the raw bytes never re-enter the JS heap on
+ * reload. On runtimes without structured-clone support, the raw bytes are
+ * persisted (extractable during the bootstrap window only) and re-imported as
+ * non-extractable on load.
+ *
+ * One-shot copy-only migration: if the new KEK DB is empty but a legacy KEK
+ * exists in the identity DB under `WRAPPING_KEY_NAME` (raw bytes), it is
+ * imported as non-extractable and copied to the new DB. The old entry is NEVER
+ * deleted — copy-only migration, zero irreversibility.
  */
 async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	if (cachedWrappingKey) return cachedWrappingKey;
 
-	const existing = await idb.load<ArrayBuffer>(WRAPPING_KEY_NAME);
+	const canClone = await probeStructuredClone();
+
+	// 1. Try to load the KEK from the new dedicated DB.
+	const existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
 	if (existing) {
-		// Import as non-extractable. Once the bytes are in IDB, the
-		// runtime handle has no need to leave WebCrypto — extraction is
-		// the threat we want to close (XSS / Spectre / malicious
-		// extension calling exportKey on the cached handle).
-		cachedWrappingKey = await crypto.subtle.importKey(
-			'raw',
-			existing,
-			{ name: 'AES-KW', length: 256 },
-			false,
-			['wrapKey', 'unwrapKey']
-		);
+		if (canClone && existing instanceof CryptoKey) {
+			// Persisted as a non-extractable CryptoKey — use directly.
+			cachedWrappingKey = existing;
+		} else {
+			// Persisted as raw bytes (fallback path) — re-import non-extractable.
+			cachedWrappingKey = await importAesKwRaw(existing as ArrayBuffer, false);
+		}
 		return cachedWrappingKey;
 	}
 
-	// Bootstrap: must be extractable so we can exportKey('raw',...) into
-	// IDB. Window is one tick — between generateKey, exportKey and the
-	// IDB save we never await on third-party code. Immediately after
-	// persisting, re-import the same bytes as non-extractable and replace
-	// the cached handle. The original extractable handle goes out of
-	// scope and is GC'd.
-	const wrappingKey = await crypto.subtle.generateKey(
-		{ name: 'AES-KW', length: 256 },
-		true,
-		['wrapKey', 'unwrapKey']
-	);
-	const raw = await crypto.subtle.exportKey('raw', wrappingKey);
-	await idb.save(WRAPPING_KEY_NAME, raw);
+	// 2. Migration: new DB empty — check for a legacy KEK in the identity DB.
+	const legacyRaw = await idb.load<ArrayBuffer>(WRAPPING_KEY_NAME);
+	if (legacyRaw) {
+		// Copy-only migration: import non-extractable, persist to new DB.
+		// NEVER delete the old entry (zero irreversibility).
+		const kek = await importAesKwRaw(legacyRaw, false);
+		if (canClone) {
+			await kekIdb.save(KEK_KEY_NAME, kek);
+		} else {
+			// Fallback: persist raw bytes. The handle we cached is already
+			// non-extractable; the raw bytes in IDB are the bootstrap-window
+			// tradeoff accepted for WebViews without structured-clone.
+			await kekIdb.save(KEK_KEY_NAME, legacyRaw);
+		}
+		cachedWrappingKey = kek;
+		return cachedWrappingKey;
+	}
 
-	cachedWrappingKey = await crypto.subtle.importKey(
-		'raw',
-		raw,
-		{ name: 'AES-KW', length: 256 },
-		false,
-		['wrapKey', 'unwrapKey']
-	);
+	// 3. Fresh generation: no KEK anywhere.
+	const kek = await generateAesKwKey(false);
+	if (canClone) {
+		// Persist the non-extractable CryptoKey directly — raw bytes never
+		// touch the JS heap.
+		await kekIdb.save(KEK_KEY_NAME, kek);
+	} else {
+		// Fallback: export raw bytes to persist, then re-import as
+		// non-extractable for the cached handle. The extractable handle is
+		// dropped after export; the bootstrap window is one tick.
+		const extractableKek = await generateAesKwKey(true);
+		const raw = await crypto.subtle.exportKey('raw', extractableKek);
+		await kekIdb.save(KEK_KEY_NAME, raw);
+		cachedWrappingKey = await importAesKwRaw(raw, false);
+		return cachedWrappingKey;
+	}
+	cachedWrappingKey = kek;
 	return cachedWrappingKey;
 }
 
@@ -357,22 +409,12 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 		throw new Error('[identity] persistIdentity called with null privateKeyBytes — invariant violation');
 	}
 
-	// Wrap raw 32-byte seed as a symmetric key via AES-KW.
-	// We import the seed as AES-256 (same byte-length) so wrapKey() accepts it.
-	// This is the authoritative storage — the PKCS8 path below is best-effort.
-	const seedAsKey = await crypto.subtle.importKey(
-		'raw',
-		toArrayBuffer(identity.privateKeyBytes),
-		{ name: 'AES-KW', length: 256 },
-		true, // must be extractable so wrapKey can encode it
-		['wrapKey', 'unwrapKey']
-	);
-	const wrappedRawSeed = await crypto.subtle.wrapKey(
-		'raw',
-		seedAsKey,
-		wrappingKey,
-		'AES-KW'
-	);
+	// Wrap raw 32-byte seed via the algorithm-agnostic aes-kw helper (HMAC-import
+	// trick). This is the authoritative storage — the PKCS8 path below is
+	// best-effort. Wire format changed from the old inline AES-256-import trick;
+	// old entries still unwrap correctly because AES-KW ciphertext is
+	// independent of the wrapped key's declared algorithm.
+	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, identity.privateKeyBytes);
 	await idb.save(DEVICE_PRIV_RAW_NAME, wrappedRawSeed);
 
 	// PKCS8 wrap path: only possible when WebCrypto Ed25519 is available (non-null
@@ -495,23 +537,12 @@ async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
 	// Absent on pre-W7-P2b1 identities — signal migration, don't regenerate.
 	const wrappedRawSeed = await idb.load<ArrayBuffer>(DEVICE_PRIV_RAW_NAME);
 	if (wrappedRawSeed) {
-		const seedKey = await crypto.subtle.unwrapKey(
-			'raw',
-			wrappedRawSeed,
-			wrappingKey,
-			'AES-KW',
-			{ name: 'AES-KW', length: 256 },
-			true,
-			['wrapKey', 'unwrapKey']
-		);
-		const rawSeedBuf = await crypto.subtle.exportKey('raw', seedKey);
-		const privateKeyBytes = new Uint8Array(rawSeedBuf);
-		return {
-			publicKeyB64: stored.publicKeyB64,
-			publicKey,
-			privateKey,
-			privateKeyBytes,
-		};
+		// Unwrap via the algorithm-agnostic aes-kw helper (HMAC-import trick).
+		// Works for both old entries (wrapped with the inline AES-256-import
+		// trick) and new entries (wrapped with wrapSecretBytes) — AES-KW
+		// ciphertext is independent of the wrapped key's declared algorithm.
+		const privateKeyBytes = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
+		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeyBytes };
 	} else {
 		// Pre-W7-P2b1 identity: raw seed unavailable.
 		// Return null so callers can show migration banner + disable sealed send.
@@ -599,9 +630,10 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedX25519Keypair = null;
 	await idb.delete(DEVICE_KEY_NAME);
 	await idb.delete(DEVICE_PRIV_RAW_NAME);
-	await idb.delete(WRAPPING_KEY_NAME);
+	await idb.delete(WRAPPING_KEY_NAME);  // old entry — kept by migration, cleared on explicit forget
 	await idb.delete(PROFILE_SEED_NAME);
 	await idb.delete(X25519_KEYPAIR_NAME);
+	await kekIdb.clear();  // new KEK DB
 	track('client.identity_wiped');
 }
 
@@ -662,17 +694,8 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 
 		// Noble-only identity: wrappedPrivateKey is zero-length, wrappedPrivateKeyRaw has the seed.
 		if (existing.wrappedPrivateKey.byteLength === 0 && existing.wrappedPrivateKeyRaw) {
-			const seedKey = await crypto.subtle.unwrapKey(
-				'raw',
-				existing.wrappedPrivateKeyRaw,
-				wrappingKey,
-				'AES-KW',
-				{ name: 'AES-KW', length: 256 },
-				true,
-				['wrapKey', 'unwrapKey']
-			);
-			const rawBuf = await crypto.subtle.exportKey('raw', seedKey);
-			cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: new Uint8Array(rawBuf) };
+			const rawBuf = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
+			cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: rawBuf };
 			return cachedX25519Keypair;
 		}
 
@@ -696,17 +719,8 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 			// recover the existing key via the noble path instead of regenerating
 			// and breaking TOFU trust with all peers.
 			if (existing.wrappedPrivateKeyRaw && existing.wrappedPrivateKeyRaw.byteLength > 0) {
-				const seedKey = await crypto.subtle.unwrapKey(
-					'raw',
-					existing.wrappedPrivateKeyRaw,
-					wrappingKey,
-					'AES-KW',
-					{ name: 'AES-KW', length: 256 },
-					true,
-					['wrapKey', 'unwrapKey'],
-				);
-				const rawBuf = await crypto.subtle.exportKey('raw', seedKey);
-				cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: new Uint8Array(rawBuf) };
+				const rawBuf = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
+				cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: rawBuf };
 				console.info('[identity] WebCrypto X25519 downgrade — recovered existing keypair via noble fallback');
 				return cachedX25519Keypair;
 			}
@@ -733,14 +747,7 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 		// support) can recover via the noble path at line 654-666 instead of
 		// regenerating a fresh keypair and breaking TOFU trust with all peers.
 		const rawPrivBytes = await crypto.subtle.exportKey('raw', kp.privateKey);
-		const privAsKey = await crypto.subtle.importKey(
-			'raw',
-			rawPrivBytes,
-			{ name: 'AES-KW', length: 256 },
-			true,
-			['wrapKey', 'unwrapKey'],
-		);
-		const wrappedPrivRaw = await crypto.subtle.wrapKey('raw', privAsKey, wrappingKey, 'AES-KW');
+		const wrappedPrivRaw = await wrapSecretBytes(wrappingKey, new Uint8Array(rawPrivBytes));
 
 		// Persist before re-importing as non-extractable (window ≈ one tick, only WebCrypto awaits).
 		await idb.save<StoredX25519NobleKeypair>(X25519_KEYPAIR_NAME, {
@@ -772,15 +779,8 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 	const privBytes = nobleX25519.utils.randomSecretKey();
 	const pubBytes = nobleX25519.getPublicKey(privBytes);
 
-	// Wrap private key bytes as AES-256 (same byte-length) for IDB persistence.
-	const seedAsKey = await crypto.subtle.importKey(
-		'raw',
-		toArrayBuffer(privBytes),
-		{ name: 'AES-KW', length: 256 },
-		true,
-		['wrapKey', 'unwrapKey']
-	);
-	const wrappedPrivRaw = await crypto.subtle.wrapKey('raw', seedAsKey, wrappingKey, 'AES-KW');
+	// Wrap private key bytes via the algorithm-agnostic aes-kw helper for IDB persistence.
+	const wrappedPrivRaw = await wrapSecretBytes(wrappingKey, privBytes);
 
 	await idb.save<StoredX25519NobleKeypair>(X25519_KEYPAIR_NAME, {
 		publicKey: toArrayBuffer(pubBytes),
@@ -956,42 +956,27 @@ export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; pub
 		throw new Error("No device identity in IDB");
 	}
 
-	const wrappingKeyRaw = await idb.load<ArrayBuffer>(WRAPPING_KEY_NAME);
-	if (!wrappingKeyRaw) {
-		throw new Error("No wrapping key in IDB");
-	}
-
-	// Re-import wrapping key with wrapKey+unwrapKey usage
-	const wrappingKey = await crypto.subtle.importKey(
-		"raw",
-		wrappingKeyRaw,
-		{ name: "AES-KW", length: 256 },
-		false,
-		["wrapKey", "unwrapKey"],
-	);
+	// ADR-8: the KEK is now a non-extractable CryptoKey in the dedicated KEK DB
+	// (no raw bytes in the identity DB). getOrCreateWrappingKey() returns the
+	// non-extractable handle; unwrapKey's extractability is independent of the
+	// KEK's extractability, so we can still unwrap as extractable here.
+	const wrappingKey = await getOrCreateWrappingKey();
 
 	// On noble-only runtimes (HyperOS/HarmonyOS) wrappedPrivateKey is zero-length
 	// (no PKCS8 wrap was possible). Fall back to unwrapping the raw seed from
 	// DEVICE_PRIV_RAW_NAME — same secret, different wrap format.
 	if (stored.wrappedPrivateKey.byteLength === 0) {
+		// Noble-only: unwrap raw seed via aes-kw.ts
 		const wrappedRawSeed = await idb.load<ArrayBuffer>(DEVICE_PRIV_RAW_NAME);
 		if (!wrappedRawSeed) {
 			throw new Error("No Ed25519 private key in IDB (noble-only identity, no raw seed stored)");
 		}
-		const seedKey = await crypto.subtle.unwrapKey(
-			'raw',
-			wrappedRawSeed,
-			wrappingKey,
-			'AES-KW',
-			{ name: 'AES-KW', length: 256 },
-			true,
-			['wrapKey', 'unwrapKey']
-		);
-		const rawBuf = await crypto.subtle.exportKey('raw', seedKey);
-		return { secret: new Uint8Array(rawBuf), publicB64u: stored.publicKeyB64 };
+		const secret = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
+		return { secret, publicB64u: stored.publicKeyB64 };
 	}
 
-	// WebCrypto path: unwrap PKCS8, export, strip 16-byte OID header.
+	// WebCrypto path: unwrap PKCS8 with extractable=true, export, strip 16-byte OID header.
+	// unwrapKey's extractability is independent of the KEK's extractability.
 	const extractablePrivKey = await crypto.subtle.unwrapKey(
 		"pkcs8",
 		stored.wrappedPrivateKey,
@@ -1027,28 +1012,16 @@ export async function replaceDeviceIdentity(
 	const wrappingKey = await getOrCreateWrappingKey();
 
 	// Always persist the raw seed (authoritative for noble-only runtimes).
-	const seedAsKey = await crypto.subtle.importKey(
-		'raw',
-		toArrayBuffer(secret),
-		{ name: 'AES-KW', length: 256 },
-		true,
-		['wrapKey', 'unwrapKey']
-	);
-	const wrappedRawSeed = await crypto.subtle.wrapKey('raw', seedAsKey, wrappingKey, 'AES-KW');
+	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, secret);
 	await idb.save(DEVICE_PRIV_RAW_NAME, wrappedRawSeed);
 
 	// Try WebCrypto PKCS8 wrap (best-effort — not available on HyperOS/HarmonyOS).
 	// On noble-only runtimes, store zero-length wrappedPrivateKey sentinel.
 	let wrappedPrivateKey: ArrayBuffer = new ArrayBuffer(0);
 	try {
-		const prefix = new Uint8Array([
-			0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05,
-			0x06, 0x03, 0x2b, 0x65, 0x70,
-			0x04, 0x22, 0x04, 0x20,
-		]);
-		const pkcs8 = new Uint8Array(prefix.byteLength + secret.byteLength);
-		pkcs8.set(prefix, 0);
-		pkcs8.set(secret, prefix.byteLength);
+		const pkcs8 = new Uint8Array(ED25519_PKCS8_PREFIX.byteLength + secret.byteLength);
+		pkcs8.set(ED25519_PKCS8_PREFIX, 0);
+		pkcs8.set(secret, ED25519_PKCS8_PREFIX.byteLength);
 
 		const extractableKey = await crypto.subtle.importKey(
 			"pkcs8",
