@@ -1,4 +1,4 @@
-# Automated releases via release-please.
+# Automated releases via release-please, with a gated npm publish.
 #
 # Flow (no manual version/tag steps):
 #   1. Land conventional commits on `main` (feat:/fix:/perf:/docs:/... — breaking
@@ -6,7 +6,8 @@
 #   2. release-please opens/updates a per-package "chore(main): release <component>
 #      X.Y.Z" PR that bumps that package's package.json + prepends its CHANGELOG.md
 #      from those commits.
-#   3. Merging a release PR creates the `<component>-vX.Y.Z` tag + GitHub Release.
+#   3. Merging a release PR creates the `<component>-vX.Y.Z` tag + GitHub Release,
+#      and the `publish` job below then pushes that version to npm.
 #
 # Two independently-versioned packages (packages/identity, packages/mesh-core) →
 # separate-pull-requests:true so each gets its own release PR; component tags
@@ -17,10 +18,55 @@
 # feat/fix bump PATCH, a breaking change bumps MINOR. Do NOT `git tag` by hand:
 # a manual tag desyncs .release-please-manifest.json.
 #
-# NO publish job: both packages are private:true, consumed as workspace/engine
-# dependencies by oxpulse-chat (not published to npm). This workflow only
-# manages version + changelog + git tag + release PR — actual consumption stays
-# a source/engine dependency, unchanged by this setup.
+# ── Why the publish job exists (read before removing it) ────────────────────────
+#
+# This workflow's header used to state: "NO publish job: both packages are
+# private:true, consumed as workspace/engine dependencies by oxpulse-chat (not
+# published to npm)." That stopped being true when `private: true` was dropped
+# from both package.json files and oxpulse-chat's web/package.json was pointed at
+# npm ranges (`@oxpulse/mesh-core: ^0.1.2`) — but the comment stayed, and no
+# publish step was ever added.
+#
+# The result, measured 2026-08-05: mesh-core had been released twelve times
+# (0.1.3 … 0.1.14) with a tag and a GitHub Release for each, and npm still served
+# 0.1.2 as `latest`. identity likewise sat at 0.1.2 against a repo at 0.1.4. Every
+# one of those runs was green, because a release that publishes nothing is exactly
+# as green as one that publishes correctly when nothing checks. That is the whole
+# failure: the delivery step did not exist, and the comment asserting it was
+# unnecessary is what kept anyone from noticing.
+#
+# So: the acceptance evidence for a release in this repo is `npm view <pkg>
+# version` matching the tag — not a green run. The "Verify the publish landed"
+# step below asserts exactly that, so the run fails when the registry disagrees.
+#
+# Backfill note: 0.1.3 … 0.1.14 (mesh-core) and 0.1.3 … 0.1.4 (identity) are NOT
+# published retroactively by this change. Only releases cut from here on land on
+# npm. Those intermediate versions stay absent from the registry permanently;
+# consumers must move to a version cut after this workflow shipped.
+#
+# ── npm Trusted Publishing (OIDC) — no NPM_TOKEN ────────────────────────────────
+#
+# The publish job requests an OIDC token (`id-token: write`) and `npm publish`
+# exchanges it with npm, which checks that THIS repo + THIS workflow FILENAME are
+# the registered trusted publisher for the package.
+#
+# That binding is on the npm side and is not visible from this file. It must be
+# configured once per package (npmjs.com → package → Settings → Publishing):
+#
+#     @oxpulse/mesh-core   →  anatolykoptev/oxpulse-core   workflow: release-please.yml
+#     @oxpulse/identity    →  anatolykoptev/oxpulse-core   workflow: release-please.yml
+#
+# Leave the "Environment name" field BLANK — this job declares no `environment:`.
+# Renaming this file breaks publishing until the npm side is updated to match;
+# that filename binding is the single most common way this setup silently stops
+# working.
+#
+# Both packages already exist on npm (0.1.2), so their trusted-publisher UI is
+# reachable. A brand-new package would need one manual token-mode `npm publish`
+# first before that UI appears.
+#
+# `--provenance` requires a public source repo. oxpulse-core is public, so it is
+# enabled; the sibling oxpulse-chat-sdk repo deliberately omits it while private.
 
 name: release-please
 
@@ -29,15 +75,127 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-  pull-requests: write
+# Least privilege by default; each job grants only what it needs.
+permissions: {}
 
 jobs:
   release-please:
+    name: Release PR / tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      # JSON array of the package paths released this run, e.g.
+      # ["packages/mesh-core"]. Empty ("[]") on a run that only opened or
+      # updated a release PR without merging one.
+      paths_released: ${{ steps.release.outputs.paths_released }}
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  publish:
+    name: Publish ${{ matrix.path }}
+    needs: release-please
+    # Gate: only when a release was actually cut this run. Without this the job
+    # would run on every push to main and try to republish an existing version.
+    if: needs.release-please.outputs.paths_released != ''
+      && needs.release-please.outputs.paths_released != '[]'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      id-token: write   # npm OIDC token exchange
+      contents: read
+    strategy:
+      # One package per job. fail-fast:false so a failure publishing one package
+      # cannot cancel an in-flight publish of the other and leave a half-released
+      # pair that is harder to reason about than two independent failures.
+      fail-fast: false
+      matrix:
+        path: ${{ fromJson(needs.release-please.outputs.paths_released) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        # Do NOT pass `version` — packageManager in package.json is auto-detected
+        # by the action. Passing both is a hard error.
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          # Puts the registry into .npmrc. OIDC does not use NODE_AUTH_TOKEN, but
+          # `npm publish` and `npm view` still need the registry URL.
+          registry-url: 'https://registry.npmjs.org'
+
+      # OIDC trusted publishing needs npm >= 11.5.1; the runner ships older.
+      # Upgrade AND assert in one step: a separate assert step reading a value
+      # the upgrade step never exported would pass vacuously on an empty string.
+      - name: Upgrade npm and assert >= 11.5.1 (required for OIDC)
+        run: |
+          npm i -g npm@latest
+          V=$(npm --version)
+          echo "npm version: $V"
+          V="$V" node -e '
+            const raw = process.env.V || "";
+            const [maj, min, pat] = raw.split(".").map(Number);
+            if (![maj, min, pat].every(Number.isInteger)) {
+              console.error(`FATAL: could not parse npm version from ${JSON.stringify(raw)}`);
+              process.exit(1);
+            }
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            if (!ok) { console.error(`FATAL: npm ${raw} < 11.5.1 — OIDC publish unsupported`); process.exit(1); }
+            console.log(`npm ${raw} OK`);
+          '
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── Test gate (LOAD-BEARING) ────────────────────────────────────────────
+      # preflight.yml triggers on `pull_request` only, so it never runs on this
+      # path: not on the push that merges a release PR, and not on a
+      # workflow_dispatch re-publish. Without these steps a release would reach
+      # npm having executed zero tests on that tree.
+      #
+      # Mirrors preflight.yml exactly, including --no-file-parallelism (WebCrypto
+      # state isolation — see transport-crypto.test.ts). Keep them in sync.
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test (vitest, --no-file-parallelism)
+        run: pnpm -r run test -- --run --no-file-parallelism
+        env:
+          NODE_ENV: test
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Publish to npm (OIDC trusted publishing)
+        working-directory: ${{ matrix.path }}
+        run: npm publish --provenance --access public
+
+      # ── The last mile ───────────────────────────────────────────────────────
+      # A publish step can exit 0 and still leave the registry unchanged. Assert
+      # the registry actually serves the version in this package's package.json,
+      # so "the run was green" and "the version is installable" cannot diverge —
+      # which is the exact failure this whole job exists to end.
+      - name: Verify the publish landed
+        working-directory: ${{ matrix.path }}
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          WANT=$(node -p "require('./package.json').version")
+          echo "asserting $NAME@$WANT is served by the registry"
+          for attempt in 1 2 3 4 5; do
+            if npm view "$NAME@$WANT" version >/dev/null 2>&1; then
+              echo "OK: $NAME@$WANT is live"
+              exit 0
+            fi
+            echo "not visible yet (attempt $attempt/5); registry propagation lag — retrying in 15s"
+            sleep 15
+          done
+          echo "::error::$NAME@$WANT is NOT on the registry after a successful publish step"
+          exit 1
