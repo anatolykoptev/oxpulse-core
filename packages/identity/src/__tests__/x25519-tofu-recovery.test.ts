@@ -66,9 +66,9 @@ describe('S8: X25519 TOFU recovery on WebCrypto downgrade (issue #17)', () => {
 			// The public key MUST be the same — TOFU trust preserved.
 			expect(Array.from(kp2.publicKey)).toEqual(Array.from(pub1));
 
-			// The private key should be loaded as privateKeyBytes (noble path).
+			// The private key should be loaded as privateKeySeed (noble path).
 			expect(kp2.privateKey).toBeNull();
-			expect(kp2.privateKeyBytes).not.toBeNull();
+			expect(kp2.privateKeySeed).not.toBeNull();
 		} finally {
 			vi.restoreAllMocks();
 		}

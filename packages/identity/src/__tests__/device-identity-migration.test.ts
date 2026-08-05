@@ -1,6 +1,6 @@
 // device-identity-migration.test.ts
 //
-// B1 (CRITICAL): unwrapIdentity must return privateKeyBytes=null for
+// B1 (CRITICAL): unwrapIdentity must return privateKeySeed=null for
 // pre-W7-P2b1 identities (no DEVICE_PRIV_RAW_NAME entry in IDB).
 // Previously returned 32-zero sentinel which nobles/curves happily signed —
 // deterministic correlatable signatures for every migrated user.
@@ -45,28 +45,28 @@ beforeEach(() => { resetIDB(); });
 afterEach(() => { resetIDB(); });
 
 describe('B1: pre-W7-P2b1 identity migration', () => {
-	it('newly created identity has non-null privateKeyBytes', async () => {
+	it('newly created identity has non-null privateKeySeed', async () => {
 		if (!ed25519Supported) return;
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
-		expect(id.privateKeyBytes).not.toBeNull();
+		expect(id.privateKeySeed).not.toBeNull();
 		// Duck-type: vi.resetModules() creates a fresh OpaquePrivateKey class,
 		// so toBeInstanceOf would fail on class identity. Check .bytes() instead.
-		expect(typeof id.privateKeyBytes?.bytes).toBe('function');
-		expect(id.privateKeyBytes!.bytes()).toBeInstanceOf(Uint8Array);
-		expect(id.privateKeyBytes!.bytes().byteLength).toBe(32);
+		expect(typeof id.privateKeySeed?.bytes).toBe('function');
+		expect(id.privateKeySeed!.bytes()).toBeInstanceOf(Uint8Array);
+		expect(id.privateKeySeed!.bytes().byteLength).toBe(32);
 	});
 
-	it('new identity privateKeyBytes is NOT all-zero sentinel', async () => {
+	it('new identity privateKeySeed is NOT all-zero sentinel', async () => {
 		if (!ed25519Supported) return;
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
-		const bytes = id.privateKeyBytes!.bytes();
+		const bytes = id.privateKeySeed!.bytes();
 		const allZero = bytes.every((b) => b === 0);
 		expect(allZero).toBe(false);
 	});
 
-	it('privateKeyBytes=null (not 32-zero) when raw seed absent in IDB', async () => {
+	it('privateKeySeed=null (not 32-zero) when raw seed absent in IDB', async () => {
 		if (!ed25519Supported) return;
 
 		// Create identity with W7-P2b1 mod (stores raw seed)
@@ -96,18 +96,18 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 		const id = await mod2.getOrCreateDeviceIdentity();
 
 		// MUST be null — not 32-zero bytes
-		expect(id.privateKeyBytes).toBeNull();
+		expect(id.privateKeySeed).toBeNull();
 	});
 
-	it('DeviceIdentity type: privateKeyBytes is OpaquePrivateKey | null', async () => {
+	it('DeviceIdentity type: privateKeySeed is OpaquePrivateKey | null', async () => {
 		// Type-level check: the compile-time type must allow null.
-		// If this test compiles, the type is correct; if privateKeyBytes is
+		// If this test compiles, the type is correct; if privateKeySeed is
 		// typed as OpaquePrivateKey (non-nullable), this assignment would error.
 		if (!ed25519Supported) return;
 		const mod = await freshImport();
 		const id = await mod.getOrCreateDeviceIdentity();
 		// Accept both null and OpaquePrivateKey without TS error:
-		const bytes: OpaquePrivateKey | null = id.privateKeyBytes;
+		const bytes: OpaquePrivateKey | null = id.privateKeySeed;
 		// Duck-type: vi.resetModules() creates a fresh class, so instanceof
 		// would fail on class identity. Check .bytes() method presence instead.
 		expect(bytes === null || typeof bytes?.bytes === 'function').toBe(true);
@@ -238,18 +238,38 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 	it('pre-migration: old wrapping-key in identity DB → KEK migrated to new DB, old entry preserved (copy-only)', async () => {
 		if (!ed25519Supported) return;
 
-		await seedPreMigrationIDB();
+		const originalSeed = await seedPreMigrationIDB();
 
 		const mod = await freshImport();
-		await mod.getOrCreateDeviceIdentity();
+		const identity = await mod.getOrCreateDeviceIdentity();
 
 		// KEK exists in new DB.
 		const kekEntry = await idbRead(KEK_DB_NAME, KEK_STORE_NAME, KEK_KEY_NAME);
 		expect(kekEntry).not.toBeNull();
 
+		// ...and is NON-EXTRACTABLE, which is the whole point of #95. Without
+		// this the migration could import the KEK extractable and every
+		// assertion here would still pass — verified by mutating
+		// `importAesKwRaw(legacyRaw, false)` to `true`, which went GREEN before
+		// this line existed.
+		expect(
+			(kekEntry as CryptoKey).extractable,
+			'migrated KEK is extractable — #95 is not actually enforced',
+		).toBe(false);
+
 		// Old entry still present (copy-only migration — NEVER deleted).
 		const oldEntry = await idbRead(LEGACY_DB_NAME, LEGACY_STORE_NAME, LEGACY_WRAPPING_KEY_NAME);
 		expect(oldEntry).not.toBeNull();
+
+		// The acceptance criterion for the whole migration: an identity created
+		// BEFORE this change still unwraps to the IDENTICAL seed through the
+		// normal signing path. Everything else here checks where the KEK lives;
+		// this checks that the user still owns their account.
+		expect(identity.privateKeySeed, 'identity did not unwrap after migration').not.toBeNull();
+		expect(
+			Array.from(identity.privateKeySeed!.bytes()),
+			'migrated identity unwrapped to DIFFERENT bytes — silent account loss',
+		).toEqual(Array.from(originalSeed));
 	});
 
 	it('new code: KEK in new DB, old DB has NO wrapping-key entry', async () => {
@@ -283,15 +303,15 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 		try {
 			const first = await freshImport();
 			const a = await first.getOrCreateDeviceIdentity();
-			expect(typeof a.privateKeyBytes?.bytes).toBe('function');
-			expect(a.privateKeyBytes!.bytes().byteLength).toBe(32);
+			expect(typeof a.privateKeySeed?.bytes).toBe('function');
+			expect(a.privateKeySeed!.bytes().byteLength).toBe(32);
 
 			// Simulate reload: fresh import (probe cache reset, structuredClone still mocked).
 			const second = await freshImport();
 			const b = await second.getOrCreateDeviceIdentity();
 
 			expect(b.publicKeyB64).toBe(a.publicKeyB64);
-			expect(Array.from(b.privateKeyBytes!.bytes())).toEqual(Array.from(a.privateKeyBytes!.bytes()));
+			expect(Array.from(b.privateKeySeed!.bytes())).toEqual(Array.from(a.privateKeySeed!.bytes()));
 		} finally {
 			(globalThis as { structuredClone: typeof structuredClone }).structuredClone = originalSC;
 		}
@@ -349,6 +369,6 @@ describe('KEK migration (#98): separate KEK IDB database', () => {
 		const b = await second.getOrCreateDeviceIdentity();
 
 		expect(b.publicKeyB64).toBe(a.publicKeyB64);
-		expect(Array.from(b.privateKeyBytes!.bytes())).toEqual(Array.from(a.privateKeyBytes!.bytes()));
+		expect(Array.from(b.privateKeySeed!.bytes())).toEqual(Array.from(a.privateKeySeed!.bytes()));
 	});
 });

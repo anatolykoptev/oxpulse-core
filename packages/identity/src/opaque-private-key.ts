@@ -1,7 +1,7 @@
 // OpaquePrivateKey — a wrapper around raw secret bytes that prevents
 // accidental exfiltration through logging or serialization.
 //
-// Used to shield the Ed25519 seed resident in DeviceIdentity.privateKeyBytes
+// Used to shield the Ed25519 seed resident in DeviceIdentity.privateKeySeed
 // (ADR-5). X25519 DH scalar adoption is a followup.
 //
 // Hardening surfaces:

@@ -135,9 +135,9 @@ vi.mock('@oxpulse/identity', async () => {
       publicKeyB64: b64pk,
       publicKey: {} as CryptoKey,
       privateKey: {} as CryptoKey,
-      privateKeyBytes: new OpaquePrivateKey(edSk),
+      privateKeySeed: new OpaquePrivateKey(edSk),
     })),
-    getOrCreateX25519Keypair: vi.fn(async () => ({ publicKey: xPk, privateKey: {} as CryptoKey, privateKeyBytes: xSk })),
+    getOrCreateX25519Keypair: vi.fn(async () => ({ publicKey: xPk, privateKey: {} as CryptoKey, privateKeySeed: xSk })),
     dhX25519: vi.fn(async (remotePub: Uint8Array) => x.getSharedSecret(xSk, remotePub)),
     fromBase64url: (s: string): Uint8Array => {
       let str = s;

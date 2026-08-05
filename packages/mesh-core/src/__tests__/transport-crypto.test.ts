@@ -92,11 +92,11 @@ vi.mock('@oxpulse/identity', async () => {
       publicKeyB64: b64pk,
       publicKey: {} as CryptoKey,
       privateKey: {} as CryptoKey,
-      // Include privateKeyBytes so noble DH branch is exercisable (raw seed = edSk).
-      privateKeyBytes: new OpaquePrivateKey(edSk),
+      // Include privateKeySeed so noble DH branch is exercisable (raw seed = edSk).
+      privateKeySeed: new OpaquePrivateKey(edSk),
     })),
     // B.2-noise-s-key-derivation: X25519 static keypair mock.
-    getOrCreateX25519Keypair: vi.fn(async () => ({ publicKey: xPk, privateKey: {} as CryptoKey, privateKeyBytes: xSk })),
+    getOrCreateX25519Keypair: vi.fn(async () => ({ publicKey: xPk, privateKey: {} as CryptoKey, privateKeySeed: xSk })),
     dhX25519: vi.fn(async (remotePub: Uint8Array) => x.getSharedSecret(xSk, remotePub)),
     fromBase64url: (s: string): Uint8Array => {
       let str = s;

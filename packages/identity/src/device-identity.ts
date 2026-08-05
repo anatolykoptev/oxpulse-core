@@ -80,7 +80,7 @@ export interface DeviceIdentity {
 	publicKey: CryptoKey | null;
 	/**
 	 * WebCrypto Ed25519 private key handle. null when WebCrypto Ed25519 is absent.
-	 * Use privateKeyBytes + @noble/curves for signing on all runtimes.
+	 * Use privateKeySeed.bytes() + @noble/curves for signing on all runtimes.
 	 */
 	privateKey: CryptoKey | null;
 	/**
@@ -101,7 +101,7 @@ export interface DeviceIdentity {
 	 * attacker. @noble/curves requires the raw seed for Ed25519 signing;
 	 * HyperOS/HarmonyOS support requires noble, so this tradeoff is load-bearing.
 	 */
-	privateKeyBytes: OpaquePrivateKey | null;
+	privateKeySeed: OpaquePrivateKey | null;
 }
 
 interface StoredIdentity {
@@ -160,7 +160,22 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	const canClone = await probeStructuredClone();
 
 	// 1. Try to load the KEK from the new dedicated DB.
-	const existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
+	//
+	// The load itself can throw. IndexedDB deserialises a stored CryptoKey on
+	// READ, so a runtime that could structured-clone one when it was written
+	// may fail to reconstruct it later — a WebView downgrade, an OS update, a
+	// different engine on the same device. Letting that propagate would lock
+	// the user out of their own identity while a perfectly usable legacy KEK
+	// sits in the old DB: the key material is present, only the handle is
+	// unreadable. So a read failure degrades to the migration path instead of
+	// aborting.
+	let existing: CryptoKey | ArrayBuffer | null = null;
+	let kekLoadFailed = false;
+	try {
+		existing = await kekIdb.load<CryptoKey | ArrayBuffer>(KEK_KEY_NAME);
+	} catch {
+		kekLoadFailed = true;
+	}
 	if (existing) {
 		if (canClone && existing instanceof CryptoKey) {
 			// Persisted as a non-extractable CryptoKey — use directly.
@@ -178,7 +193,11 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 		// Copy-only migration: import non-extractable, persist to new DB.
 		// NEVER delete the old entry (zero irreversibility).
 		const kek = await importAesKwRaw(legacyRaw, false);
-		if (canClone) {
+		// `!kekLoadFailed`: if reading a stored CryptoKey just failed on THIS
+		// runtime, persisting another one would reproduce the same failure on
+		// the next boot. Fall back to raw bytes instead — the recovery path
+		// must not re-enter the state it is recovering from.
+		if (canClone && !kekLoadFailed) {
 			await kekIdb.save(KEK_KEY_NAME, kek);
 		} else {
 			// Fallback: persist raw bytes. The handle we cached is already
@@ -191,6 +210,19 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	}
 
 	// 3. Fresh generation: no KEK anywhere.
+	//
+	// Only legitimate when no KEK has ever existed. If the stored KEK was
+	// present but unreadable AND no legacy copy survives, generating a fresh
+	// one would silently orphan the existing identity — the wrapped seed stays
+	// in IDB and becomes permanently undecryptable, with the app cheerfully
+	// reporting a brand-new device. Fail loudly instead; an error the operator
+	// can see beats data loss that looks like a fresh install.
+	if (kekLoadFailed) {
+		throw new Error(
+			'[identity] stored KEK could not be deserialised and no legacy KEK is available — ' +
+			'refusing to generate a fresh one, which would permanently orphan the existing identity',
+		);
+	}
 	const kek = await generateAesKwKey(false);
 	if (canClone) {
 		// Persist the non-extractable CryptoKey directly — raw bytes never
@@ -336,7 +368,7 @@ export async function generateDeviceIdentity(): Promise<DeviceIdentity> {
 	// Use @noble/curves keygen so we have access to raw seed bytes.
 	// keygen() returns { secretKey: Uint8Array(32), publicKey: Uint8Array(32) }.
 	const kp = nobleEd25519.keygen();
-	const privateKeyBytes = kp.secretKey; // 32-byte raw Ed25519 seed
+	const rawSeed = kp.secretKey; // 32-byte raw Ed25519 seed
 	const publicKeyB64 = toBase64url(kp.publicKey);
 
 	// Attempt to import into WebCrypto for callers that hold a CryptoKey reference
@@ -353,7 +385,7 @@ export async function generateDeviceIdentity(): Promise<DeviceIdentity> {
 		// supported for private keys — only public keys accept 'raw' format).
 		const pkcs8 = new Uint8Array(ED25519_PKCS8_PREFIX.byteLength + 32);
 		pkcs8.set(ED25519_PKCS8_PREFIX, 0);
-		pkcs8.set(privateKeyBytes, ED25519_PKCS8_PREFIX.byteLength);
+		pkcs8.set(rawSeed, ED25519_PKCS8_PREFIX.byteLength);
 
 		// extractable: true — required for wrapKey in persistIdentity (plan §B.1)
 		privateKey = await crypto.subtle.importKey(
@@ -388,7 +420,7 @@ export async function generateDeviceIdentity(): Promise<DeviceIdentity> {
 		publicKeyB64,
 		publicKey,
 		privateKey,
-		privateKeyBytes: new OpaquePrivateKey(privateKeyBytes),
+		privateKeySeed: new OpaquePrivateKey(rawSeed),
 	};
 }
 
@@ -408,9 +440,9 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 	const wrappingKey = await getOrCreateWrappingKey();
 
 	// persistIdentity is only called from generateDeviceIdentity which always
-	// sets privateKeyBytes from the noble Ed25519 keypair — never null.
-	if (!identity.privateKeyBytes) {
-		throw new Error('[identity] persistIdentity called with null privateKeyBytes — invariant violation');
+	// sets privateKeySeed from the noble Ed25519 keypair — never null.
+	if (!identity.privateKeySeed) {
+		throw new Error('[identity] persistIdentity called with null privateKeySeed — invariant violation');
 	}
 
 	// Wrap raw 32-byte seed via the algorithm-agnostic aes-kw helper (HMAC-import
@@ -418,7 +450,7 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 	// best-effort. Wire format changed from the old inline AES-256-import trick;
 	// old entries still unwrap correctly because AES-KW ciphertext is
 	// independent of the wrapped key's declared algorithm.
-	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, identity.privateKeyBytes.bytes());
+	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, identity.privateKeySeed.bytes());
 	await idb.save(DEVICE_PRIV_RAW_NAME, wrappedRawSeed);
 
 	// PKCS8 wrap path: only possible when WebCrypto Ed25519 is available (non-null
@@ -482,7 +514,7 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 		publicKeyB64: identity.publicKeyB64,
 		publicKey,
 		privateKey: nonExtractablePrivKey,
-		privateKeyBytes: identity.privateKeyBytes,
+		privateKeySeed: identity.privateKeySeed,
 	};
 }
 
@@ -545,8 +577,8 @@ async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
 		// Works for both old entries (wrapped with the inline AES-256-import
 		// trick) and new entries (wrapped with wrapSecretBytes) — AES-KW
 		// ciphertext is independent of the wrapped key's declared algorithm.
-		const privateKeyBytes = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
-		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeyBytes: new OpaquePrivateKey(privateKeyBytes) };
+		const rawSeed = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
+		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeySeed: new OpaquePrivateKey(rawSeed) };
 	} else {
 		// Pre-W7-P2b1 identity: raw seed unavailable.
 		// Return null so callers can show migration banner + disable sealed send.
@@ -561,7 +593,7 @@ async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
 			publicKeyB64: stored.publicKeyB64,
 			publicKey,
 			privateKey,
-			privateKeyBytes: null,
+			privateKeySeed: null,
 		};
 	}
 
@@ -576,18 +608,18 @@ async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
  * on the server. Works on all runtimes including HyperOS/HarmonyOS where
  * WebCrypto Ed25519 is absent (Chrome <137).
  *
- * Requires privateKeyBytes to be non-null (pre-W7-P2b1 identities without
+ * Requires privateKeySeed to be non-null (pre-W7-P2b1 identities without
  * raw seed must re-register — checked by the caller).
  */
 export async function signWithDeviceIdentity(
 	identity: DeviceIdentity,
 	message: string
 ): Promise<string> {
-	if (!identity.privateKeyBytes) {
-		throw new Error('[identity] signWithDeviceIdentity: privateKeyBytes is null — identity migration required');
+	if (!identity.privateKeySeed) {
+		throw new Error('[identity] signWithDeviceIdentity: privateKeySeed is null — identity migration required');
 	}
 	const msg = new TextEncoder().encode(message);
-	const sig = nobleEd25519.sign(msg, identity.privateKeyBytes.bytes());
+	const sig = nobleEd25519.sign(msg, identity.privateKeySeed.bytes());
 	return toBase64url(sig);
 }
 
@@ -663,7 +695,7 @@ export async function clearDeviceIdentity(): Promise<void> {
 interface X25519KeypairCache {
 	publicKey: Uint8Array;                  // raw 32-byte X25519 public key
 	privateKey: CryptoKey | null;           // non-extractable ECDH (X25519) private key, null on noble-only runtimes
-	privateKeyBytes: Uint8Array | null;     // raw 32-byte X25519 private key for @noble/curves DH, null when WebCrypto available
+	privateKeySeed: Uint8Array | null;     // raw 32-byte X25519 private key for @noble/curves DH, null when WebCrypto available
 }
 
 interface StoredX25519Keypair {
@@ -699,7 +731,7 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 		// Noble-only identity: wrappedPrivateKey is zero-length, wrappedPrivateKeyRaw has the seed.
 		if (existing.wrappedPrivateKey.byteLength === 0 && existing.wrappedPrivateKeyRaw) {
 			const rawBuf = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
-			cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: rawBuf };
+			cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeySeed: rawBuf };
 			return cachedX25519Keypair;
 		}
 
@@ -714,7 +746,7 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 				false, // non-extractable at runtime
 				['deriveBits'],
 			);
-			cachedX25519Keypair = { publicKey: pub, privateKey: priv, privateKeyBytes: null };
+			cachedX25519Keypair = { publicKey: pub, privateKey: priv, privateKeySeed: null };
 			return cachedX25519Keypair;
 		} catch (e) {
 			if ((e as { name?: string })?.name !== 'NotSupportedError') throw e;
@@ -724,7 +756,7 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 			// and breaking TOFU trust with all peers.
 			if (existing.wrappedPrivateKeyRaw && existing.wrappedPrivateKeyRaw.byteLength > 0) {
 				const rawBuf = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
-				cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeyBytes: rawBuf };
+				cachedX25519Keypair = { publicKey: pub, privateKey: null, privateKeySeed: rawBuf };
 				console.info('[identity] WebCrypto X25519 downgrade — recovered existing keypair via noble fallback');
 				return cachedX25519Keypair;
 			}
@@ -771,7 +803,7 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 			['deriveBits'],
 		);
 
-		cachedX25519Keypair = { publicKey: pub, privateKey: nonExtractPriv, privateKeyBytes: null };
+		cachedX25519Keypair = { publicKey: pub, privateKey: nonExtractPriv, privateKeySeed: null };
 		return cachedX25519Keypair;
 	} catch (e) {
 		if ((e as { name?: string })?.name !== 'NotSupportedError') throw e;
@@ -792,7 +824,7 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 		wrappedPrivateKeyRaw: wrappedPrivRaw,
 	});
 
-	cachedX25519Keypair = { publicKey: pubBytes, privateKey: null, privateKeyBytes: privBytes };
+	cachedX25519Keypair = { publicKey: pubBytes, privateKey: null, privateKeySeed: privBytes };
 	return cachedX25519Keypair;
 }
 
@@ -811,10 +843,10 @@ export async function dhX25519(remotePub: Uint8Array): Promise<Uint8Array> {
 	// Noble-only path: private key is raw bytes.
 	if (kp.privateKey === null) {
 		const cached = cachedX25519Keypair;
-		if (!cached?.privateKeyBytes) {
+		if (!cached?.privateKeySeed) {
 			throw new Error('[identity] dhX25519: no X25519 private key available');
 		}
-		return nobleX25519.getSharedSecret(cached.privateKeyBytes, remotePub);
+		return nobleX25519.getSharedSecret(cached.privateKeySeed, remotePub);
 	}
 
 	// WebCrypto path.

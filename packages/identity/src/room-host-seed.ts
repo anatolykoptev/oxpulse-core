@@ -30,6 +30,11 @@ const DB_NAME = 'oxpulse-room-host-seed';
 const STORE_NAME = 'seed';
 const KEY = 'room_host_seed_v1';     // LOAD-BEARING — DO NOT RENAME
 const WRAPPING_KEY = 'wrapping_key'; // wrapping key for this store only
+// The CryptoKey form lives under its OWN entry. ADR-3's copy-only rule applies
+// here too: upgrading raw bytes to a CryptoKey must never overwrite the raw
+// bytes, because they are the only thing that can recover the seed if the
+// CryptoKey later fails to deserialise.
+const WRAPPING_KEY_CK = 'wrapping_key_ck';
 
 const idb = createIdbStore({ dbName: DB_NAME, storeName: STORE_NAME });
 
@@ -84,19 +89,38 @@ async function getWrappingKey(): Promise<CryptoKey> {
 
 	const canClone = await probeStructuredClone();
 
+	// Prefer the CryptoKey entry; a read failure here is not fatal because the
+	// raw bytes below are never deleted.
+	let ckEntry: CryptoKey | null = null;
+	let ckLoadFailed = false;
+	try {
+		const loaded = await idb.load<CryptoKey>(WRAPPING_KEY_CK);
+		if (loaded instanceof CryptoKey) ckEntry = loaded;
+	} catch {
+		ckLoadFailed = true;
+	}
+	if (ckEntry) {
+		cachedWrappingKey = ckEntry;
+		return cachedWrappingKey;
+	}
+
 	const existing = await idb.load<CryptoKey | ArrayBuffer>(WRAPPING_KEY);
 	if (existing) {
-		if (canClone && existing instanceof CryptoKey) {
-			// Persisted as a non-extractable CryptoKey — use directly.
+		if (existing instanceof CryptoKey) {
+			// An older build persisted the CryptoKey under the raw-bytes key.
 			cachedWrappingKey = existing;
 		} else {
-			// Persisted as raw bytes (fallback path, or legacy pre-Phase-5
-			// entry) — re-import non-extractable. If structured-clone is now
-			// supported, upgrade the stored entry to a CryptoKey in place.
+			// Raw bytes — re-import non-extractable. When structured-clone is
+			// supported, COPY a CryptoKey to its own entry; the raw bytes stay
+			// put. Overwriting them in place (the previous behaviour) destroyed
+			// the only recovery path if the CryptoKey later failed to
+			// deserialise — ADR-3's copy-only rule, which device-identity
+			// honours by writing to a different database and which this store
+			// must honour by writing to a different key.
 			const raw = existing as ArrayBuffer;
 			const kek = await importAesKwRaw(raw, false);
-			if (canClone) {
-				await idb.save(WRAPPING_KEY, kek);
+			if (canClone && !ckLoadFailed) {
+				await idb.save(WRAPPING_KEY_CK, kek);
 			}
 			cachedWrappingKey = kek;
 		}
@@ -108,7 +132,7 @@ async function getWrappingKey(): Promise<CryptoKey> {
 	// (extractable during the bootstrap window only) and re-import non-extractable.
 	const kek = await generateAesKwKey(false);
 	if (canClone) {
-		await idb.save(WRAPPING_KEY, kek);
+		await idb.save(WRAPPING_KEY_CK, kek);
 		cachedWrappingKey = kek;
 	} else {
 		const extractableKek = await generateAesKwKey(true);
