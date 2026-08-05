@@ -22,7 +22,7 @@ export type MeshMetric =
   // B.3 mailbox: IDB write failure during inbox.put() (router.ts fire-and-forget path).
   // label: reason — err.name (e.g. QuotaExceededError, InvalidStateError), max 80 chars.
   | 'inbox_put_failed'
-  // B.3 mailbox: entries evicted by bounded put() or evictExcess() to enforce maxEntries cap.
+  // B.3 mailbox: entries evicted by bounded put() to enforce maxEntries cap.
   // label: store — 'inbox' | 'spool'. Value is the count evicted (emit once per eviction batch).
   | 'mailbox_evicted'
   // B.3 mailbox: QuotaExceededError caught during put(), triggering aggressive eviction + retry.
