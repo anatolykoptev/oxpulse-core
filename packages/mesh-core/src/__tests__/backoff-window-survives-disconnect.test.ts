@@ -145,3 +145,46 @@ describe('AUDIT #44/#52: backoff window must survive a disconnect event', () => 
     expect(connectSpy, 'device was retried immediately — backoff defeated').toHaveBeenCalledTimes(1);
   });
 });
+
+describe('AUDIT #44/#52: the 30s GC prunes EXPIRED backoff entries', () => {
+  beforeEach(() => {
+    meshState.peers = []; meshState.advertising = false; meshState.scanning = false; meshState.error = null;
+    connectSpy.mockReset();
+    connListenerCb.current = null; scanCbRef.current = null;
+    if (typeof localStorage !== 'undefined') localStorage.clear();
+    _resetTofuStore();
+  });
+
+  afterEach(async () => {
+    if (meshState.advertising || meshState.scanning) await stopMesh();
+    vi.useRealTimers();
+  });
+
+  // clearBackoff now refuses to drop an ARMED window (F1). That leaves one way
+  // for the Maps to grow without bound, which is issue #44's actual concern: a
+  // device that fails to connect and then vanishes, never emitting a
+  // post-expiry disconnect. The periodic prune on the existing 30s GC interval
+  // is the ONLY thing that reclaims those entries, and nothing else covers it.
+  //
+  // Fake Date + setInterval only; drain() relies on a real setTimeout. Note
+  // advanceTimersByTime also advances the mocked clock, so a single 30s tick
+  // both expires the 5s window and fires the GC.
+  it('reclaims an expired entry when the device never reconnects', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval'] });
+    connectSpy.mockRejectedValue(new Error('connect failed'));
+
+    await startMesh();
+    await drain();
+
+    scanCbRef.current?.(fakeSighting(DEV));
+    await drain();
+    expect(_getBackoffSize(), 'a failed connect must arm a backoff window').toBe(1);
+
+    // 30s later: the 5s window has expired and the GC interval has fired.
+    // No disconnect event ever arrived for this device.
+    vi.advanceTimersByTime(30_000);
+    await drain();
+
+    expect(_getBackoffSize(), 'GC did not reclaim an EXPIRED window: Maps grow unbounded').toBe(0);
+  });
+});
