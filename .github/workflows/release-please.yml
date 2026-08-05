@@ -186,17 +186,28 @@ jobs:
       # which is the exact failure this whole job exists to end.
       - name: Verify the publish landed
         working-directory: ${{ matrix.path }}
+        # Queries the registry's per-version endpoint over HTTP rather than
+        # `npm view`. `npm view` reads the cached PACKUMENT — on 0.1.17 it
+        # returned "not found" for 75s straight while the version was in fact
+        # already live, failing the run on a successful publish. A verification
+        # step that cries wolf is worse than none, because it teaches everyone to
+        # merge past a red publish. The per-version URL is not subject to that
+        # cache, and 10 x 30s tolerates real CDN propagation.
         run: |
           NAME=$(node -p "require('./package.json').name")
           WANT=$(node -p "require('./package.json').version")
-          echo "asserting $NAME@$WANT is served by the registry"
-          for attempt in 1 2 3 4 5; do
-            if npm view "$NAME@$WANT" version >/dev/null 2>&1; then
+          # Scoped names must be URL-encoded: @scope/name -> @scope%2Fname
+          ENC=$(node -p "encodeURIComponent(process.argv[1])" "$NAME")
+          URL="https://registry.npmjs.org/$ENC/$WANT"
+          echo "asserting $NAME@$WANT is served by the registry ($URL)"
+          for attempt in $(seq 1 10); do
+            CODE=$(curl -fsS -o /dev/null -w '%{http_code}' "$URL" || true)
+            if [ "$CODE" = "200" ]; then
               echo "OK: $NAME@$WANT is live"
               exit 0
             fi
-            echo "not visible yet (attempt $attempt/5); registry propagation lag — retrying in 15s"
-            sleep 15
+            echo "not visible yet (attempt $attempt/10, HTTP ${CODE:-none}) — retrying in 30s"
+            sleep 30
           done
-          echo "::error::$NAME@$WANT is NOT on the registry after a successful publish step"
+          echo "::error::$NAME@$WANT is NOT on the registry 5 minutes after a successful publish step"
           exit 1
