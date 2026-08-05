@@ -16,8 +16,17 @@
  * So the rule is mechanical rather than a matter of care: removing or renaming
  * anything below turns this test RED. Re-approving it is a deliberate edit to
  * the expected list in the same commit, which makes the removal visible in
- * review — and, per semver, a breaking change a consumer opts into rather than
- * discovers from a compiler error.
+ * review.
+ *
+ * AND MARK THE COMMIT BREAKING — `fix(mesh-core)!:` or a `BREAKING CHANGE:`
+ * footer. At 0.x release-please then cuts a MINOR, so a consumer on `^0.x.y`
+ * cannot silently pick up a removal in a patch. Semver permits removing public
+ * API in a 0.x patch, which is exactly why it is easy to keep doing by
+ * accident: `Outbox.evictExcess` and `Outbox.size` went out that way in 0.1.13
+ * before anyone noticed. Decided in #60.
+ *
+ * The `!` goes after the SCOPE, not the type. `feat!(mesh-core):` is malformed,
+ * is not recognised as breaking, and cuts an ordinary patch instead.
  *
  * ADDING an export is free: the assertions below are subset checks, not
  * equality, so growth never fails the build.
