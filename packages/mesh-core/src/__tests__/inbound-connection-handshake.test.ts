@@ -178,6 +178,7 @@ import {
 } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
 import { chunkFrame, FrameType } from '../frame.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 // ── Test constants ─────────────────────────────────────────────────────────
 const TEST_MTU = 247;
@@ -195,10 +196,18 @@ function fakeSighting() {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// Replaces the fixed wall-clock `drain()`. Each wait targets the observable
+// the next assertion reads: _hasCryptoState or the metrics sink.
+
+/** Wait for a CryptoState to exist (or not) for the given device. */
+async function awaitCryptoState(deviceId: string, present: boolean): Promise<void> {
+  await waitFor(
+    () => _hasCryptoState(deviceId) === present,
+    present
+      ? `CryptoState to be created for ${deviceId}`
+      : `CryptoState to be cleared for ${deviceId}`,
+  );
 }
 
 /** Inject a HandshakeMsg1 frame from the peer via the GATT-server RX path. */
@@ -243,29 +252,33 @@ describe('F2: inbound connection registers in connectedDevices so responder hand
 
   it('an inbound ({connected:true}) connection lets the responder handshake start (no frame dropped)', async () => {
     await startMesh();
-    await drain();
+    await flushMicrotasks();
 
     // 1. Outbound connect succeeds → peer registered + connectedDevices set +
     //    initiateHandshake creates a responder CryptoState (no msg-1 sent).
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitCryptoState(PEER_DEVICE_ID, true);
 
     // 2. The link drops. connectedDevices + cryptoStates are cleared; the
     //    registry retains the peer (30s GC).
     connListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, connected: false });
-    await drain(30);
+    await awaitCryptoState(PEER_DEVICE_ID, false);
     expect(_hasCryptoState(PEER_DEVICE_ID)).toBe(false);
 
     // 3. The peer reconnects INBOUND via the native connection listener. This
     //    is the path F2 fixes: the device is NOT in connectedDevices here.
+    //    The connection listener sets connectedDevices synchronously; flush
+    //    microtasks so the entry is visible before we inject the frame.
     connListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, connected: true });
-    await drain(30);
+    await flushMicrotasks();
 
     // 4. Deliver a HandshakeMsg1 through the GATT-server RX listener (the path
     //    inbound peers use). The responder-bootstrap guard checks
     //    connectedDevices.has(deviceAddress) — without F2 this drops the frame.
+    //    The responder-bootstrap path awaits getLocalIdentity() (async IDB),
+    //    then creates a CryptoState and advances the handshake — wait on that.
     injectMsg1ViaRx(PEER_DEVICE_ID);
-    await drain(60);
+    await awaitCryptoState(PEER_DEVICE_ID, true);
 
     // Core assertions — observable state, not log strings.
     // (a) The responder handshake actually started: a CryptoState was created.

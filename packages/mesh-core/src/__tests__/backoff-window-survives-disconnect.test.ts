@@ -85,6 +85,7 @@ vi.mock('@oxpulse/identity', async () => {
 });
 
 import { startMesh, stopMesh, meshState, _getBackoffSize, _resetTofuStore } from '../transport.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 const PEER_ID_BYTES = new Uint8Array(8).fill(0x77);
 const DEV = 'dev-backoff-window';
@@ -97,10 +98,15 @@ function fakeSighting(deviceId: string) {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// Replaces the fixed wall-clock `drain()`. The scan callback's backoff check
+// is synchronous (before the first await); the connect attempt + backoff
+// arming is a microtask chain. We wait on the observable (_getBackoffSize)
+// instead of a fixed wall-clock sleep.
+
+/** Wait for a failed connect to arm a backoff window (n entries). */
+async function awaitBackoffSize(n: number): Promise<void> {
+  await waitFor(() => _getBackoffSize() === n, `backoff size to reach ${n}`);
 }
 
 describe('AUDIT #44/#52: backoff window must survive a disconnect event', () => {
@@ -119,29 +125,33 @@ describe('AUDIT #44/#52: backoff window must survive a disconnect event', () => 
   it('does not retry a backed-off device after a disconnect event wipes the window', async () => {
     connectSpy.mockRejectedValue(new Error('connect failed'));
     await startMesh();
-    await drain();
+    await flushMicrotasks();
 
     // 1st sighting -> connect attempted -> fails -> 5s backoff window armed.
     scanCbRef.current?.(fakeSighting(DEV));
-    await drain();
+    await awaitBackoffSize(1);
     expect(connectSpy).toHaveBeenCalledTimes(1);
     expect(_getBackoffSize()).toBe(1);
 
     // 2nd sighting while still inside the 5s window -> must be skipped.
+    // The backoff check is synchronous (before the first await in the scan
+    // callback), so the skip is immediate; flush microtasks to let any pending
+    // work from the first sighting quiesce before asserting.
     scanCbRef.current?.(fakeSighting(DEV));
-    await drain();
+    await flushMicrotasks();
     expect(connectSpy).toHaveBeenCalledTimes(1);
 
     // A disconnect event arrives for the same device. The backoff window is
-    // still armed (only ~0.1s of 5s elapsed) and MUST survive.
+    // still armed (only ~0.1s of 5s elapsed) and MUST survive. The disconnect
+    // handler (clearBackoff) is synchronous.
     connListenerCb.current?.({ deviceAddress: DEV, connected: false });
-    await drain();
+    await flushMicrotasks();
 
     expect(_getBackoffSize(), 'backoff window was wiped by the disconnect handler').toBe(1);
 
     // 3rd sighting, still inside the original 5s window -> must still be skipped.
     scanCbRef.current?.(fakeSighting(DEV));
-    await drain();
+    await flushMicrotasks();
     expect(connectSpy, 'device was retried immediately — backoff defeated').toHaveBeenCalledTimes(1);
   });
 });
@@ -166,24 +176,24 @@ describe('AUDIT #44/#52: the 30s GC prunes EXPIRED backoff entries', () => {
   // post-expiry disconnect. The periodic prune on the existing 30s GC interval
   // is the ONLY thing that reclaims those entries, and nothing else covers it.
   //
-  // Fake Date + setInterval only; drain() relies on a real setTimeout. Note
-  // advanceTimersByTime also advances the mocked clock, so a single 30s tick
-  // both expires the 5s window and fires the GC.
+  // Fake Date + setInterval only; setTimeout stays real so microtask draining
+  // works. advanceTimersByTime also advances the mocked clock, so a single 30s
+  // tick both expires the 5s window and fires the GC.
   it('reclaims an expired entry when the device never reconnects', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setInterval'] });
     connectSpy.mockRejectedValue(new Error('connect failed'));
 
     await startMesh();
-    await drain();
+    await flushMicrotasks();
 
     scanCbRef.current?.(fakeSighting(DEV));
-    await drain();
+    await awaitBackoffSize(1);
     expect(_getBackoffSize(), 'a failed connect must arm a backoff window').toBe(1);
 
     // 30s later: the 5s window has expired and the GC interval has fired.
     // No disconnect event ever arrived for this device.
     vi.advanceTimersByTime(30_000);
-    await drain();
+    await flushMicrotasks();
 
     expect(_getBackoffSize(), 'GC did not reclaim an EXPIRED window: Maps grow unbounded').toBe(0);
   });

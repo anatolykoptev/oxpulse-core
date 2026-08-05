@@ -110,7 +110,8 @@ vi.mock('@oxpulse/identity', async () => {
   };
 });
 
-import { startMesh, stopMesh, meshState, sendFrame, getPendingHandshakes, acceptPeer, rejectPeer, _resetTofuStore } from '../transport.js';
+import { startMesh, stopMesh, meshState, sendFrame, getPendingHandshakes, acceptPeer, rejectPeer, onFrame, _hasCryptoState, _resetTofuStore } from '../transport.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 // ── Deterministic test identity factory (for peer side) ──────────────────────
 // B.2-noise-s-key-derivation: also provides getX25519PublicKey + dhX25519
@@ -147,12 +148,19 @@ function fakeSighting() {
   };
 }
 
-/** Drain microtasks + allow macrotasks (setTimeout) to settle. */
-async function drain(n = 30) {
-  // Mix microtask draining with a timer yield so WebCrypto operations complete.
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise(r => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// The old `drain()` flushed a fixed number of microtasks + a 50ms wall-clock
+// sleep and then asserted; under load the handshake had not settled, producing
+// shifting false-reds. These wait on the observable condition each step needs.
+
+/** Wait for the initiator to send msg-1 (initiateHandshake ran, CryptoState created). */
+async function awaitMsg1Sent(): Promise<void> {
+  await waitFor(() => writeRxSpy.mock.calls.length > 0, 'transport to send msg-1 (initiateHandshake)');
+}
+
+/** Wait for the initiator handshake to complete: msg-3 sent + SAS available. */
+async function awaitHandshakeComplete(): Promise<void> {
+  await waitFor(() => getPendingHandshakes().length > 0, 'initiator handshake to complete (msg-3 sent, SAS available)');
 }
 
 /** Extract raw Uint8Array from a writeRxSpy call (arg index 3 = DataView). */
@@ -221,7 +229,7 @@ describe('transport crypto (B.2 Task 11)', () => {
   async function startAndConnect() {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
   }
 
   // ── Test 1: handshake completes, SAS matches ────────────────────────────
@@ -242,7 +250,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     // Inject msg-2 chunks toward transport.
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     // Transport (initiator) should have sent msg-3.
     ({ newIdx, peerMsgOut, frameType } = drainWritesToPeer(new FrameReassembler(), newIdx));
@@ -282,7 +290,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await peerHs.readMessage(peerMsgOut!);
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     const r2 = new FrameReassembler();
     ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
@@ -304,7 +312,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     // Send a frame from our side.
     const plaintext = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
     await sendFrame(peerIdHex, plaintext);
-    await drain(20);
+    await flushMicrotasks();
 
     // Collect the encrypted chunks written after msg-3.
     const r3 = new FrameReassembler();
@@ -337,7 +345,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await peerHs.readMessage(peerMsgOut!);
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     const r2 = new FrameReassembler();
     ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
@@ -360,15 +368,23 @@ describe('transport crypto (B.2 Task 11)', () => {
     const wire = await peerSession.encrypt(pt);
     const chunks = chunkFrame(wire, TEST_MTU, FrameType.SessionData);
 
-    // First delivery — should succeed (no error).
-    injectFromPeer(chunks);
-    await drain(40);
-    expect(meshState.error).toBeNull();
+    // First delivery — should succeed (no error). Wait for the frame to be
+    // decrypted (onFrame fires) so the assertion runs on settled state, not on
+    // a coincidentally-null error before the decrypt completes.
+    let firstFrameReceived = false;
+    const off = onFrame(() => { firstFrameReceived = true; });
+    try {
+      injectFromPeer(chunks);
+      await waitFor(() => firstFrameReceived, 'first session-data frame to be decrypted');
+      expect(meshState.error).toBeNull();
 
-    // Replay the same chunks — should trigger replay-rejected.
-    injectFromPeer(chunks);
-    await drain(40);
-    expect(meshState.error).toBe('replay-rejected');
+      // Replay the same chunks — should trigger replay-rejected.
+      injectFromPeer(chunks);
+      await waitFor(() => meshState.error === 'replay-rejected', 'replay of session-data frame to set meshState.error = replay-rejected');
+      expect(meshState.error).toBe('replay-rejected');
+    } finally {
+      off();
+    }
   });
 
   // ── Test 5: TOFU key change → unknown-peer-key ──────────────────────────
@@ -381,7 +397,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await peerHs.readMessage(peerMsgOut!);
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     const r2 = new FrameReassembler();
     ({ peerMsgOut } = drainWritesToPeer(r2, newIdx));
@@ -400,7 +416,7 @@ describe('transport crypto (B.2 Task 11)', () => {
 
     await startMesh();
     scanCbRef.current?.(fakeSighting()); // same peer-id bytes → same peerIdHex
-    await drain(120);
+    await awaitMsg1Sent();
 
     // Collect msg-1.
     const r3 = new FrameReassembler();
@@ -418,7 +434,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await impostorHs.readMessage(impostorMsg!);
     const m2imp = await impostorHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2imp, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     // Collect msg-3.
     const r4 = new FrameReassembler();
@@ -435,7 +451,7 @@ describe('transport crypto (B.2 Task 11)', () => {
       }
     }
     if (msg3) await impostorHs.readMessage(msg3);
-    await drain(20);
+    await flushMicrotasks();
 
     // TOFU mismatch: peer-id same, pubkey different.
     const pending = getPendingHandshakes();
@@ -461,12 +477,14 @@ describe('transport crypto (B.2 Task 11)', () => {
 
     // Inject msg-2 once — transport processes it normally.
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     // Now replay msg-2 again (out-of-state: transport already advanced to msg-3 state).
     // Per C2 fix: this must be silently dropped, NOT set verdict='rejected'.
+    // The drop is a microtask-only chain (readMessage throws NoiseStateError →
+    // return); flush microtasks so the assertion runs after it quiesces.
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(60);
+    await flushMicrotasks();
 
     // Verdict must NOT be 'rejected' — crypto state should remain (pending or accepted).
     // The handshake either completed (sas set) or is still in-flight, never poisoned.
@@ -488,7 +506,7 @@ describe('transport crypto (B.2 Task 11)', () => {
   it('responder bootstrap path awaits local identity without null-assertion crash', async () => {
     // Start mesh but do NOT trigger a scan sighting (we are the responder).
     await startMesh();
-    await drain(10);
+    await flushMicrotasks();
 
     // Register PEER_DEVICE_ID in connectedDevices by faking a successful connection:
     // The peer initiates — we receive HandshakeMsg1 from them before our scan resolves.
@@ -500,14 +518,17 @@ describe('transport crypto (B.2 Task 11)', () => {
     // handleIncomingChunk can resolve peerIdHex.
     // We do that by injecting through the scan path first then rx immediately.
     scanCbRef.current?.(fakeSighting());
-    await drain(20); // let connect complete but not full handshake initiation
+    // Wait for connect + initiateHandshake to settle (responder creates a
+    // CryptoState but sends no msg-1). _hasCryptoState implies connectedDevices
+    // has the device, which the responder-bootstrap guard requires.
+    await waitFor(() => _hasCryptoState(PEER_DEVICE_ID), 'connect + initiateHandshake to settle (responder)');
 
     // Now inject msg-1 as if peer sent it to us (rx listener path).
     const chunks = chunkFrame(m1, TEST_MTU, FrameType.HandshakeMsg1);
     for (const c of chunks) {
       rxListenerCb.current?.({ deviceAddress: PEER_DEVICE_ID, data: btoa(String.fromCharCode(...c)) });
     }
-    await drain(120);
+    await waitFor(() => writeRxSpy.mock.calls.length > 0, 'responder to send msg-2 after receiving msg-1');
 
     // The transport must NOT crash (null-assert on localIdentityProvider).
     // Evidence: it should have responded with msg-2 via writeRx.
@@ -528,7 +549,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await peerHs.readMessage(peerMsgOut!);
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     const r2 = new FrameReassembler();
     ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
@@ -550,9 +571,9 @@ describe('transport crypto (B.2 Task 11)', () => {
     const pt0 = new TextEncoder().encode('frame-zero');
     const pt1 = new TextEncoder().encode('frame-one');
     await sendFrame(peerIdHex, pt0);
-    await drain(10);
+    await flushMicrotasks();
     await sendFrame(peerIdHex, pt1);
-    await drain(10);
+    await flushMicrotasks();
 
     // Collect both encrypted SessionData frames.
     const r3 = new FrameReassembler();
@@ -585,7 +606,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await peerHs.readMessage(peerMsgOut!);
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     const r2 = new FrameReassembler();
     ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
@@ -607,9 +628,9 @@ describe('transport crypto (B.2 Task 11)', () => {
     const pt0 = new TextEncoder().encode('out-of-order-0');
     const pt1 = new TextEncoder().encode('out-of-order-1');
     await sendFrame(peerIdHex, pt0);
-    await drain(10);
+    await flushMicrotasks();
     await sendFrame(peerIdHex, pt1);
-    await drain(10);
+    await flushMicrotasks();
 
     // Collect both encrypted frames.
     const r3 = new FrameReassembler();
@@ -643,7 +664,7 @@ describe('transport crypto (B.2 Task 11)', () => {
     await peerHs.readMessage(peerMsgOut!);
     const m2 = await peerHs.writeMessage(new Uint8Array(0));
     injectFromPeer(chunkFrame(m2, TEST_MTU, FrameType.HandshakeMsg2));
-    await drain(120);
+    await awaitHandshakeComplete();
 
     const r2 = new FrameReassembler();
     ({ newIdx, peerMsgOut } = drainWritesToPeer(r2, newIdx));
@@ -661,29 +682,36 @@ describe('transport crypto (B.2 Task 11)', () => {
       direction: 'responder',
     });
 
-    // Peer encrypts 70 frames and sends them to our transport.
-    const firstWire = await peerSession.encrypt(new Uint8Array([0x42]));
-    const firstChunks = chunkFrame(firstWire, TEST_MTU, FrameType.SessionData);
-    injectFromPeer(firstChunks);
-    await drain(30);
+    // Peer encrypts 70 frames and sends them to our transport. Wait for each
+    // frame to be decrypted (onFrame fires) before sending the next, preserving
+    // the original sequential delivery semantics the 64-frame window relies on.
+    let framesReceived = 0;
+    const off = onFrame(() => { framesReceived++; });
+    try {
+      const firstWire = await peerSession.encrypt(new Uint8Array([0x42]));
+      const firstChunks = chunkFrame(firstWire, TEST_MTU, FrameType.SessionData);
+      injectFromPeer(firstChunks);
+      await waitFor(() => framesReceived >= 1, 'session frame 1 to be decrypted');
 
-    // Send 69 more frames to push counter 0 outside the 64-frame window.
-    for (let i = 1; i < 70; i++) {
-      const wire = await peerSession.encrypt(new Uint8Array([i]));
-      injectFromPeer(chunkFrame(wire, TEST_MTU, FrameType.SessionData));
-      await drain(5);
+      // Send 69 more frames to push counter 0 outside the 64-frame window.
+      for (let i = 1; i < 70; i++) {
+        const wire = await peerSession.encrypt(new Uint8Array([i]));
+        injectFromPeer(chunkFrame(wire, TEST_MTU, FrameType.SessionData));
+        await waitFor(() => framesReceived >= i + 1, `session frame ${i + 1} to be decrypted`);
+      }
+
+      // All 70 frames should have been accepted — no error.
+      expect(meshState.error).toBeNull();
+
+      // Now re-inject the first frame (counter 0) — outside the 64-frame window.
+      injectFromPeer(firstChunks);
+      await waitFor(() => meshState.error === 'replay-rejected', 're-injected frame outside the 64-frame window to set meshState.error = replay-rejected');
+
+      // Must be rejected with 'replay-rejected' — the observable behaviour that
+      // must survive the ratchet migration.
+      expect(meshState.error).toBe('replay-rejected');
+    } finally {
+      off();
     }
-    await drain(30);
-
-    // All 70 frames should have been accepted — no error.
-    expect(meshState.error).toBeNull();
-
-    // Now re-inject the first frame (counter 0) — outside the 64-frame window.
-    injectFromPeer(firstChunks);
-    await drain(30);
-
-    // Must be rejected with 'replay-rejected' — the observable behaviour that
-    // must survive the ratchet migration.
-    expect(meshState.error).toBe('replay-rejected');
   });
 });

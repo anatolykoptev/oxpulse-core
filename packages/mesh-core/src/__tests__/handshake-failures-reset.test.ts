@@ -186,6 +186,7 @@ import {
 } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
 import { chunkFrame, FrameType } from '../frame.js';
+import { waitFor, flushMicrotasks } from './_async-helpers.js';
 
 // ── Test constants ─────────────────────────────────────────────────────────
 const TEST_MTU = 247;
@@ -202,10 +203,29 @@ function fakeSighting() {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helpers (issue #58) ───────────────────────────────
+// Replaces the fixed wall-clock `drain()`. Each wait targets the observable
+// the next assertion reads: handshakeFailures counter or getPendingHandshakes.
+
+/** Wait for initiateHandshake to run (ControllableHandshake instance created). */
+async function awaitHandshakeStarted(): Promise<void> {
+  await waitFor(() => handshakeRef.current !== null, 'initiateHandshake to create a CryptoState');
+}
+
+/** Wait for handshakeFailures to reach exactly `n` for PEER_DEVICE_ID. */
+async function awaitFailures(n: number): Promise<void> {
+  await waitFor(
+    () => _getHandshakeFailures(PEER_DEVICE_ID) === n,
+    `handshakeFailures to reach ${n}`,
+  );
+}
+
+/** Wait for the handshake to complete (SAS available) and counter reset to 0. */
+async function awaitHandshakeCompleteReset(): Promise<void> {
+  await waitFor(
+    () => getPendingHandshakes().length > 0 && _getHandshakeFailures(PEER_DEVICE_ID) === 0,
+    'handshake to complete (SAS available) and handshakeFailures reset to 0',
+  );
 }
 
 /** Inject a handshake msg-2 frame from "peer" toward transport. */
@@ -250,7 +270,7 @@ describe('#46: handshakeFailures reset on successful handshake (issue #46)', () 
   it('handshakeFailures reset to 0 after 2 failures + successful handshake', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeStarted();
 
     // Transport (initiator) sent msg-1; NoiseXxHandshake mock was created.
     expect(handshakeRef.current).not.toBeNull();
@@ -261,18 +281,18 @@ describe('#46: handshakeFailures reset on successful handshake (issue #46)', () 
 
     // Inject msg-2 #1 → readMessage throws Error → handshakeFailures=1.
     injectMsg2();
-    await drain(30);
+    await awaitFailures(1);
     expect(_getHandshakeFailures(PEER_DEVICE_ID)).toBe(1);
 
     // Inject msg-2 #2 → readMessage throws Error → handshakeFailures=2.
     injectMsg2();
-    await drain(30);
+    await awaitFailures(2);
     expect(_getHandshakeFailures(PEER_DEVICE_ID)).toBe(2);
 
     // Inject msg-2 #3 → readMessage succeeds → transport sends msg-3 →
     // isComplete() → split → session established → handshakeFailures reset to 0.
     injectMsg2();
-    await drain(60);
+    await awaitHandshakeCompleteReset();
 
     // Core assertion: counter must be 0 after successful handshake.
     // RED without fix: counter stays at 2.
@@ -288,21 +308,21 @@ describe('#46: handshakeFailures reset on successful handshake (issue #46)', () 
   it('handshake_failures_reset metric emitted when counter is reset', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeStarted();
 
     const hs = handshakeRef.current!;
     hs.readQueue = ['fail', 'fail', 'ok'];
 
     // 2 failures.
     injectMsg2();
-    await drain(30);
+    await awaitFailures(1);
     injectMsg2();
-    await drain(30);
+    await awaitFailures(2);
     expect(_getHandshakeFailures(PEER_DEVICE_ID)).toBe(2);
 
     // Successful handshake → reset.
     injectMsg2();
-    await drain(60);
+    await awaitHandshakeCompleteReset();
 
     const resetMetrics = metrics.filter((m) => m.metric === 'handshake_failures_reset');
     expect(resetMetrics.length).toBeGreaterThanOrEqual(1);
@@ -313,7 +333,7 @@ describe('#46: handshakeFailures reset on successful handshake (issue #46)', () 
   it('3rd failure after reset does NOT cause premature rejection', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeStarted();
 
     const hs = handshakeRef.current!;
     // Queue: 2 failures, success (handshake completes, counter reset), then 1 more failure.
@@ -321,20 +341,20 @@ describe('#46: handshakeFailures reset on successful handshake (issue #46)', () 
 
     // 2 failures.
     injectMsg2();
-    await drain(30);
+    await awaitFailures(1);
     injectMsg2();
-    await drain(30);
+    await awaitFailures(2);
     expect(_getHandshakeFailures(PEER_DEVICE_ID)).toBe(2);
 
     // Successful handshake → counter reset to 0.
     injectMsg2();
-    await drain(60);
+    await awaitHandshakeCompleteReset();
     expect(_getHandshakeFailures(PEER_DEVICE_ID)).toBe(0);
 
     // 3rd failure (after reset) → counter goes to 1, NOT 3.
     // Without fix: counter was 2, this makes it 3 → premature rejection.
     injectMsg2();
-    await drain(30);
+    await awaitFailures(1);
 
     // With fix: counter is 1 (not 3), no rejection.
     expect(_getHandshakeFailures(PEER_DEVICE_ID)).toBe(1);
@@ -347,14 +367,14 @@ describe('#46: handshakeFailures reset on successful handshake (issue #46)', () 
   it('handshake_failures_reset NOT emitted when counter was already 0', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitHandshakeStarted();
 
     const hs = handshakeRef.current!;
     // No failures — straight to success.
     hs.readQueue = ['ok'];
 
     injectMsg2();
-    await drain(60);
+    await waitFor(() => getPendingHandshakes().length > 0, 'handshake to complete (SAS available)');
 
     // Counter was 0 before handshake completion → no reset needed → no metric.
     const resetMetrics = metrics.filter((m) => m.metric === 'handshake_failures_reset');

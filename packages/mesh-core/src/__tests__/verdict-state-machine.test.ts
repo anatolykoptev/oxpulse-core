@@ -87,6 +87,7 @@ vi.mock('@oxpulse/identity', async () => {
 
 import { startMesh, stopMesh, meshState, getPendingHandshakes, acceptPeer, rejectPeer, _resetTofuStore } from '../transport.js';
 import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
+import { waitFor } from './_async-helpers.js';
 
 const PEER_ID_BYTES = new Uint8Array(8).fill(0x77);
 const PEER_DEVICE_ID = 'peer-aa:bb:cc';
@@ -99,10 +100,15 @@ function fakeSighting() {
   };
 }
 
-async function drain(n = 30) {
-  for (let i = 0; i < n; i++) await Promise.resolve();
-  await new Promise(r => setTimeout(r, 50));
-  for (let i = 0; i < n; i++) await Promise.resolve();
+// ── Deterministic settle helper (issue #58) ────────────────────────────────
+// Replaces the fixed wall-clock `drain()`. The tests call acceptPeer/rejectPeer
+// (synchronous) after initiateHandshake creates a pending CryptoState; we wait
+// for msg-1 to be sent (the observable that initiateHandshake ran) instead of a
+// fixed wall-clock sleep.
+
+/** Wait for the initiator to send msg-1 (initiateHandshake ran). */
+async function awaitMsg1Sent(): Promise<void> {
+  await waitFor(() => writeRxSpy.mock.calls.length > 0, 'transport to send msg-1 (initiateHandshake)');
 }
 
 function peerIdHex() {
@@ -126,7 +132,7 @@ describe('S1: verdict state machine (issue #10)', () => {
   it('M1: rejectPeer then acceptPeer → verdict stays rejected', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     rejectPeer(peerIdHex());
     // acceptPeer after reject should NOT override.
@@ -141,7 +147,7 @@ describe('S1: verdict state machine (issue #10)', () => {
   it('M2: acceptPeer then rejectPeer → verdict stays accepted', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     // We need a completed handshake to accept. Use writeRx to complete it.
     // For this test, just verify the state machine logic by calling accept first.
@@ -160,7 +166,7 @@ describe('S1: verdict state machine (issue #10)', () => {
   it('double acceptPeer is idempotent (no crash, no state change)', async () => {
     await startMesh();
     scanCbRef.current?.(fakeSighting());
-    await drain(120);
+    await awaitMsg1Sent();
 
     // Calling acceptPeer twice should not crash.
     acceptPeer(peerIdHex());
@@ -177,7 +183,7 @@ describe('S1: verdict state machine (issue #10)', () => {
     try {
       await startMesh();
       scanCbRef.current?.(fakeSighting());
-      await drain(120);
+      await awaitMsg1Sent();
 
       rejectPeer(peerIdHex());
       rejectPeer(peerIdHex());
