@@ -4,6 +4,15 @@
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "description": "Long-term Ed25519 device identity for oxpulse-chat (Phase B.2+)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anatolykoptev/oxpulse-core.git",
+    "directory": "packages/identity"
+  },
+  "homepage": "https://github.com/anatolykoptev/oxpulse-core/tree/main/packages/identity#readme",
+  "bugs": {
+    "url": "https://github.com/anatolykoptev/oxpulse-core/issues"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

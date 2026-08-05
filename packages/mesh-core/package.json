@@ -4,6 +4,15 @@
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "description": "BLE / WiFi-Direct offline mesh transport for oxpulse-chat (Phase B.1+)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anatolykoptev/oxpulse-core.git",
+    "directory": "packages/mesh-core"
+  },
+  "homepage": "https://github.com/anatolykoptev/oxpulse-core/tree/main/packages/mesh-core#readme",
+  "bugs": {
+    "url": "https://github.com/anatolykoptev/oxpulse-core/issues"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
