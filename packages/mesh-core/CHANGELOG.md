@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.16...mesh-core-v0.1.17) (2026-08-05)
+
+
+### Fixed
+
+* **mesh-core:** restore Inbox/Spool evictExcess and lock the public API ([#69](https://github.com/anatolykoptev/oxpulse-core/issues/69)) ([34e1ff0](https://github.com/anatolykoptev/oxpulse-core/commit/34e1ff0a847ebe279a22df930915b7bbb623d84f))
+
 ## [0.1.16](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.1.15...mesh-core-v0.1.16) (2026-08-05)
 
 
