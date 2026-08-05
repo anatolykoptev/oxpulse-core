@@ -142,6 +142,7 @@ vi.mock('@oxpulse/identity', async () => {
 
 import { startMesh, stopMesh, meshState, _hasCryptoState, _resetTofuStore } from '../transport.js';
 import { waitFor, flushMicrotasks } from './_async-helpers.js';
+import { setMeshMetricSink, type MeshMetric } from '../metrics.js';
 
 // ── Test constants ─────────────────────────────────────────────────────────
 // Both peer-id bytes > OUR_PEER_ID (0x11) → our side is always the initiator,
@@ -198,6 +199,9 @@ describe('#91: cryptoStates entry leaks when a peer disconnects during the initi
     // initiateHandshake inside the `await getLocalIdentity()` gap.
     const resolveIdentity = armIdentityGate();
 
+    const metrics: { metric: MeshMetric; labels?: Record<string, string> }[] = [];
+    setMeshMetricSink((metric, labels) => metrics.push({ metric, labels }));
+
     await startMesh();
 
     // Trigger the outbound connect path for device A.
@@ -224,6 +228,14 @@ describe('#91: cryptoStates entry leaks when a peer disconnects during the initi
 
     // No leaked CryptoState holding handshake key material for a gone device.
     expect(_hasCryptoState(DEVICE_A)).toBe(false);
+
+    // #91 F1: the bail is observable. The responder path already emits for the
+    // identical condition, so an operator asking how often BLE churn aborts a
+    // handshake mid-bootstrap needs this side counted too. Asserted here because
+    // a metric nobody reads is indistinguishable from one never emitted.
+    const aborted = metrics.filter((m) => m.metric === 'handshake_init_aborted');
+    expect(aborted, 'no handshake_init_aborted metric emitted for the bail').toHaveLength(1);
+    expect(aborted[0]!.labels?.device, 'metric should name the device that vanished').toBe(DEVICE_A);
 
     // ── Phase 2: reconnect with a rotated MAC does not accumulate ──────────
     // The peer comes back with a different MAC (device B). The identity is now

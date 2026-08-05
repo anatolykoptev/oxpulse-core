@@ -808,7 +808,13 @@ async function initiateHandshake(deviceId: string, peerIdBytes: Uint8Array): Pro
   // (handshake key material) that no reaper touches — the disconnect handler
   // already fired, and checkHandshakeTimeouts skips disconnected entries by
   // design. Bail before creating any state.
-  if (!connectedDevices.has(deviceId)) return;
+  if (!connectedDevices.has(deviceId)) {
+    // Observable, matching what the responder path already does for the same
+    // condition — this bail is not an error, but "how often does BLE churn abort
+    // a handshake mid-bootstrap" is a question an operator cannot otherwise ask.
+    emitMeshMetric('handshake_init_aborted', { device: deviceId });
+    return;
+  }
 
   const peerIdHex = toHex(peerIdBytes);
   const role = roleFor(peerId, peerIdBytes);
