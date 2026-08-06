@@ -318,10 +318,33 @@ function nowMs(): number {
  * here MUST stay in lockstep with the server's allowlist — Prometheus
  * cardinality is bounded by that, not by what we send.
  */
+/**
+ * Thrown when the stored identity data is missing or malformed — as opposed to
+ * the runtime lacking a capability.
+ *
+ * It exists because classifyIdentityError sniffs the message for /Ed25519/i to
+ * detect WebCrypto's "Ed25519 is not supported", and two of this file's own
+ * error messages contain the word Ed25519 while meaning the opposite:
+ * "No Ed25519 private key in IDB" and "Unexpected PKCS#8 length for Ed25519
+ * key" are a missing entry and a corrupt one. Both were being reported as
+ * ed25519_unsupported, so an operator investigating a spike of "this runtime
+ * cannot do Ed25519" would have found data corruption mixed in.
+ */
+export class IdentityDataError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'IdentityDataError';
+	}
+}
+
 function classifyIdentityError(e: unknown, stage: 'create' | 'unwrap'): string {
 	const name = (e as { name?: string })?.name ?? '';
 	const message = String((e as { message?: string })?.message ?? '');
 	if (name === 'QuotaExceededError') return 'idb_quota_exceeded';
+	// Ours, and typed — checked BEFORE the message sniffing below, which would
+	// otherwise read the word Ed25519 in a missing-data message as a capability
+	// failure. See IdentityDataError.
+	if (name === 'IdentityDataError') return stage === 'create' ? 'wrap_failed' : 'unwrap_failed';
 	if (name === 'NotSupportedError' || /Ed25519/i.test(message)) return 'ed25519_unsupported';
 	if (name === 'InvalidAccessError' && stage === 'create') return 'extractable_unsupported';
 	if (stage === 'create') return 'wrap_failed';
@@ -971,7 +994,7 @@ export { toBase64url, fromBase64url } from './base64url.js';
 async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; publicB64u: string }> {
 	const stored = await idb.load<{ publicKeyB64: string; wrappedPrivateKey: ArrayBuffer }>(DEVICE_KEY_NAME);
 	if (!stored) {
-		throw new Error("No device identity in IDB");
+		throw new IdentityDataError("No device identity in IDB");
 	}
 
 	// ADR-8: the KEK is now a non-extractable CryptoKey in the dedicated KEK DB
@@ -987,7 +1010,7 @@ async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; public
 		// Noble-only: unwrap raw seed via aes-kw.ts
 		const wrappedRawSeed = await idb.load<ArrayBuffer>(DEVICE_PRIV_RAW_NAME);
 		if (!wrappedRawSeed) {
-			throw new Error("No Ed25519 private key in IDB (noble-only identity, no raw seed stored)");
+			throw new IdentityDataError("No Ed25519 private key in IDB (noble-only identity, no raw seed stored)");
 		}
 		const secret = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
 		return { secret, publicB64u: stored.publicKeyB64 };
@@ -1008,7 +1031,7 @@ async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; public
 	const pkcs8 = await crypto.subtle.exportKey("pkcs8", extractablePrivKey);
 	const pkcs8Bytes = new Uint8Array(pkcs8);
 	if (pkcs8Bytes.byteLength < 48) {
-		throw new Error("Unexpected PKCS#8 length for Ed25519 key");
+		throw new IdentityDataError("Unexpected PKCS#8 length for Ed25519 key");
 	}
 	const secret = pkcs8Bytes.slice(16);
 
@@ -1034,7 +1057,9 @@ async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; public
  * It audits the BACKUP path, not access to the seed in general. The same 32
  * bytes are reachable from the ordinary public API as
  * `getOrCreateDeviceIdentity().privateKeySeed.bytes()`, measured byte-identical
- * to this function's output. That path is on the signing hot path and cannot be
+ * to this function's output. `generateDeviceIdentity()` is a second route of the
+ * same shape — a different seed, since it mints a fresh keypair, but equally
+ * unaudited. That path is on the signing hot path and cannot be
  * audited without emitting an event per signature, so it is deliberately not
  * instrumented. In-page code that wants the seed will take that route and this
  * event will not fire. What this buys is a record of deliberate backup exports —
