@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.1...identity-v0.2.2) (2026-08-06)
+
+
+### Added
+
+* **identity:** audit every raw-secret export ([0aed0b6](https://github.com/anatolykoptev/oxpulse-core/commit/0aed0b60d6e03d7babdf55b954d08306a058001b))
+* **identity:** audit every raw-secret export ([#111](https://github.com/anatolykoptev/oxpulse-core/issues/111)) ([0aed0b6](https://github.com/anatolykoptev/oxpulse-core/commit/0aed0b60d6e03d7babdf55b954d08306a058001b))
+
 ## [0.2.1](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.0...identity-v0.2.1) (2026-08-05)
 
 
