@@ -312,13 +312,6 @@ function nowMs(): number {
 }
 
 /**
- * Map a thrown error to one of the bounded enum values mirrored in
- * `crates/server/src/analytics/mod.rs:sanitize_identity_error_class`.
- * Anything we cannot classify becomes `unknown` server-side. Strings
- * here MUST stay in lockstep with the server's allowlist — Prometheus
- * cardinality is bounded by that, not by what we send.
- */
-/**
  * Thrown when the stored identity data is missing or malformed — as opposed to
  * the runtime lacking a capability.
  *
@@ -337,6 +330,13 @@ export class IdentityDataError extends Error {
 	}
 }
 
+/**
+ * Map a thrown error to one of the bounded enum values mirrored in
+ * `crates/server/src/analytics/mod.rs:sanitize_identity_error_class`.
+ * Anything we cannot classify becomes `unknown` server-side. Strings
+ * here MUST stay in lockstep with the server's allowlist — Prometheus
+ * cardinality is bounded by that, not by what we send.
+ */
 function classifyIdentityError(e: unknown, stage: 'create' | 'unwrap'): string {
 	const name = (e as { name?: string })?.name ?? '';
 	const message = String((e as { message?: string })?.message ?? '');
@@ -1030,6 +1030,19 @@ async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; public
 
 	const pkcs8 = await crypto.subtle.exportKey("pkcs8", extractablePrivKey);
 	const pkcs8Bytes = new Uint8Array(pkcs8);
+	// UNREACHABLE BY CONSTRUCTION, kept as a guard against a WebCrypto bug.
+	//
+	// Measured rather than assumed. A test tried to reach it by storing a
+	// wrappedPrivateKey that unwraps to a 40-byte buffer; the unwrap rejects
+	// first with `DataError: Invalid keyData`, because unwrapKey('pkcs8', ...,
+	// Ed25519) validates the envelope structure. So the only way past that line
+	// is a valid Ed25519 CryptoKey, and exportKey('pkcs8') on one of those is
+	// always >= 48 bytes.
+	//
+	// That test was deleted rather than kept: it passed, but on the unwrap
+	// error, not this branch — coverage advertised and not delivered. Mutating
+	// either this throw's type or the 48 to a 1 is invisible to the suite, and
+	// that is a property of the branch being unreachable, not of a missing test.
 	if (pkcs8Bytes.byteLength < 48) {
 		throw new IdentityDataError("Unexpected PKCS#8 length for Ed25519 key");
 	}

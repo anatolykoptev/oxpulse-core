@@ -97,10 +97,33 @@ describe('exportRawDeviceSecret audit (#103)', () => {
 		// runtime cannot do Ed25519" would have found data corruption in it.
 		const { mod, events } = await loadWithTracker();
 
-		await expect(mod.exportRawDeviceSecret()).rejects.toThrow(/No device identity in IDB/);
+		const err = await mod.exportRawDeviceSecret().catch((e: unknown) => e);
+		expect((err as Error).message).toMatch(/No device identity in IDB/);
+		// F4 — the classification test alone cannot see the throw's TYPE here:
+		// this message contains no "Ed25519", so a plain Error classifies the
+		// same. Assert the name directly, otherwise `this.name` is guarded by
+		// only one of the three throw sites.
+		expect((err as Error).name).toBe('IdentityDataError');
 
 		const audit = events.filter((e) => e.event === AUDIT).at(-1)!;
 		expect(audit.payload?.error_class).toBe('unwrap_failed');
+
+		// F1 — the success path asserts a plausible duration; the ERROR path did
+		// not, and `duration_ms: 0` on it passed the whole suite. An operator
+		// correlating failed-export timing against probe patterns would have read
+		// a flat zero.
+		expect(typeof audit.payload?.duration_ms).toBe('number');
+		expect(audit.payload?.duration_ms as number).toBeGreaterThan(0);
+
+		// F2 — likewise the payload SHAPE. Adding `leaked: String(e)` to the
+		// error payload passed 143/143. An IdentityDataError message is benign,
+		// but a WebCrypto OperationError's is engine-defined and not ours to
+		// assume is safe.
+		expect(Object.keys(audit.payload ?? {}).sort()).toEqual([
+			'duration_ms',
+			'error_class',
+			'outcome',
+		]);
 	}, 30_000);
 
 	it('reports a MISSING raw seed on the noble-only path as a data failure', async () => {
