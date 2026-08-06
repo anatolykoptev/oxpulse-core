@@ -965,8 +965,10 @@ export { toBase64url, fromBase64url } from './base64url.js';
  * Public API, narrow scope: use only on the identity-backup export path.
  * Re-exported from `index.ts`. The leading paragraphs document the threat
  * model that gates lawful use; do not call this from product feature code.
+ *
+ * Every call is audited — see the exported wrapper below.
  */
-export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; publicB64u: string }> {
+async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; publicB64u: string }> {
 	const stored = await idb.load<{ publicKeyB64: string; wrappedPrivateKey: ArrayBuffer }>(DEVICE_KEY_NAME);
 	if (!stored) {
 		throw new Error("No device identity in IDB");
@@ -1011,6 +1013,51 @@ export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; pub
 	const secret = pkcs8Bytes.slice(16);
 
 	return { secret, publicB64u: stored.publicKeyB64 };
+}
+
+/**
+ * Audited entry point for raw-secret export (#103).
+ *
+ * The event is emitted by this WRAPPER, not at each return inside the
+ * implementation. There are two success paths today — noble-only and WebCrypto —
+ * and a third would silently escape a hand-placed emit. That is the same
+ * "the code is right and nothing observes it" failure this package hit four
+ * times during #108; a wrapper cannot be bypassed by a new return statement.
+ *
+ * A FAILED export is emitted too. Repeated failures are what probing looks
+ * like, and a silent failure is exactly what an attacker would prefer.
+ *
+ * The payload carries NO key material. The auditable fact is that an export
+ * happened, which is the only thing a defender can act on.
+ *
+ * SCOPE — read this before treating the event as an exfiltration alarm.
+ * It audits the BACKUP path, not access to the seed in general. The same 32
+ * bytes are reachable from the ordinary public API as
+ * `getOrCreateDeviceIdentity().privateKeySeed.bytes()`, measured byte-identical
+ * to this function's output. That path is on the signing hot path and cannot be
+ * audited without emitting an event per signature, so it is deliberately not
+ * instrumented. In-page code that wants the seed will take that route and this
+ * event will not fire. What this buys is a record of deliberate backup exports —
+ * useful for "was this identity exported before it appeared elsewhere" — and it
+ * should not be described as closing the #103 hole.
+ */
+export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; publicB64u: string }> {
+	const t0 = nowMs();
+	try {
+		const result = await exportRawDeviceSecretImpl();
+		track('client.identity_raw_export', undefined, {
+			outcome: 'ok',
+			duration_ms: nowMs() - t0,
+		});
+		return result;
+	} catch (e) {
+		track('client.identity_raw_export', undefined, {
+			outcome: 'error',
+			error_class: classifyIdentityError(e, 'unwrap'),
+			duration_ms: nowMs() - t0,
+		});
+		throw e;
+	}
 }
 
 /**
