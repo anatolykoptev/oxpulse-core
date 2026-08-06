@@ -11,6 +11,7 @@ export {
 	clearDeviceIdentity,
 	hasDeviceIdentity,
 	exportRawDeviceSecret,
+	IdentityDataError,
 	replaceDeviceIdentity,
 	probeBrowserSupport,
 	type DeviceIdentity,

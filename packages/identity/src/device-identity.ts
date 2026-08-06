@@ -312,6 +312,25 @@ function nowMs(): number {
 }
 
 /**
+ * Thrown when the stored identity data is missing or malformed — as opposed to
+ * the runtime lacking a capability.
+ *
+ * It exists because classifyIdentityError sniffs the message for /Ed25519/i to
+ * detect WebCrypto's "Ed25519 is not supported", and two of this file's own
+ * error messages contain the word Ed25519 while meaning the opposite:
+ * "No Ed25519 private key in IDB" and "Unexpected PKCS#8 length for Ed25519
+ * key" are a missing entry and a corrupt one. Both were being reported as
+ * ed25519_unsupported, so an operator investigating a spike of "this runtime
+ * cannot do Ed25519" would have found data corruption mixed in.
+ */
+export class IdentityDataError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'IdentityDataError';
+	}
+}
+
+/**
  * Map a thrown error to one of the bounded enum values mirrored in
  * `crates/server/src/analytics/mod.rs:sanitize_identity_error_class`.
  * Anything we cannot classify becomes `unknown` server-side. Strings
@@ -322,6 +341,10 @@ function classifyIdentityError(e: unknown, stage: 'create' | 'unwrap'): string {
 	const name = (e as { name?: string })?.name ?? '';
 	const message = String((e as { message?: string })?.message ?? '');
 	if (name === 'QuotaExceededError') return 'idb_quota_exceeded';
+	// Ours, and typed — checked BEFORE the message sniffing below, which would
+	// otherwise read the word Ed25519 in a missing-data message as a capability
+	// failure. See IdentityDataError.
+	if (name === 'IdentityDataError') return stage === 'create' ? 'wrap_failed' : 'unwrap_failed';
 	if (name === 'NotSupportedError' || /Ed25519/i.test(message)) return 'ed25519_unsupported';
 	if (name === 'InvalidAccessError' && stage === 'create') return 'extractable_unsupported';
 	if (stage === 'create') return 'wrap_failed';
@@ -965,11 +988,13 @@ export { toBase64url, fromBase64url } from './base64url.js';
  * Public API, narrow scope: use only on the identity-backup export path.
  * Re-exported from `index.ts`. The leading paragraphs document the threat
  * model that gates lawful use; do not call this from product feature code.
+ *
+ * Every call is audited — see the exported wrapper below.
  */
-export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; publicB64u: string }> {
+async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; publicB64u: string }> {
 	const stored = await idb.load<{ publicKeyB64: string; wrappedPrivateKey: ArrayBuffer }>(DEVICE_KEY_NAME);
 	if (!stored) {
-		throw new Error("No device identity in IDB");
+		throw new IdentityDataError("No device identity in IDB");
 	}
 
 	// ADR-8: the KEK is now a non-extractable CryptoKey in the dedicated KEK DB
@@ -985,7 +1010,7 @@ export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; pub
 		// Noble-only: unwrap raw seed via aes-kw.ts
 		const wrappedRawSeed = await idb.load<ArrayBuffer>(DEVICE_PRIV_RAW_NAME);
 		if (!wrappedRawSeed) {
-			throw new Error("No Ed25519 private key in IDB (noble-only identity, no raw seed stored)");
+			throw new IdentityDataError("No Ed25519 private key in IDB (noble-only identity, no raw seed stored)");
 		}
 		const secret = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
 		return { secret, publicB64u: stored.publicKeyB64 };
@@ -1005,12 +1030,72 @@ export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; pub
 
 	const pkcs8 = await crypto.subtle.exportKey("pkcs8", extractablePrivKey);
 	const pkcs8Bytes = new Uint8Array(pkcs8);
+	// UNREACHABLE BY CONSTRUCTION, kept as a guard against a WebCrypto bug.
+	//
+	// Measured rather than assumed. A test tried to reach it by storing a
+	// wrappedPrivateKey that unwraps to a 40-byte buffer; the unwrap rejects
+	// first with `DataError: Invalid keyData`, because unwrapKey('pkcs8', ...,
+	// Ed25519) validates the envelope structure. So the only way past that line
+	// is a valid Ed25519 CryptoKey, and exportKey('pkcs8') on one of those is
+	// always >= 48 bytes.
+	//
+	// That test was deleted rather than kept: it passed, but on the unwrap
+	// error, not this branch — coverage advertised and not delivered. Mutating
+	// either this throw's type or the 48 to a 1 is invisible to the suite, and
+	// that is a property of the branch being unreachable, not of a missing test.
 	if (pkcs8Bytes.byteLength < 48) {
-		throw new Error("Unexpected PKCS#8 length for Ed25519 key");
+		throw new IdentityDataError("Unexpected PKCS#8 length for Ed25519 key");
 	}
 	const secret = pkcs8Bytes.slice(16);
 
 	return { secret, publicB64u: stored.publicKeyB64 };
+}
+
+/**
+ * Audited entry point for raw-secret export (#103).
+ *
+ * The event is emitted by this WRAPPER, not at each return inside the
+ * implementation. There are two success paths today — noble-only and WebCrypto —
+ * and a third would silently escape a hand-placed emit. That is the same
+ * "the code is right and nothing observes it" failure this package hit four
+ * times during #108; a wrapper cannot be bypassed by a new return statement.
+ *
+ * A FAILED export is emitted too. Repeated failures are what probing looks
+ * like, and a silent failure is exactly what an attacker would prefer.
+ *
+ * The payload carries NO key material. The auditable fact is that an export
+ * happened, which is the only thing a defender can act on.
+ *
+ * SCOPE — read this before treating the event as an exfiltration alarm.
+ * It audits the BACKUP path, not access to the seed in general. The same 32
+ * bytes are reachable from the ordinary public API as
+ * `getOrCreateDeviceIdentity().privateKeySeed.bytes()`, measured byte-identical
+ * to this function's output. `generateDeviceIdentity()` is a second route of the
+ * same shape — a different seed, since it mints a fresh keypair, but equally
+ * unaudited. That path is on the signing hot path and cannot be
+ * audited without emitting an event per signature, so it is deliberately not
+ * instrumented. In-page code that wants the seed will take that route and this
+ * event will not fire. What this buys is a record of deliberate backup exports —
+ * useful for "was this identity exported before it appeared elsewhere" — and it
+ * should not be described as closing the #103 hole.
+ */
+export async function exportRawDeviceSecret(): Promise<{ secret: Uint8Array; publicB64u: string }> {
+	const t0 = nowMs();
+	try {
+		const result = await exportRawDeviceSecretImpl();
+		track('client.identity_raw_export', undefined, {
+			outcome: 'ok',
+			duration_ms: nowMs() - t0,
+		});
+		return result;
+	} catch (e) {
+		track('client.identity_raw_export', undefined, {
+			outcome: 'error',
+			error_class: classifyIdentityError(e, 'unwrap'),
+			duration_ms: nowMs() - t0,
+		});
+		throw e;
+	}
 }
 
 /**
