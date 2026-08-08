@@ -36,9 +36,10 @@
   "devDependencies": {
     "@noble/curves": "^2.2.0",
     "@types/node": "^22",
+    "fake-indexeddb": "^6.2.5",
+    "identity-legacy-0-1-5": "npm:@oxpulse/identity@0.1.5",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.5",
-    "fake-indexeddb": "^6.2.5"
+    "vitest": "^4.1.5"
   },
   "engines": {
     "node": ">=18"
