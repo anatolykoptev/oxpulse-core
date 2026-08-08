@@ -28,10 +28,38 @@ import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-/** A device that has never run either version. */
+/**
+ * A device that has never run either version.
+ *
+ * Both the IDB factory AND the module registry are replaced. The stores in
+ * `device-identity` are module-level singletons that capture
+ * `globalThis.indexedDB`, so swapping the factory without resetting modules
+ * leaves a live handle to the previous device — which is a test that quietly
+ * measures the wrong browser.
+ */
 function freshDevice() {
   globalThis.indexedDB = new IDBFactory();
   vi.resetModules();
+}
+
+/**
+ * Delete both databases outright.
+ *
+ * Swapping `globalThis.indexedDB` alone does NOT isolate these tests, which
+ * cost a debugging round: with a shared factory the second test read the
+ * identity the first one had created and compared it against a freshly-written
+ * legacy key, so it failed while the code under test was correct. Deleting the
+ * databases does not depend on whether the swap took effect.
+ */
+async function wipeDatabases() {
+  for (const name of ['oxpulse-device-id', 'oxpulse-device-id-kek', 'oxpulse-room-host-seed']) {
+    await new Promise<void>((resolve) => {
+      const r = indexedDB.deleteDatabase(name);
+      r.onsuccess = () => resolve();
+      r.onerror = () => resolve();
+      r.onblocked = () => resolve();
+    });
+  }
 }
 
 /** Load the version under test with its module state reset. */
@@ -46,71 +74,77 @@ async function legacyVersion() {
   return import('identity-legacy-0-1-5');
 }
 
-beforeEach(() => {
+/** Read a key straight out of IDB, independent of either package. */
+async function rawGet(dbName: string, store: string, key: string): Promise<unknown> {
+  const db: IDBDatabase = await new Promise((resolve, reject) => {
+    const r = indexedDB.open(dbName);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+  try {
+    if (!db.objectStoreNames.contains(store)) return null;
+    return await new Promise((resolve, reject) => {
+      const g = db.transaction(store, 'readonly').objectStore(store).get(key);
+      g.onsuccess = () => resolve(g.result ?? null);
+      g.onerror = () => reject(g.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+beforeEach(async () => {
   freshDevice();
+  await wipeDatabases();
 });
 
 describe('a device carrying the 0.1.5 layout', () => {
-  it('keeps its identity when 0.2.x takes over', async () => {
+  // One test, one upgrade. These properties are all facts about the SAME
+  // transition, and splitting them across `it`s made each one depend on the
+  // previous test's IndexedDB — which is how two of them failed while the code
+  // was correct. A shared-state bug in the harness reads exactly like a bug in
+  // the thing under test, and costs the same debugging round.
+  it('keeps its identity, copies the KEK forward, and keeps the legacy key', async () => {
     // 1. 0.1.5 creates and persists an identity — the pre-#98 layout, written
     //    by the code that actually wrote it in the field.
     const legacy = await legacyVersion();
-    const before = await legacy.getOrCreateDeviceIdentity();
-    const beforeKey = before.publicKeyB64;
-    expect(beforeKey, '0.1.5 must produce an identity to migrate').toBeTruthy();
+    const before = (await legacy.getOrCreateDeviceIdentity()).publicKeyB64;
+    expect(before, '0.1.5 must produce an identity to migrate').toBeTruthy();
+    expect(
+      await rawGet('oxpulse-device-id', 'identity', 'wrapping-key'),
+      'the premise of this whole test: 0.1.5 writes a legacy wrapping key',
+    ).not.toBeNull();
 
     // 2. The user updates. Same browser, same IndexedDB, new code.
     const current = await currentVersion();
-    const after = await current.getOrCreateDeviceIdentity();
-    const afterKey = after.publicKeyB64;
+    const after = (await current.getOrCreateDeviceIdentity()).publicKeyB64;
 
     expect(
-      afterKey,
+      after,
       'THE incident: an identity written by 0.1.5 must survive the upgrade. A ' +
-        'different key here means the user was locked out of an identity that ' +
-        'is still sitting in their IndexedDB, which is what shipped on ' +
-        '2026-08-06 and what this test exists to prevent.',
-    ).toBe(beforeKey);
-  });
+        'different key here means the user was locked out of an identity still ' +
+        'sitting in their IndexedDB — what shipped on 2026-08-06.',
+    ).toBe(before);
 
-  it('does not need the legacy key twice — the second load takes the new path', async () => {
-    const legacy = await legacyVersion();
-    const first = await legacy.getOrCreateDeviceIdentity();
-    const firstKey = first.publicKeyB64;
+    // 3. The key is copied forward, so adoption runs once per device rather
+    //    than on every load.
+    expect(
+      await rawGet('oxpulse-device-id-kek', 'kek', 'wrapping-key'),
+      'without the copy, every future load re-adopts',
+    ).not.toBeNull();
 
-    const current = await currentVersion();
-    await current.getOrCreateDeviceIdentity();
+    // 4. And the legacy entry survives. Deleting the only thing that can
+    //    decrypt a user's identity, in the same step that first uses it,
+    //    leaves no second attempt if the copy failed. `forgetDeviceIdentity`
+    //    owns that deletion; the migration does not.
+    expect(
+      await rawGet('oxpulse-device-id', 'identity', 'wrapping-key'),
+      'the legacy wrapping key must not be deleted by the migration',
+    ).not.toBeNull();
 
-    // Reload with fresh module state: the KEK must now be in the dedicated
-    // database, so this resolves without touching the legacy entry at all.
+    // 5. The next load resolves from the dedicated database, same identity.
     const reloaded = await currentVersion();
-    const again = await reloaded.getOrCreateDeviceIdentity();
-    expect(again.publicKeyB64).toBe(firstKey);
-  });
-
-  it('leaves the legacy key in place — a migration must keep its own escape hatch', async () => {
-    // Deleting the only thing that can decrypt a user's identity, in the same
-    // step that first tries to use it, leaves no second attempt if the copy
-    // fails. The forget path owns that deletion; the migration does not.
-    const legacy = await legacyVersion();
-    await legacy.getOrCreateDeviceIdentity();
-
-    const current = await currentVersion();
-    await current.getOrCreateDeviceIdentity();
-
-    const stillThere = await new Promise<boolean>((resolve) => {
-      const req = indexedDB.open('oxpulse-device-id');
-      req.onerror = () => resolve(false);
-      req.onsuccess = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains('identity')) return resolve(false);
-        const get = db.transaction('identity', 'readonly').objectStore('identity').get('wrapping-key');
-        get.onsuccess = () => resolve(get.result != null);
-        get.onerror = () => resolve(false);
-      };
-    });
-
-    expect(stillThere, 'the legacy wrapping key must not be deleted by the migration').toBe(true);
+    expect((await reloaded.getOrCreateDeviceIdentity()).publicKeyB64).toBe(before);
   });
 });
 
