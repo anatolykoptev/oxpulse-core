@@ -322,6 +322,49 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 }
 
 /**
+ * Last-resort unwrap using the pre-#98 wrapping key; `null` if it cannot help.
+ *
+ * Called only after a normal unwrap has already failed, so the cost is paid
+ * exclusively by devices that are broken. Never throws: a failure here must
+ * leave the caller free to report its own original error, the more informative
+ * one.
+ *
+ * The bogus KEK is overwritten only AFTER a successful unwrap. Writing first
+ * would mean a device with an unrelated legacy entry loses the KEK it had, and
+ * "recovery" that can make things worse is not recovery.
+ */
+async function recoverWithLegacyKey(stored: StoredIdentity): Promise<DeviceIdentity | null> {
+	try {
+		const legacy = await idb.load<CryptoKey | ArrayBuffer>(WRAPPING_KEY_NAME);
+		if (!legacy) return null;
+		const entry = classifyKekEntry(legacy);
+		if (!entry) return null;
+
+		const key = entry.kind === 'raw'
+			? await importAesKwRaw(entry.bytes, false)
+			: entry.key;
+
+		const identity = await unwrapIdentityWith(stored, key);
+
+		// It worked — the legacy key is provably the right one. Adopt it.
+		cachedWrappingKey = key;
+		try {
+			if (entry.kind === 'raw') {
+				await kekIdb.save(KEK_KEY_NAME, entry.bytes);
+			} else if (await probeStructuredClone()) {
+				await kekIdb.save(KEK_KEY_NAME, entry.key);
+			}
+		} catch {
+			// Survivable: this session is recovered, and the next load recovers
+			// again by the same route.
+		}
+		return identity;
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Get or create the device identity.
  * This is the main entry point - call this on app initialization.
  */
@@ -362,6 +405,25 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 			track('client.identity_loaded', undefined, { duration_ms: nowMs() - t0 });
 			return identity;
 		} catch (e) {
+			// Recovery for devices that ALREADY ran the broken 0.2.x.
+			//
+			// Adoption gated on "the KEK database is empty" helps only devices
+			// that never opened the broken build — which is nobody in the
+			// incident. The broken path generated a fresh KEK and SAVED it
+			// before the unwrap it was about to fail, so every affected device
+			// carries a bogus KEK, the database is not empty, and adoption
+			// never fires. Measured the hard way: the first fix shipped and the
+			// operator still could not sign in.
+			//
+			// So the trigger is the FAILURE, not the absence.
+			const recovered = await recoverWithLegacyKey(stored);
+			if (recovered) {
+				cachedIdentity = recovered;
+				track('client.identity_recovered_from_broken_kek', undefined, {
+					duration_ms: nowMs() - t0,
+				});
+				return recovered;
+			}
 			track('client.identity_unwrap_failed', undefined, {
 				error_class: classifyIdentityError(e, 'unwrap'),
 			});
@@ -630,7 +692,20 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
  * invalidate the user's enrolled pubkey on the server).
  */
 async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
-	const wrappingKey = await getOrCreateWrappingKey();
+	return unwrapIdentityWith(stored, await getOrCreateWrappingKey());
+}
+
+/**
+ * Unwrap with an EXPLICIT key, bypassing `getOrCreateWrappingKey`.
+ *
+ * Split out for the broken-KEK recovery path, which must try a specific key
+ * rather than whatever the resolver currently believes in — on an affected
+ * device the resolver believes in the bogus KEK the broken build persisted.
+ */
+async function unwrapIdentityWith(
+	stored: StoredIdentity,
+	wrappingKey: CryptoKey,
+): Promise<DeviceIdentity> {
 
 	// Import the public key via WebCrypto (best-effort).
 	// On noble-only runtimes this throws NotSupportedError — we fall back to null.
