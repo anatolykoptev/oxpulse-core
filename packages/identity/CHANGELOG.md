@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.2...identity-v0.2.3) (2026-08-08)
+
+
+### Fixed
+
+* **identity:** adopt the pre-[#98](https://github.com/anatolykoptev/oxpulse-core/issues/98) wrapping key — 0.2.x locked field users out of their identities ([#113](https://github.com/anatolykoptev/oxpulse-core/issues/113)) ([f17c0e3](https://github.com/anatolykoptev/oxpulse-core/commit/f17c0e3c939742227c51c3cb29525b824a5e8d5b))
+
 ## [0.2.2](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.1...identity-v0.2.2) (2026-08-06)
 
 
