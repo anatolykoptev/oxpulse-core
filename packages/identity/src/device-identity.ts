@@ -149,18 +149,103 @@ async function probeStructuredClone(): Promise<boolean> {
  * persisted (extractable during the bootstrap window only) and re-imported as
  * non-extractable on load.
  *
- * There is deliberately NO migration from the pre-#98 layout. Nothing has this
- * package installed in the field yet, so a legacy KEK cannot exist on any
- * device that is not a developer's own browser profile. Carrying a migration
- * for that would mean permanently keeping the most delicate code in this file
- * — and both HIGH findings in the review of #95-#98 were in the migration and
- * fallback paths, not in the primitives. Complexity that protects nobody is
- * still complexity that can be wrong.
+ * ## The pre-#98 layout IS migrated, and the reason is an incident
  *
- * If a developer has a pre-#98 identity in their profile, clear site data.
- * When this ships to real devices, a migration written against a format that
- * actually exists in the field is a different and much better-founded change.
+ * This comment used to say: "There is deliberately NO migration from the
+ * pre-#98 layout. Nothing has this package installed in the field yet, so a
+ * legacy KEK cannot exist on any device that is not a developer's own browser
+ * profile. If a developer has a pre-#98 identity in their profile, clear site
+ * data."
+ *
+ * That premise was false. `@oxpulse/identity ^0.1.5` was live in oxpulse-chat
+ * production from v0.16.0, and v0.17.0 shipped 0.2.0 into it on 2026-08-06.
+ * The result, measured on that deployment:
+ *
+ *   device_identity_failure_total{error_class="unwrap_failed", stage="unwrap"}
+ *     08-06, every bucket, all day and after the deploy:  0.0
+ *     08-07 06h  2.0    10h  45.4    18h  35.3
+ *
+ * Zero for a full day, then tens — users with a perfectly good identity in
+ * IndexedDB, locked out of it, because this function found no KEK in the new
+ * database, generated a fresh one, and nothing could then unwrap what the old
+ * one had wrapped.
+ *
+ * The reasoning about complexity was sound; only the fact was wrong. So the
+ * migration here is the narrowest one that discharges it: it ADOPTS the legacy
+ * wrapping key and touches nothing else. It does not rewrite identity records,
+ * does not delete the legacy entry (the forget path already owns that), and
+ * has exactly one branch. The delicate paths that produced the HIGH findings —
+ * re-wrapping and fallback — are not reintroduced.
+ *
+ * The legacy key lives under `WRAPPING_KEY_NAME` in the IDENTITY database, and
+ * `forgetDeviceIdentity` already calls it "old entry — kept by migration". The
+ * intent to keep it for exactly this was recorded; the code that uses it was
+ * not written. This is that code.
  */
+/**
+ * Adopt a pre-#98 wrapping key if this device has one; `null` otherwise.
+ *
+ * Returns a usable KEK and copies it into the dedicated database so this runs
+ * once per device. The legacy entry is deliberately left in place: a migration
+ * that deletes the only thing that can decrypt a user's identity, in the same
+ * step that first tries to use it, has no second attempt if the copy fails.
+ *
+ * Never throws. A device with no legacy key is the common case and must reach
+ * the generate path; an unreadable legacy key must ALSO reach it rather than
+ * failing the whole app, since on a genuinely-new device there is nothing to
+ * lose. The one thing it must not do is return a key that cannot unwrap the
+ * stored identity — and it cannot, because the key it returns is the one that
+ * wrapped it.
+ */
+async function adoptLegacyWrappingKey(canClone: boolean): Promise<CryptoKey | null> {
+	let legacy: CryptoKey | ArrayBuffer | null = null;
+	try {
+		legacy = await idb.load<CryptoKey | ArrayBuffer>(WRAPPING_KEY_NAME);
+	} catch {
+		// The identity DB is unreadable. The caller's own load already handles
+		// that case; here it just means "no legacy key to adopt".
+		return null;
+	}
+	if (!legacy) return null;
+
+	const entry = classifyKekEntry(legacy);
+	if (!entry) {
+		// Something is under the legacy name that is neither shape. Do not throw:
+		// a first-run device must still get an identity.
+		track('client.identity_kek_legacy_unusable', undefined, {});
+		return null;
+	}
+
+	const key = entry.kind === 'raw'
+		? await importAesKwRaw(entry.bytes, false)
+		: entry.key;
+
+	// Copy forward. Failure here is survivable — the adoption already worked for
+	// THIS session, so the user is not locked out; the next load simply adopts
+	// again. Reporting it matters: a device that can never complete the copy
+	// would otherwise look identical to one that migrated cleanly.
+	let copied = false;
+	try {
+		// A CryptoKey can only be persisted where structured-clone works. On a
+		// runtime without it, keep using the adopted key and re-adopt next load
+		// rather than exporting raw bytes — the legacy key stays where it is,
+		// and re-deriving raw material to "finish" a migration is exactly the
+		// kind of extra path that produced the earlier HIGH findings.
+		if (entry.kind === 'raw') {
+			await kekIdb.save(KEK_KEY_NAME, entry.bytes);
+			copied = true;
+		} else if (canClone) {
+			await kekIdb.save(KEK_KEY_NAME, entry.key);
+			copied = true;
+		}
+	} catch {
+		copied = false;
+	}
+
+	track('client.identity_kek_migrated', undefined, { shape: entry.kind, copied });
+	return key;
+}
+
 async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 	if (cachedWrappingKey) return cachedWrappingKey;
 
@@ -202,7 +287,21 @@ async function getOrCreateWrappingKey(): Promise<CryptoKey> {
 		return cachedWrappingKey;
 	}
 
-	// No KEK yet — first run on this device.
+	// No KEK in the dedicated database. That is either a first run on this
+	// device, or a device carrying the pre-#98 layout — and those two must not
+	// be confused, because for the second one "first run" means locking the
+	// user out of an identity that is sitting right there.
+	//
+	// Read-only and non-destructive: adopt the legacy key, copy it forward so
+	// the next load takes the fast path above, and leave the original where it
+	// is. `forgetDeviceIdentity` remains the only thing that deletes it.
+	const adopted = await adoptLegacyWrappingKey(canClone);
+	if (adopted) {
+		cachedWrappingKey = adopted;
+		return cachedWrappingKey;
+	}
+
+	// Genuinely first run on this device.
 	if (canClone) {
 		// Persist the non-extractable CryptoKey directly — raw bytes never
 		// touch the JS heap.
