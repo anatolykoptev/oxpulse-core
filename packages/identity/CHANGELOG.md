@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.3...identity-v0.2.4) (2026-08-08)
+
+
+### Fixed
+
+* **identity:** recover devices that ALREADY ran the broken 0.2.x — the first fix missed all of them ([#115](https://github.com/anatolykoptev/oxpulse-core/issues/115)) ([98a3b36](https://github.com/anatolykoptev/oxpulse-core/commit/98a3b36c87ea9c65fe159ccc76892394845809af))
+
 ## [0.2.3](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.2...identity-v0.2.3) (2026-08-08)
 
 
