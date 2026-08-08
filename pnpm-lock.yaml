@@ -20,6 +20,9 @@ importers:
       fake-indexeddb:
         specifier: ^6.2.5
         version: 6.2.5
+      identity-broken-0-2-1:
+        specifier: npm:@oxpulse/identity@0.2.1
+        version: '@oxpulse/identity@0.2.1'
       identity-legacy-0-1-5:
         specifier: npm:@oxpulse/identity@0.1.5
         version: '@oxpulse/identity@0.1.5'
@@ -190,6 +193,10 @@ packages:
 
   '@oxpulse/identity@0.1.5':
     resolution: {integrity: sha512-/D7w2gPmHk948tGzFQo+kgzZ2qtdxREjYw/kVDdtWxj+XZrn7OuenI+oLBhNz6oOf0aB/qN7YwGZP4mQOFuWrQ==}
+    engines: {node: '>=18'}
+
+  '@oxpulse/identity@0.2.1':
+    resolution: {integrity: sha512-8oW4zRA8S1FtjPyRX3cojAQjDkAhLrE6rn/Vdj9FSIWShLGINYmQwfat11HJs9fSQuEu6h5A2VnwLqZ4hPPgeQ==}
     engines: {node: '>=18'}
 
   '@oxpulse/wire-codec@0.6.1':
@@ -1080,6 +1087,10 @@ snapshots:
   '@oxc-project/types@0.139.0': {}
 
   '@oxpulse/identity@0.1.5':
+    dependencies:
+      '@noble/curves': 2.2.0
+
+  '@oxpulse/identity@0.2.1':
     dependencies:
       '@noble/curves': 2.2.0
 
