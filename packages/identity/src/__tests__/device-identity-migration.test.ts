@@ -66,37 +66,226 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 		expect(allZero).toBe(false);
 	});
 
-	it('privateKeySeed=null (not 32-zero) when raw seed absent in IDB', async () => {
-		if (!ed25519Supported) return;
+	const RAW_KEY = 'oxp/identity/ed25519-priv-raw';
 
-		// Create identity with W7-P2b1 mod (stores raw seed)
-		const mod = await freshImport();
-		await mod.getOrCreateDeviceIdentity();
-
-		// Simulate pre-W7-P2b1: delete the raw seed entry from IDB.
-		// We can do this by manually opening the IDB and deleting the key.
-		const DB_NAME = mod.IDB_DB_NAME;
-		const STORE_NAME = mod.IDB_STORE_NAME;
-		const RAW_KEY = 'oxp/identity/ed25519-priv-raw';
-
-		await new Promise<void>((resolve, reject) => {
-			const req = globalThis.indexedDB.open(DB_NAME);
+	/** Read one row from an IDB store directly, bypassing the module. */
+	function idbGet(dbName: string, storeName: string, key: string): Promise<unknown> {
+		return new Promise((resolve, reject) => {
+			const req = globalThis.indexedDB.open(dbName);
 			req.onsuccess = () => {
 				const db = req.result;
-				const tx = db.transaction(STORE_NAME, 'readwrite');
-				tx.objectStore(STORE_NAME).delete(RAW_KEY);
+				if (!db.objectStoreNames.contains(storeName)) { db.close(); resolve(null); return; }
+				const tx = db.transaction(storeName, 'readonly');
+				const g = tx.objectStore(storeName).get(key);
+				g.onsuccess = () => { db.close(); resolve(g.result ?? null); };
+				g.onerror = () => { db.close(); reject(g.error); };
+			};
+			req.onerror = () => reject(req.error);
+		});
+	}
+
+	/** Overwrite one row in an IDB store directly, bypassing the module. */
+	function idbPut(dbName: string, storeName: string, key: string, value: unknown): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const req = globalThis.indexedDB.open(dbName);
+			req.onsuccess = () => {
+				const db = req.result;
+				const tx = db.transaction(storeName, 'readwrite');
+				tx.objectStore(storeName).put(value, key);
 				tx.oncomplete = () => { db.close(); resolve(); };
 				tx.onerror = () => reject(tx.error);
 			};
 			req.onerror = () => reject(req.error);
 		});
+	}
 
-		// Fresh import (drops module cache, keeps IDB)
+	/** Delete one row from an IDB store directly, bypassing the module. */
+	function idbDelete(dbName: string, storeName: string, key: string): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const req = globalThis.indexedDB.open(dbName);
+			req.onsuccess = () => {
+				const db = req.result;
+				const tx = db.transaction(storeName, 'readwrite');
+				tx.objectStore(storeName).delete(key);
+				tx.oncomplete = () => { db.close(); resolve(); };
+				tx.onerror = () => reject(tx.error);
+			};
+			req.onerror = () => reject(req.error);
+		});
+	}
+
+	it('legacy identity (raw seed absent) is REPLACED by a fresh signing identity', async () => {
+		if (!ed25519Supported) return;
+
+		// Create identity with W7-P2b1 mod (stores raw seed), plus the sibling
+		// key material a real legacy device carries — the X25519 static keypair,
+		// the profile seed and the room-host seed. Seeding them is what makes
+		// the residue-wipe assertions below non-vacuous.
+		const mod = await freshImport();
+		const original = await mod.getOrCreateDeviceIdentity();
+		await mod.getOrCreateX25519Keypair();
+		await mod.getOrCreateProfileSeed();
+		const roomHost = await import('../room-host-seed.js');
+		await roomHost.getOrCreateRoomHostSeed();
+
+		// Simulate pre-W7-P2b1: delete the raw seed entry from IDB.
+		await idbDelete(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, RAW_KEY);
+
+		// Fresh import (drops module cache, keeps IDB). The tracker shim must be
+		// imported from the SAME post-reset registry as device-identity, or the
+		// spy lands on a module instance the code under test never calls.
 		const mod2 = await freshImport();
+		const shim = await import('../tracker-shim.js');
+		const events: Array<{ event: string; payload?: Record<string, unknown> }> = [];
+		shim.setIdentityTracker((event, _roomId, payload) => { events.push({ event, payload }); });
 		const id = await mod2.getOrCreateDeviceIdentity();
 
-		// MUST be null — not 32-zero bytes
-		expect(id.privateKeySeed).toBeNull();
+		// Operator decision 2026-08-16: a legacy identity cannot produce a single
+		// signature (signWithDeviceIdentity throws), so every authed flow dies
+		// downstream with a generic error. Replace it instead of returning it.
+		expect(id.privateKeySeed).not.toBeNull();
+		expect(id.privateKeySeed!.bytes().byteLength).toBe(32);
+		expect(id.publicKeyB64).not.toBe(original.publicKeyB64);
+		expect(events.map((e) => e.event)).toContain('client.identity_legacy_replaced');
+		const replaced = events.find((e) => e.event === 'client.identity_legacy_replaced');
+		expect(replaced?.payload).toEqual({ reason: 'no_raw_seed', via: 'unwrap' });
+
+		// Residue post-conditions, asserted on IDB directly (SEC-CR-006: without
+		// these, amputating the residue wipe keeps the suite green — the pubkey
+		// still changes and the seed is still present either way). The retired
+		// identity's X25519 keypair, profile seed and room-host seed must be
+		// GONE so they cannot pair with the new Ed25519 key.
+		expect(await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, 'x25519-keypair-v1')).toBeNull();
+		expect(await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, 'profile_seed_v1')).toBeNull();
+		expect(await idbGet('oxpulse-room-host-seed', 'seed', 'room_host_seed_v1')).toBeNull();
+
+		// The replacement must be persistent, not ephemeral: a reload loads the
+		// SAME new identity instead of regenerating (or worse, finding the wipe
+		// left a half-broken record).
+		const mod3 = await freshImport();
+		const reloaded = await mod3.getOrCreateDeviceIdentity();
+		expect(reloaded.publicKeyB64).toBe(id.publicKeyB64);
+		expect(reloaded.privateKeySeed).not.toBeNull();
+	});
+
+	it('two concurrent calls on a legacy store resolve to ONE identity (SEC-CR-001)', async () => {
+		if (!ed25519Supported) return;
+
+		const mod = await freshImport();
+		await mod.getOrCreateDeviceIdentity();
+		await idbDelete(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, RAW_KEY);
+
+		// Measured pre-fix (crypto review of PR #117): two concurrent entries
+		// both wiped and both minted — divergent identities in one tab, and the
+		// loser signed with a keypair that was never persisted. The in-flight
+		// singleton must collapse them to one replacement.
+		const mod2 = await freshImport();
+		const [a, b] = await Promise.all([
+			mod2.getOrCreateDeviceIdentity(),
+			mod2.getOrCreateDeviceIdentity(),
+		]);
+		expect(a.publicKeyB64).toBe(b.publicKeyB64);
+		expect(a.privateKeySeed).not.toBeNull();
+		expect(b.privateKeySeed).not.toBeNull();
+
+		// And the persisted state matches what BOTH callers were handed.
+		const mod3 = await freshImport();
+		const reloaded = await mod3.getOrCreateDeviceIdentity();
+		expect(reloaded.publicKeyB64).toBe(a.publicKeyB64);
+	});
+
+	it('a storage fault during the replacement mint degrades to ephemeral and retries next boot (SEC-CR-008)', async () => {
+		if (!ed25519Supported) return;
+
+		const mod = await freshImport();
+		const original = await mod.getOrCreateDeviceIdentity();
+		await idbDelete(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, RAW_KEY);
+
+		// Fault-inject: the first atomic pair write on the identity store throws
+		// quota, then storage is healthy again. Measured pre-fix (SEC-CR-008):
+		// the throw escaped unclassified and the interrupted state failed every
+		// subsequent load — the exact stranding this PR exists to prevent.
+		vi.resetModules();
+		const realStore = await import('../idb-store.js');
+		let faults = 1;
+		vi.doMock('../idb-store.js', () => ({
+			...realStore,
+			createIdbStore: (opts: { dbName: string; storeName: string }) => {
+				const store = realStore.createIdbStore(opts);
+				if (opts.dbName !== 'oxpulse-device-id') return store;
+				return {
+					...store,
+					async saveMany(entries: ReadonlyArray<readonly [string, unknown]>) {
+						if (faults > 0) {
+							faults--;
+							throw new DOMException('quota', 'QuotaExceededError');
+						}
+						return store.saveMany(entries);
+					},
+				};
+			},
+		}));
+		const mod2 = (await import('../device-identity.js')) as DeviceIdentityModule;
+		const shim = await import('../tracker-shim.js');
+		const events: string[] = [];
+		shim.setIdentityTracker((event) => { events.push(event); });
+
+		const ephemeral = await mod2.getOrCreateDeviceIdentity();
+		// Degraded, not stranded: a signing-capable identity for the session…
+		expect(ephemeral.privateKeySeed).not.toBeNull();
+		expect(events).toContain('client.identity_quota_exceeded_fallback');
+		// …not recorded as a completed replacement…
+		expect(events).not.toContain('client.identity_legacy_replaced');
+		// …and not persisted: the legacy rows are intact for the next boot
+		// (the pair write is atomic, so there is no half-written state).
+		expect(await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, RAW_KEY)).toBeNull();
+		const rec = (await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, 'device-key')) as {
+			publicKeyB64: string;
+		};
+		expect(rec.publicKeyB64).toBe(original.publicKeyB64);
+
+		vi.doUnmock('../idb-store.js');
+
+		// Next boot, storage healthy: the replacement completes.
+		const mod3 = await freshImport();
+		const replaced = await mod3.getOrCreateDeviceIdentity();
+		expect(replaced.privateKeySeed).not.toBeNull();
+		expect(replaced.publicKeyB64).not.toBe(original.publicKeyB64);
+	});
+
+	it('a split seed/pubkey pair fails LOUDLY instead of signing under a wrong identity (SEC-CR-002)', async () => {
+		if (!ed25519Supported) return;
+
+		const mod = await freshImport();
+		const original = await mod.getOrCreateDeviceIdentity();
+
+		// Construct the split state: the stored pubkey record names a DIFFERENT
+		// (valid) public key than the one the wrapped seed derives — what an
+		// interleaved two-transaction write leaves behind. Measured pre-fix:
+		// loads clean, verify(join sig, stored pubkey) === false, no error at
+		// any layer, forever.
+		const foreignPub = nobleEd25519.getPublicKey(
+			crypto.getRandomValues(new Uint8Array(32))
+		);
+		const storedRec = (await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, 'device-key')) as {
+			publicKeyB64: string;
+			wrappedPrivateKey: ArrayBuffer;
+		};
+		expect(storedRec).not.toBeNull();
+		expect(storedRec.publicKeyB64).toBe(original.publicKeyB64);
+		await idbPut(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, 'device-key', {
+			...storedRec,
+			publicKeyB64: toBase64url(foreignPub),
+		});
+
+		const mod2 = await freshImport();
+		const shim = await import('../tracker-shim.js');
+		const events: string[] = [];
+		shim.setIdentityTracker((event) => { events.push(event); });
+		await expect(mod2.getOrCreateDeviceIdentity()).rejects.toThrow(
+			/does not match the seed-derived public key/
+		);
+		expect(events).toContain('client.identity_unwrap_failed');
 	});
 
 	it('DeviceIdentity type: privateKeySeed is OpaquePrivateKey | null', async () => {

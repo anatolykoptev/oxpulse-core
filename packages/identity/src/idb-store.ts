@@ -67,6 +67,14 @@ export interface IdbStoreOptions {
 
 export interface IdbStore {
 	save<T>(key: string, value: T): Promise<void>;
+	/**
+	 * Put several entries in ONE readwrite transaction — all land or none do.
+	 * Exists for writes whose entries are only valid together (the Ed25519
+	 * seed + pubkey record pair, SEC-CR-009): two separate transactions make
+	 * a split pair representable, and a split pair signs under an identity
+	 * the device does not hold.
+	 */
+	saveMany(entries: ReadonlyArray<readonly [string, unknown]>): Promise<void>;
 	load<T>(key: string): Promise<T | null>;
 	delete(key: string): Promise<void>;
 	clear(): Promise<void>;
@@ -110,6 +118,29 @@ export function createIdbStore(opts: IdbStoreOptions): IdbStore {
 				}
 				req.onerror = () => reject(req.error);
 				req.onsuccess = () => resolve();
+			});
+		},
+
+		async saveMany(entries: ReadonlyArray<readonly [string, unknown]>): Promise<void> {
+			const db = await openIDB();
+			return new Promise((resolve, reject) => {
+				const tx = db.transaction(storeName, 'readwrite');
+				const store = tx.objectStore(storeName);
+				try {
+					for (const [key, value] of entries) {
+						store.put(value, key);
+					}
+				} catch (err) {
+					try { tx.abort(); } catch { /* already aborting */ }
+					reject(err);
+					return;
+				}
+				// Resolve on transaction COMPLETION, not per-request success —
+				// completion is the atomicity boundary; a request can succeed
+				// and the transaction still abort.
+				tx.oncomplete = () => resolve();
+				tx.onerror = () => reject(tx.error);
+				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
 			});
 		},
 

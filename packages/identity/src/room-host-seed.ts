@@ -158,9 +158,20 @@ export async function exportRoomHostSeed(): Promise<Uint8Array | null> {
 	return getOrCreateRoomHostSeed();
 }
 
-/** Test-only: wipe the seed store and in-memory cache. */
-export async function __clearRoomHostSeed(): Promise<void> {
+/**
+ * Wipe the room-host seed store and in-memory cache.
+ *
+ * Production callers: getOrCreateDeviceIdentity's legacy replacement and
+ * clearDeviceIdentity — the seed is the sole HKDF input for every per-room
+ * host signing key, so leaving it behind would let a fresh identity keep
+ * signing host actions (kick/lock/pin-mint) as the retired identity's host
+ * authority (SEC-CR-004, crypto review of PR #117).
+ */
+export async function clearRoomHostSeed(): Promise<void> {
 	cachedSeed = null;
 	cachedWrappingKey = null;
 	await idb.clear();
 }
+
+/** @deprecated test-era alias — use clearRoomHostSeed. */
+export const __clearRoomHostSeed = clearRoomHostSeed;
