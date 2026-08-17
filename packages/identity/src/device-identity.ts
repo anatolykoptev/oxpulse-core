@@ -399,11 +399,10 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 	}
 
 	if (stored) {
+		let unwrapped: DeviceIdentity;
 		try {
-			const identity = await unwrapIdentity(stored);
-			cachedIdentity = identity;
+			unwrapped = await unwrapIdentity(stored);
 			track('client.identity_loaded', undefined, { duration_ms: nowMs() - t0 });
-			return identity;
 		} catch (e) {
 			// Recovery for devices that ALREADY ran the broken 0.2.x.
 			//
@@ -417,18 +416,36 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 			//
 			// So the trigger is the FAILURE, not the absence.
 			const recovered = await recoverWithLegacyKey(stored);
-			if (recovered) {
-				cachedIdentity = recovered;
-				track('client.identity_recovered_from_broken_kek', undefined, {
-					duration_ms: nowMs() - t0,
+			if (!recovered) {
+				track('client.identity_unwrap_failed', undefined, {
+					error_class: classifyIdentityError(e, 'unwrap'),
 				});
-				return recovered;
+				throw e;
 			}
-			track('client.identity_unwrap_failed', undefined, {
-				error_class: classifyIdentityError(e, 'unwrap'),
+			unwrapped = recovered;
+			track('client.identity_recovered_from_broken_kek', undefined, {
+				duration_ms: nowMs() - t0,
 			});
-			throw e;
 		}
+
+		if (unwrapped.privateKeySeed !== null) {
+			cachedIdentity = unwrapped;
+			return unwrapped;
+		}
+
+		// Pre-W7-P2b1 identity: no raw seed → signWithDeviceIdentity throws, so
+		// EVERY authed flow (self-token mint, sealed DM, directed call) dies
+		// downstream with an error that never names this cause. Operator decision
+		// 2026-08-16: this is an experimental deployment — replace the identity
+		// instead of stranding the device behind a permanent generic failure.
+		// The wipe is TOTAL (clearDeviceIdentity) so the old X25519 keypair and
+		// profile seed cannot pair with the new Ed25519 key. New pubkey = new
+		// user_id: server-side contacts and handle binding do NOT carry over.
+		// The check applies to the recovery path too — a recovered identity can
+		// be just as seedless as a directly-unwrapped one.
+		track('client.identity_legacy_replaced', undefined, { reason: 'no_raw_seed' });
+		await clearDeviceIdentity();
+		// Fall through to the create path below.
 	}
 
 	// Generate new identity (extractable=true for wrapKey during bootstrap).
@@ -687,9 +704,11 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
  *
  * Loads both the PKCS8-wrapped CryptoKey (best-effort, null on noble-only
  * runtimes) and the AES-KW-wrapped raw seed (authoritative for signing).
- * If the raw seed is absent (pre-W7-P2b1 identity), logs a warning and
- * emits a migration-needed event — DO NOT silently regenerate (that would
- * invalidate the user's enrolled pubkey on the server).
+ * If the raw seed is absent (pre-W7-P2b1 identity), logs a warning, emits a
+ * migration-needed event and returns privateKeySeed=null. This function does
+ * NOT regenerate — that policy call belongs to the caller, and
+ * getOrCreateDeviceIdentity replaces such identities wholesale (operator
+ * decision 2026-08-16: re-register legacy rather than strand the device).
  */
 async function unwrapIdentity(stored: StoredIdentity): Promise<DeviceIdentity> {
 	return unwrapIdentityWith(stored, await getOrCreateWrappingKey());
@@ -757,8 +776,8 @@ async function unwrapIdentityWith(
 		const rawSeed = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
 		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeySeed: new OpaquePrivateKey(rawSeed) };
 	} else {
-		// Pre-W7-P2b1 identity: raw seed unavailable.
-		// Return null so callers can show migration banner + disable sealed send.
+		// Pre-W7-P2b1 identity: raw seed unavailable. Return null and let the
+		// caller decide (getOrCreateDeviceIdentity replaces the identity).
 		// NEVER use a zero sentinel — noble/curves signs the known all-zero key
 		// deterministically, producing correlatable signatures that recipients drop.
 		console.warn(

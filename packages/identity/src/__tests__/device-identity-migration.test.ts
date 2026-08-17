@@ -66,12 +66,12 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 		expect(allZero).toBe(false);
 	});
 
-	it('privateKeySeed=null (not 32-zero) when raw seed absent in IDB', async () => {
+	it('legacy identity (raw seed absent) is REPLACED by a fresh signing identity', async () => {
 		if (!ed25519Supported) return;
 
 		// Create identity with W7-P2b1 mod (stores raw seed)
 		const mod = await freshImport();
-		await mod.getOrCreateDeviceIdentity();
+		const original = await mod.getOrCreateDeviceIdentity();
 
 		// Simulate pre-W7-P2b1: delete the raw seed entry from IDB.
 		// We can do this by manually opening the IDB and deleting the key.
@@ -91,12 +91,32 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 			req.onerror = () => reject(req.error);
 		});
 
-		// Fresh import (drops module cache, keeps IDB)
+		// Fresh import (drops module cache, keeps IDB). The tracker shim must be
+		// imported from the SAME post-reset registry as device-identity, or the
+		// spy lands on a module instance the code under test never calls.
 		const mod2 = await freshImport();
+		const shim = await import('../tracker-shim.js');
+		const events: Array<{ event: string; payload?: Record<string, unknown> }> = [];
+		shim.setIdentityTracker((event, _roomId, payload) => { events.push({ event, payload }); });
 		const id = await mod2.getOrCreateDeviceIdentity();
 
-		// MUST be null — not 32-zero bytes
-		expect(id.privateKeySeed).toBeNull();
+		// Operator decision 2026-08-16: a legacy identity cannot produce a single
+		// signature (signWithDeviceIdentity throws), so every authed flow dies
+		// downstream with a generic error. Replace it instead of returning it.
+		expect(id.privateKeySeed).not.toBeNull();
+		expect(id.privateKeySeed!.bytes().byteLength).toBe(32);
+		expect(id.publicKeyB64).not.toBe(original.publicKeyB64);
+		expect(events.map((e) => e.event)).toContain('client.identity_legacy_replaced');
+		const replaced = events.find((e) => e.event === 'client.identity_legacy_replaced');
+		expect(replaced?.payload).toEqual({ reason: 'no_raw_seed' });
+
+		// The replacement must be persistent, not ephemeral: a reload loads the
+		// SAME new identity instead of regenerating (or worse, finding the wipe
+		// left a half-broken record).
+		const mod3 = await freshImport();
+		const reloaded = await mod3.getOrCreateDeviceIdentity();
+		expect(reloaded.publicKeyB64).toBe(id.publicKeyB64);
+		expect(reloaded.privateKeySeed).not.toBeNull();
 	});
 
 	it('DeviceIdentity type: privateKeySeed is OpaquePrivateKey | null', async () => {
