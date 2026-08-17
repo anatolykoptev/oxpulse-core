@@ -502,7 +502,16 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 		// unwrap-lockout class. The legacy WRAPPING_KEY_NAME row also stays:
 		// for an adopted device it holds the SAME key the new rows are wrapped
 		// with, so it remains a valid recovery route if the KEK DB is ever lost.
-		const replacement = await persistIdentity(await generateDeviceIdentity());
+		//
+		// The mint shares the create path's storage-fault contract (SEC-CR-008):
+		// on IDB-unavailable/quota the session runs on an UNCACHED ephemeral
+		// identity, the legacy rows stay intact (the pair write is atomic), and
+		// the next boot retries the replacement.
+		const minted = await mintIdentityWithStorageFallback();
+		if (!minted.persisted) {
+			return minted.identity;
+		}
+		const replacement = minted.identity;
 
 		// Residue of the retired identity. The X25519 static keypair, profile
 		// seed and room-host seed belong to the old user_id and must not pair
@@ -535,19 +544,39 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 	// Generate new identity (extractable=true for wrapKey during bootstrap).
 	// persistIdentity wraps the key for IDB and immediately unwraps it as
 	// non-extractable — the returned identity carries the safe handle.
-	try {
-		const extractableIdentity = await generateDeviceIdentity();
-		const identity = await persistIdentity(extractableIdentity);
+	const { identity, persisted } = await mintIdentityWithStorageFallback();
+	if (persisted) {
 		cachedIdentity = identity;
 		track('client.identity_created', undefined, { duration_ms: nowMs() - t0 });
-		return identity;
+	}
+	return identity;
+}
+
+/**
+ * Generate + persist a fresh identity, degrading to an UNCACHED ephemeral
+ * one when storage faults. Shared by the create path and the legacy
+ * replacement (SEC-CR-008 — the replacement's mint must not be the one
+ * persist in the file without this contract).
+ *
+ * `persisted: false` means the identity lives only in memory: the caller
+ * must NOT cache it (a reload that finds IDB restored should pick up
+ * persistent storage) and must NOT treat it as a completed replacement.
+ * Throws on faults that are neither IDB-unavailable nor quota — those are
+ * classified and reported as identity_create_failed.
+ */
+async function mintIdentityWithStorageFallback(): Promise<{
+	identity: DeviceIdentity;
+	persisted: boolean;
+}> {
+	try {
+		const extractableIdentity = await generateDeviceIdentity();
+		return { identity: await persistIdentity(extractableIdentity), persisted: true };
 	} catch (e) {
 		// WEBVIEW-GUARD: IDB became unavailable between the probe (load above) and
 		// the persist attempt. Treat same as the load-path fallback.
 		if (e instanceof IDBUnavailableError) {
 			track('client.idb_unavailable', undefined, { reason: e.reason });
-			const ephemeral = await generateDeviceIdentity();
-			return ephemeral;
+			return { identity: await generateDeviceIdentity(), persisted: false };
 		}
 		// S9: QuotaExceededError — IDB quota full. Treat same as IDBUnavailable:
 		// emit ephemeral identity so the app can boot, with a distinct metric
@@ -556,8 +585,7 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 			track('client.identity_quota_exceeded_fallback', undefined, {
 				error_class: 'idb_quota_exceeded',
 			});
-			const ephemeral = await generateDeviceIdentity();
-			return ephemeral;
+			return { identity: await generateDeviceIdentity(), persisted: false };
 		}
 		track('client.identity_create_failed', undefined, {
 			error_class: classifyIdentityError(e, 'create'),
@@ -716,30 +744,38 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 	// old entries still unwrap correctly because AES-KW ciphertext is
 	// independent of the wrapped key's declared algorithm.
 	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, identity.privateKeySeed.bytes());
-	await idb.save(DEVICE_PRIV_RAW_NAME, wrappedRawSeed);
 
 	// PKCS8 wrap path: only possible when WebCrypto Ed25519 is available (non-null
 	// privateKey). On noble-only runtimes store a zero-length sentinel so
 	// unwrapIdentity can detect the noble-only case and skip unwrapKey.
-	let nonExtractablePrivKey: CryptoKey | null = null;
-	if (identity.privateKey !== null) {
-		// Wrap the extractable private key for storage (PKCS8 format — Ed25519 'raw' not supported).
-		const wrappedPrivateKey = await crypto.subtle.wrapKey(
+	const wrappedPrivateKey: ArrayBuffer | null = identity.privateKey !== null
+		? await crypto.subtle.wrapKey(
 			'pkcs8',
 			identity.privateKey,
 			wrappingKey,
 			'AES-KW'
-		);
+		)
+		: null;
+	const stored: StoredIdentity = {
+		publicKeyB64: identity.publicKeyB64,
+		wrappedPrivateKey: wrappedPrivateKey ?? new ArrayBuffer(0),
+	};
 
-		const stored: StoredIdentity = {
-			publicKeyB64: identity.publicKeyB64,
-			wrappedPrivateKey,
-		};
-		await idb.save(DEVICE_KEY_NAME, stored);
+	// ONE transaction for the pair (SEC-CR-009): the seed and the pubkey
+	// record are only valid together. Written separately, an interrupted or
+	// interleaved writer leaves seed_B beside pubkey_A — a split pair that the
+	// unwrapIdentityWith integrity check turns into a permanent loud failure.
+	// Atomic, the interrupted state is simply the previous identity.
+	await idb.saveMany([
+		[DEVICE_PRIV_RAW_NAME, wrappedRawSeed],
+		[DEVICE_KEY_NAME, stored],
+	]);
 
-		// Immediately unwrap to obtain the non-extractable runtime handle.
-		// The extractable CryptoKey in `identity.privateKey` goes out of scope
-		// after this function returns — callers must use the returned identity.
+	// Immediately unwrap to obtain the non-extractable runtime handle.
+	// The extractable CryptoKey in `identity.privateKey` goes out of scope
+	// after this function returns — callers must use the returned identity.
+	let nonExtractablePrivKey: CryptoKey | null = null;
+	if (wrappedPrivateKey !== null) {
 		nonExtractablePrivKey = await crypto.subtle.unwrapKey(
 			'pkcs8',
 			wrappedPrivateKey,
@@ -749,14 +785,6 @@ async function persistIdentity(identity: DeviceIdentity): Promise<DeviceIdentity
 			false, // non-extractable from this point forward
 			['sign']
 		);
-	} else {
-		// Noble-only runtime: persist publicKeyB64 + zero-length wrappedPrivateKey
-		// so the DEVICE_KEY_NAME entry exists and unwrapIdentity knows the record.
-		const stored: StoredIdentity = {
-			publicKeyB64: identity.publicKeyB64,
-			wrappedPrivateKey: new ArrayBuffer(0),
-		};
-		await idb.save(DEVICE_KEY_NAME, stored);
 	}
 
 	// Import the WebCrypto public key for callers that hold CryptoKey (best-effort).
@@ -1413,7 +1441,6 @@ export async function replaceDeviceIdentity(
 
 	// Always persist the raw seed (authoritative for noble-only runtimes).
 	const wrappedRawSeed = await wrapSecretBytes(wrappingKey, secret);
-	await idb.save(DEVICE_PRIV_RAW_NAME, wrappedRawSeed);
 
 	// Try WebCrypto PKCS8 wrap (best-effort — not available on HyperOS/HarmonyOS).
 	// On noble-only runtimes, store zero-length wrappedPrivateKey sentinel.
@@ -1436,10 +1463,16 @@ export async function replaceDeviceIdentity(
 		// Noble-only runtime — keep zero-length sentinel.
 	}
 
-	await idb.save(DEVICE_KEY_NAME, {
-		publicKeyB64: publicB64u,
-		wrappedPrivateKey,
-	});
+	// ONE transaction for the pair (SEC-CR-009) — same invariant as
+	// persistIdentity: a restore interrupted between the two rows must leave
+	// the previous pair, never seed_new beside pubkey_old.
+	await idb.saveMany([
+		[DEVICE_PRIV_RAW_NAME, wrappedRawSeed],
+		[DEVICE_KEY_NAME, {
+			publicKeyB64: publicB64u,
+			wrappedPrivateKey,
+		}],
+	]);
 
 	cachedIdentity = null;
 }

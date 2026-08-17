@@ -194,6 +194,65 @@ describe('B1: pre-W7-P2b1 identity migration', () => {
 		expect(reloaded.publicKeyB64).toBe(a.publicKeyB64);
 	});
 
+	it('a storage fault during the replacement mint degrades to ephemeral and retries next boot (SEC-CR-008)', async () => {
+		if (!ed25519Supported) return;
+
+		const mod = await freshImport();
+		const original = await mod.getOrCreateDeviceIdentity();
+		await idbDelete(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, RAW_KEY);
+
+		// Fault-inject: the first atomic pair write on the identity store throws
+		// quota, then storage is healthy again. Measured pre-fix (SEC-CR-008):
+		// the throw escaped unclassified and the interrupted state failed every
+		// subsequent load — the exact stranding this PR exists to prevent.
+		vi.resetModules();
+		const realStore = await import('../idb-store.js');
+		let faults = 1;
+		vi.doMock('../idb-store.js', () => ({
+			...realStore,
+			createIdbStore: (opts: { dbName: string; storeName: string }) => {
+				const store = realStore.createIdbStore(opts);
+				if (opts.dbName !== 'oxpulse-device-id') return store;
+				return {
+					...store,
+					async saveMany(entries: ReadonlyArray<readonly [string, unknown]>) {
+						if (faults > 0) {
+							faults--;
+							throw new DOMException('quota', 'QuotaExceededError');
+						}
+						return store.saveMany(entries);
+					},
+				};
+			},
+		}));
+		const mod2 = (await import('../device-identity.js')) as DeviceIdentityModule;
+		const shim = await import('../tracker-shim.js');
+		const events: string[] = [];
+		shim.setIdentityTracker((event) => { events.push(event); });
+
+		const ephemeral = await mod2.getOrCreateDeviceIdentity();
+		// Degraded, not stranded: a signing-capable identity for the session…
+		expect(ephemeral.privateKeySeed).not.toBeNull();
+		expect(events).toContain('client.identity_quota_exceeded_fallback');
+		// …not recorded as a completed replacement…
+		expect(events).not.toContain('client.identity_legacy_replaced');
+		// …and not persisted: the legacy rows are intact for the next boot
+		// (the pair write is atomic, so there is no half-written state).
+		expect(await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, RAW_KEY)).toBeNull();
+		const rec = (await idbGet(mod.IDB_DB_NAME, mod.IDB_STORE_NAME, 'device-key')) as {
+			publicKeyB64: string;
+		};
+		expect(rec.publicKeyB64).toBe(original.publicKeyB64);
+
+		vi.doUnmock('../idb-store.js');
+
+		// Next boot, storage healthy: the replacement completes.
+		const mod3 = await freshImport();
+		const replaced = await mod3.getOrCreateDeviceIdentity();
+		expect(replaced.privateKeySeed).not.toBeNull();
+		expect(replaced.publicKeyB64).not.toBe(original.publicKeyB64);
+	});
+
 	it('a split seed/pubkey pair fails LOUDLY instead of signing under a wrong identity (SEC-CR-002)', async () => {
 		if (!ed25519Supported) return;
 
