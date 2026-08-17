@@ -26,6 +26,8 @@ import { toArrayBuffer } from './crypto-utils.js';
 import { toBase64url, fromBase64url } from './base64url.js';
 import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw, classifyKekEntry } from './aes-kw.js';
 import { OpaquePrivateKey } from './opaque-private-key.js';
+import { clearRoomHostSeed } from './room-host-seed.js';
+import { hostKeypairCache } from './host-identity.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
 // Structure: SEQUENCE { version=0, AlgorithmIdentifier { OID 1.3.101.112 }, OCTET STRING { OCTET STRING { seed } } }
@@ -364,11 +366,51 @@ async function recoverWithLegacyKey(stored: StoredIdentity): Promise<DeviceIdent
 	}
 }
 
+/** In-flight singleton for getOrCreateDeviceIdentity — see the lock rationale below. */
+let inflightIdentity: Promise<DeviceIdentity> | null = null;
+
+/**
+ * Serialize the load-or-replace-or-mint sequence.
+ *
+ * Two layers, both load-bearing (SEC-CR-001, crypto review of PR #117):
+ *   1. Same-tab: a module-level in-flight promise. The measured trigger is
+ *      mesh-core's "C1: peer initiated before our scan callback fired
+ *      getLocalIdentity()" — a second entry while the first still awaits IDB.
+ *      Unserialized, both mint divergent keypairs and the loser signs all
+ *      session traffic with a key that was never persisted.
+ *   2. Cross-tab: navigator.locks (Web Locks API), where available. IndexedDB
+ *      offers no cross-tab mutual exclusion, and persistIdentity writes the
+ *      seed and the pubkey record in two transactions — interleaved writers
+ *      can persist seed_B beside pubkey_A (silent, permanent auth failure).
+ *      Runtimes without Web Locks (jsdom, old WebViews) fall back to the
+ *      in-flight promise alone — same-tab is the measured trigger; cross-tab
+ *      splits are additionally caught loudly by the pair check in
+ *      unwrapIdentityWith.
+ */
+function withIdentityLock<T>(fn: () => Promise<T>): Promise<T> {
+	const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
+	if (locks && typeof locks.request === 'function') {
+		return locks.request('oxpulse-device-identity', fn) as Promise<T>;
+	}
+	return fn();
+}
+
 /**
  * Get or create the device identity.
  * This is the main entry point - call this on app initialization.
  */
 export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
+	if (cachedIdentity) return cachedIdentity;
+	if (inflightIdentity) return inflightIdentity;
+	inflightIdentity = withIdentityLock(getOrCreateDeviceIdentityInner).finally(() => {
+		inflightIdentity = null;
+	});
+	return inflightIdentity;
+}
+
+async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
+	// Re-check under the lock: another tab (or the awaited in-flight call)
+	// may have resolved the identity while this caller waited.
 	if (cachedIdentity) return cachedIdentity;
 
 	const t0 = nowMs();
@@ -400,9 +442,9 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 
 	if (stored) {
 		let unwrapped: DeviceIdentity;
+		let recoveredFromBrokenKek = false;
 		try {
 			unwrapped = await unwrapIdentity(stored);
-			track('client.identity_loaded', undefined, { duration_ms: nowMs() - t0 });
 		} catch (e) {
 			// Recovery for devices that ALREADY ran the broken 0.2.x.
 			//
@@ -423,13 +465,21 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 				throw e;
 			}
 			unwrapped = recovered;
-			track('client.identity_recovered_from_broken_kek', undefined, {
-				duration_ms: nowMs() - t0,
-			});
+			recoveredFromBrokenKek = true;
 		}
 
 		if (unwrapped.privateKeySeed !== null) {
 			cachedIdentity = unwrapped;
+			// Emitted only for an identity actually RETURNED — a recovered-then-
+			// replaced legacy identity must not count as an incident recovery
+			// (that metric gates the 2026-08-06 broken-KEK fix).
+			if (recoveredFromBrokenKek) {
+				track('client.identity_recovered_from_broken_kek', undefined, {
+					duration_ms: nowMs() - t0,
+				});
+			} else {
+				track('client.identity_loaded', undefined, { duration_ms: nowMs() - t0 });
+			}
 			return unwrapped;
 		}
 
@@ -438,14 +488,48 @@ export async function getOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
 		// downstream with an error that never names this cause. Operator decision
 		// 2026-08-16: this is an experimental deployment — replace the identity
 		// instead of stranding the device behind a permanent generic failure.
-		// The wipe is TOTAL (clearDeviceIdentity) so the old X25519 keypair and
-		// profile seed cannot pair with the new Ed25519 key. New pubkey = new
-		// user_id: server-side contacts and handle binding do NOT carry over.
-		// The check applies to the recovery path too — a recovered identity can
-		// be just as seedless as a directly-unwrapped one.
-		track('client.identity_legacy_replaced', undefined, { reason: 'no_raw_seed' });
-		await clearDeviceIdentity();
-		// Fall through to the create path below.
+		// New pubkey = new user_id: server-side contacts and handle binding do
+		// NOT carry over. The check applies to the recovery path too — a
+		// recovered identity can be just as seedless as a directly-unwrapped one.
+		//
+		// MINT-FIRST, and the KEK survives (both per the crypto review of this
+		// PR): the replacement is generated and persisted BEFORE anything is
+		// deleted, so a failure at any point leaves the device with a usable
+		// identity — the old rows until the overwrite, the new ones after —
+		// never none. persistIdentity wraps with the already-resolved KEK;
+		// clearing the KEK DB here is what would let two concurrent
+		// replacements mint incompatible KEKs and re-create the 2026-08-06
+		// unwrap-lockout class. The legacy WRAPPING_KEY_NAME row also stays:
+		// for an adopted device it holds the SAME key the new rows are wrapped
+		// with, so it remains a valid recovery route if the KEK DB is ever lost.
+		const replacement = await persistIdentity(await generateDeviceIdentity());
+
+		// Residue of the retired identity. The X25519 static keypair, profile
+		// seed and room-host seed belong to the old user_id and must not pair
+		// with the new Ed25519 key (same rationale clearDeviceIdentity gives
+		// for the profile seed). Deletion failures are survivable — the
+		// replacement is already persisted — but must be visible.
+		cachedX25519Keypair = null;
+		cachedProfileSeed = null;
+		hostKeypairCache.clear();
+		try {
+			await idb.delete(X25519_KEYPAIR_NAME);
+			await idb.delete(PROFILE_SEED_NAME);
+			await clearRoomHostSeed();
+		} catch (e) {
+			track('client.identity_legacy_residue_wipe_failed', undefined, {
+				error_class: classifyIdentityError(e, 'unwrap'),
+			});
+		}
+
+		cachedIdentity = replacement;
+		// After the mint succeeded — an attempt that dies mid-way must not
+		// count as a replacement.
+		track('client.identity_legacy_replaced', undefined, {
+			reason: 'no_raw_seed',
+			via: recoveredFromBrokenKek ? 'recovery' : 'unwrap',
+		});
+		return replacement;
 	}
 
 	// Generate new identity (extractable=true for wrapKey during bootstrap).
@@ -774,6 +858,23 @@ async function unwrapIdentityWith(
 		// trick) and new entries (wrapped with wrapSecretBytes) — AES-KW
 		// ciphertext is independent of the wrapped key's declared algorithm.
 		const rawSeed = await unwrapSecretBytes(wrappingKey, wrappedRawSeed);
+		// Pair-level integrity (SEC-CR-002): AES-KW proves each row decrypted
+		// intact, but the seed and the pubkey live in two rows written in two
+		// transactions and are never otherwise compared. A split pair (partial
+		// write, interleaved writers, storage corruption) would load clean and
+		// sign valid-but-wrong signatures forever — the server verifies against
+		// the presented pubkey and simply rejects, with no diagnostic anywhere.
+		// One scalar mult per load; public data, so a plain compare is fine.
+		const derivedPub = nobleEd25519.getPublicKey(rawSeed);
+		const storedPub = fromBase64url(stored.publicKeyB64);
+		if (
+			derivedPub.length !== storedPub.length ||
+			!derivedPub.every((b, i) => b === storedPub[i])
+		) {
+			throw new IdentityDataError(
+				'stored public key does not match the seed-derived public key'
+			);
+		}
 		return { publicKeyB64: stored.publicKeyB64, publicKey, privateKey, privateKeySeed: new OpaquePrivateKey(rawSeed) };
 	} else {
 		// Pre-W7-P2b1 identity: raw seed unavailable. Return null and let the
@@ -860,11 +961,16 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedWrappingKey = null;
 	cachedProfileSeed = null;
 	cachedX25519Keypair = null;
+	hostKeypairCache.clear();
 	await idb.delete(DEVICE_KEY_NAME);
 	await idb.delete(DEVICE_PRIV_RAW_NAME);
 	await idb.delete(WRAPPING_KEY_NAME);  // old entry — kept by migration, cleared on explicit forget
 	await idb.delete(PROFILE_SEED_NAME);
 	await idb.delete(X25519_KEYPAIR_NAME);
+	// Same rationale as the profile seed: the room-host seed derives every
+	// per-room host signing key, so a forgotten device must not keep host
+	// authority over rooms the retired identity hosted (SEC-CR-004).
+	await clearRoomHostSeed();
 	await kekIdb.clear();  // new KEK DB
 	track('client.identity_wiped');
 }

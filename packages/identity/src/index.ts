@@ -48,6 +48,7 @@ export {
 export {
 	getOrCreateRoomHostSeed,
 	exportRoomHostSeed,
+	clearRoomHostSeed,
 } from './room-host-seed.js';
 
 // X25519 identity keypair + self-sig binding (Phase 2 T0.5)
