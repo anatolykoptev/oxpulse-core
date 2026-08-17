@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.4...identity-v0.2.5) (2026-08-17)
+
+
+### Added
+
+* **identity:** replace a legacy seedless identity instead of stranding the device ([#117](https://github.com/anatolykoptev/oxpulse-core/issues/117)) ([20fc1ac](https://github.com/anatolykoptev/oxpulse-core/commit/20fc1ac4f92f5660c70e5a7561c59017535c3a99))
+
 ## [0.2.4](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.3...identity-v0.2.4) (2026-08-08)
 
 
