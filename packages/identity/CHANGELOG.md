@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.5...identity-v0.2.6) (2026-08-19)
+
+
+### Added
+
+* **identity:** persist the sealed-messaging X25519 key so it survives a reload ([#120](https://github.com/anatolykoptev/oxpulse-core/issues/120)) ([96fc040](https://github.com/anatolykoptev/oxpulse-core/commit/96fc040f44cf7dc3b8e7e3eedebcf9f6a8bfe463))
+
 ## [0.2.5](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.4...identity-v0.2.5) (2026-08-17)
 
 
