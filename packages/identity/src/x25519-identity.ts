@@ -5,7 +5,11 @@
 //   Bound to the Ed25519 identity via a self-sig over "oxp/pkbind/v1" || x25519_pub.
 
 import { x25519, ed25519 } from '@noble/curves/ed25519.js';
-import type { DeviceIdentity } from './device-identity.js';
+import {
+	getOrCreateSealedX25519Secret,
+	identityEpoch,
+	type DeviceIdentity,
+} from './device-identity.js';
 
 const PKBIND_PREFIX = new TextEncoder().encode('oxp/pkbind/v1');
 
@@ -63,57 +67,105 @@ export function verifyX25519SelfSig(
 
 // ─── Session-level X25519 identity cache ─────────────────────────────────────
 //
-// FOLLOWUP(T0.5b): persist X25519 keypair to IDB with same AES-KW wrap pattern
-// as Ed25519 (device-identity.ts). For now, in-memory generation on first call
-// per session is functionally correct for Phase 2 testing. Persistence requires
-// extending the IDB schema without stranding existing users' identities.
+// T0.5b DONE: the scalar is persisted in IDB, AES-KW wrapped, by
+// getOrCreateSealedX25519Secret() in device-identity.ts. The WeakMap below is
+// now only a per-session memo over that read — the durable copy is the one on
+// disk, and it is what makes the key publishable at all.
 
-/** Module-scoped cache keyed by DeviceIdentity instance reference. */
-const x25519Cache = new WeakMap<DeviceIdentity, X25519Identity>();
+/**
+ * Module-scoped memo keyed by DeviceIdentity instance reference.
+ *
+ * Guarded by the identity epoch: a caller holding a RETIRED DeviceIdentity
+ * object would otherwise be served that identity's sealed key straight from
+ * memory after a wipe or a replace, never reaching the owner check in IDB.
+ */
+const x25519Cache = new WeakMap<DeviceIdentity, { epoch: number; id: X25519Identity }>();
+
+/**
+ * A fresh object with fresh buffers on every hand-out.
+ *
+ * getOrCreateSealedX25519Secret already returns a COPY of the scalar precisely
+ * so a consumer zeroizing its buffer after use — ordinary hygiene — cannot
+ * corrupt the session key. That guarantee stopped one layer short of the public
+ * entry point: the memo holds ONE X25519Identity, and returning that same object
+ * reference to every caller meant wiping `id.priv` left the memo holding 32 zero
+ * bytes while `pub` and `selfSig` still described the original key. Every later
+ * caller in the session then derived a wrong DH, with the stored and published
+ * key unchanged and nothing anywhere surfacing the mismatch.
+ *
+ * `pub` and `selfSig` are copied too. They are public values, so no secret
+ * hygiene applies — but the hazard is a consumer mutating what it was handed,
+ * and a guarantee that covers one field of three is the harder one to reason
+ * about at the call site.
+ */
+function handOut(id: X25519Identity): X25519Identity {
+	return { priv: id.priv.slice(), pub: id.pub.slice(), selfSig: id.selfSig.slice() };
+}
 
 /**
  * Get or create the X25519 identity associated with the given Ed25519 DeviceIdentity.
  *
- * FOLLOWUP(T0.5b): currently in-memory only — regenerated on each page load.
- * Persistence to IDB is deferred. The TOFU store (T9) compensates: recipients
- * see a new fingerprint on each session, triggering the "key changed" warn-and-send
- * path. This is acceptable for Phase 2 (decision #5 — warn, don't block).
+ * The keypair is PERSISTED (IDB, AES-KW wrapped) as of T0.5b, so the public key
+ * is stable across sessions and reloads. Before that it was regenerated per
+ * page load, which is why the TOFU store saw a new fingerprint every session
+ * and why the key could never be published to the server's registry.
  *
  * Idempotent within a session: multiple calls return the same keypair.
  */
 export async function getOrCreateX25519Identity(
 	identity: DeviceIdentity,
 ): Promise<X25519Identity> {
+	// Sampled ONCE, at entry. Reading the epoch again at write time is a TOCTOU:
+	// a wipe landing inside the await below would bump it, and the retired key
+	// would then be memoised under the POST-wipe epoch — matching forever after,
+	// served from memory with no IDB read, which is exactly what this guard
+	// exists to prevent. clearDeviceIdentity takes no lock, so it interleaves
+	// freely, and it is the one operation where a surviving key is worst.
+	const epochAtEntry = identityEpoch();
 	const cached = x25519Cache.get(identity);
-	if (cached) return cached;
+	if (cached && cached.epoch === epochAtEntry) return handOut(cached.id);
 
-	// Generate fresh X25519 keypair and self-sign with @noble/curves ed25519.
 	// privateKeySeed is the raw 32-byte Ed25519 seed — always available for
-	// W7-P2b1+ identities (which include all new enrollments after the noble-universal
-	// swap). Pre-W7-P2b1 identities have privateKeySeed=null and cannot produce
-	// a self-sig — they show a migration banner instead.
-	//
-	// Previously this path called crypto.subtle.sign() with identity.privateKey
-	// (CryptoKey). That is now unnecessary: noble ed25519.sign() works on all
-	// runtimes including HyperOS/HarmonyOS where WebCrypto Ed25519 is absent,
-	// and produces byte-identical signatures. The workaround comment is removed.
+	// W7-P2b1+ identities. Pre-W7-P2b1 identities have privateKeySeed=null and
+	// cannot produce a self-sig; they show a migration banner instead. Signing
+	// goes through noble, which works on runtimes where WebCrypto Ed25519 is
+	// absent (HyperOS/HarmonyOS) and is byte-identical where it is present.
 	if (!identity.privateKeySeed) {
 		throw new Error('[x25519-identity] getOrCreateX25519Identity: privateKeySeed null — identity migration required');
 	}
-	const kp = x25519.keygen();
+
+	// PERSISTED, not generated per session (T0.5b, done). A peer encrypts to
+	// this public key, so a key that changes on every page load makes every
+	// message sealed to the previous one permanently unreadable — and publishing
+	// such a key trips the server's 1-rotation/hour throttle and churns every
+	// peer's TOFU fingerprint. The scalar now comes from IDB, AES-KW wrapped.
+	//
+	// publicKeyB64 is passed so the store can verify the scalar belongs to THIS
+	// identity. That check, not this call site, is what makes a key left behind
+	// by any identity change unusable — including routes with no explicit wipe.
+	const priv = await getOrCreateSealedX25519Secret(identity.publicKeyB64);
+	const pub = x25519.getPublicKey(priv);
 
 	const signedBytes = new Uint8Array(PKBIND_PREFIX.length + 32);
 	signedBytes.set(PKBIND_PREFIX, 0);
-	signedBytes.set(kp.publicKey, PKBIND_PREFIX.length);
+	signedBytes.set(pub, PKBIND_PREFIX.length);
 
+	// Recomputed rather than stored: Ed25519 signing is deterministic (RFC 8032
+	// §5.1.6 derives the nonce from the key and message), so this reproduces the
+	// same 64 bytes every session — and storing a signature next to the key it
+	// signs only adds a way for the two to disagree.
 	const selfSig = ed25519.sign(signedBytes, identity.privateKeySeed.bytes());
 
-	const x25519Id: X25519Identity = {
-		priv: kp.secretKey,
-		pub: kp.publicKey,
-		selfSig,
-	};
+	const x25519Id: X25519Identity = { priv, pub, selfSig };
 
-	x25519Cache.set(identity, x25519Id);
-	return x25519Id;
+	// Returning it is correct either way — the owner check validated the scalar
+	// when it was read. What must not happen is MEMOISING a value the identity
+	// moved out from under mid-flight.
+	if (identityEpoch() === epochAtEntry) {
+		x25519Cache.set(identity, { epoch: epochAtEntry, id: x25519Id });
+	}
+	// handOut here too: x25519Id is the object the memo now holds, so returning
+	// it directly would hand the first caller the memo's own buffers and reopen
+	// the hole for exactly one call — the one that minted the key.
+	return handOut(x25519Id);
 }

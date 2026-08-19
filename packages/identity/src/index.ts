@@ -14,6 +14,7 @@ export {
 	IdentityDataError,
 	replaceDeviceIdentity,
 	probeBrowserSupport,
+	SealedKeyUnavailableError,
 	type DeviceIdentity,
 } from './device-identity.js';
 

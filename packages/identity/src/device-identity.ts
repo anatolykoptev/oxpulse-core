@@ -54,6 +54,24 @@ const DEVICE_PRIV_RAW_NAME = 'oxp/identity/ed25519-priv-raw'; // DO NOT RENAME a
 // New key — existing users get a fresh X25519 keypair on first B.2 boot.
 // NOT load-bearing for Ed25519 signing identity — safe to rename/regenerate.
 const X25519_KEYPAIR_NAME = 'x25519-keypair-v1';
+// Sealed-messaging X25519 secret (pairwise 1:1 chat). SEPARATE from the Noise
+// static key above, deliberately: sharing one static DH key across two
+// protocols is a cross-protocol-reuse question nobody should have to defend,
+// and the two have different lifetimes anyway.
+//
+// This key is what a peer encrypts to, so LOSING it makes every message sealed
+// to it permanently unreadable. It used to live only in a WeakMap in
+// x25519-identity.ts (FOLLOWUP T0.5b), so it was regenerated on every page
+// load: each session published a different public key, every peer saw a TOFU
+// fingerprint change, and anything sealed to the previous key was already
+// undecryptable by the time it arrived. That is why sealed 1:1 could never be
+// enrolled — publishing an ephemeral key is worse than publishing none.
+//
+// Stored as the raw 32-byte scalar, AES-KW wrapped with the same wrapping key
+// as the Ed25519 seed. Raw rather than a non-extractable CryptoKey because the
+// consumer (sealMessage / openMessage in @oxpulse/crypto-primitives) takes
+// Uint8Array — a WebCrypto handle could not be passed to it at all.
+const SEALED_X25519_NAME = 'x25519-sealed-v1'; // DO NOT RENAME after first user
 
 // LOAD-BEARING: IDB database + store name used by all installed users. NEVER rename.
 // See identity-extraction-adr.md §3.4 and __tests__/storage-keys.test.ts.
@@ -519,10 +537,20 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 		// for the profile seed). Deletion failures are survivable — the
 		// replacement is already persisted — but must be visible.
 		cachedX25519Keypair = null;
+		cachedSealedX25519 = null;
+		identityEpochCounter++;
 		cachedProfileSeed = null;
 		hostKeypairCache.clear();
 		try {
 			await idb.delete(X25519_KEYPAIR_NAME);
+			// The sealed key is the RETIRED identity's decryption key. Its
+			// self_sig would still verify — that is recomputed from whichever
+			// seed is current — so nothing would look broken; the key would
+			// simply follow the user across an identity change it was supposed
+			// to be severed by. Peers pinned that public key against the OLD
+			// user_id, and a replacement exists precisely to break that
+			// continuity, so the scalar goes with the identity that owned it.
+			await idb.delete(SEALED_X25519_NAME);
 			await idb.delete(PROFILE_SEED_NAME);
 			await clearRoomHostSeed();
 		} catch (e) {
@@ -989,18 +1017,325 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedWrappingKey = null;
 	cachedProfileSeed = null;
 	cachedX25519Keypair = null;
+	cachedSealedX25519 = null;
+	identityEpochCounter++;
 	hostKeypairCache.clear();
 	await idb.delete(DEVICE_KEY_NAME);
 	await idb.delete(DEVICE_PRIV_RAW_NAME);
 	await idb.delete(WRAPPING_KEY_NAME);  // old entry — kept by migration, cleared on explicit forget
 	await idb.delete(PROFILE_SEED_NAME);
 	await idb.delete(X25519_KEYPAIR_NAME);
+	await idb.delete(SEALED_X25519_NAME);
 	// Same rationale as the profile seed: the room-host seed derives every
 	// per-room host signing key, so a forgotten device must not keep host
 	// authority over rooms the retired identity hosted (SEC-CR-004).
 	await clearRoomHostSeed();
 	await kekIdb.clear();  // new KEK DB
 	track('client.identity_wiped');
+}
+
+// ─── Sealed-messaging X25519 secret ──────────────────────────────────────────
+
+/** Cached sealed scalar for this session, with the identity it belongs to. */
+// The epoch lives IN the value, not in a check at each writer. Three point
+// fixes at three write sites did not converge — the memo write, the mint
+// write-back, and the read branch — because the invariant was being enforced by
+// whoever happened to write. Carried here, a stale entry cannot be served
+// whichever site produced it, and a fourth write site is covered for free.
+// Same move as ownerEd25519PubB64 for the durable copy, one layer in.
+let cachedSealedX25519: { owner: string; epoch: number; priv: Uint8Array } | null = null;
+
+/**
+ * Bumped whenever the device identity is wiped or replaced.
+ *
+ * Cross-module in-memory caches read this instead of being reached into from
+ * here: x25519-identity.ts memoises per DeviceIdentity OBJECT, so a caller
+ * still holding a retired identity reference would otherwise be served that
+ * identity's sealed key from memory, after the wipe, with no IDB read. An
+ * exported reset would mean device-identity.ts importing x25519-identity.ts,
+ * which imports back — a cycle. A counter the other side polls has no direction.
+ */
+let identityEpochCounter = 0;
+
+/** @see identityEpochCounter */
+export function identityEpoch(): number {
+	return identityEpochCounter;
+}
+/**
+ * In-flight dedup slot. Carries the epoch for the same reason cachedSealedX25519
+ * does — a joiner must not be served across an identity change.
+ *
+ * The owner alone is not enough, and the gap is narrow but durable. A mint that
+ * starts at epoch 0 and resumes after a wipe deliberately returns its scalar
+ * WITHOUT persisting it. A second caller still holding the retired identity then
+ * samples the post-wipe epoch at ITS entry, joins this slot, receives that
+ * unpersisted scalar — and because its own entry epoch matches the current one,
+ * x25519-identity.ts memoises it as current for the rest of the session. The
+ * result is the exact state the epoch machinery exists to prevent: a scalar that
+ * lives only until the tab closes, treated as the durable one and publishable.
+ * Every peer sealing to that public key produces something permanently
+ * unreadable.
+ */
+let inflightSealed: { owner: string; epoch: number; p: Promise<Uint8Array> } | null = null;
+
+/**
+ * Thrown when the sealed-messaging scalar cannot be PERSISTED: the runtime has
+ * no working IndexedDB (Instagram/TikTok in-app WebViews, some private modes)
+ * or its quota is exhausted.
+ *
+ * Deliberately a throw, where every other storage-touching entry point in this
+ * file degrades to an ephemeral in-memory value instead. That asymmetry is the
+ * design, not an oversight:
+ *
+ *   - The Ed25519 identity degrades because the alternative is the SPA not
+ *     booting at all, and a session-scoped signing key still signs. Nothing is
+ *     published, so nothing outlives the session to be wrong later.
+ *   - This key exists to be PUBLISHED, so a peer can seal to it. A key that
+ *     dies at reload is worse in the registry than no key at all: every message
+ *     sealed to it is permanently unreadable, the server throttles the
+ *     correcting publish to 1/hour so it does not self-heal, and every peer's
+ *     TOFU fingerprint churns on each page load.
+ *
+ * Returning an `{ priv, ephemeral: true }` pair instead would put the whole
+ * weight on a caller remembering to read the flag — a marker with no reader is
+ * the same defect as a gate with no writer. With no value returned at all,
+ * publishing a non-persisted key is unrepresentable rather than merely
+ * discouraged.
+ *
+ * Callers should treat this as "sealed messaging is unavailable on this
+ * runtime" and say so, rather than retrying.
+ */
+export class SealedKeyUnavailableError extends Error {
+	/** Bounded — mirrors IDBUnavailableError.reason plus the quota case. */
+	readonly reason: IDBUnavailableError['reason'] | 'quota_exceeded';
+	constructor(reason: IDBUnavailableError['reason'] | 'quota_exceeded') {
+		super(`sealed X25519 key cannot be persisted: ${reason}`);
+		this.name = 'SealedKeyUnavailableError';
+		this.reason = reason;
+	}
+}
+
+interface StoredSealedX25519 {
+	/** Discriminator. One KEK wraps the Ed25519 seed, the Noise scalar and this
+	 *  one, and all three are 32 bytes — nothing about length could catch a
+	 *  crossed row, so the row says what it is. */
+	kind: 'x25519-sealed-v1';
+	/**
+	 * The identity this scalar belongs to (`DeviceIdentity.publicKeyB64`).
+	 *
+	 * This is the load-bearing field. Without it, "wipe the sealed key on every
+	 * path that changes the identity" is an invariant maintained by remembering
+	 * — and a carried-over key does NOT fail loudly, because self_sig is
+	 * recomputed from whichever seed is current, so the binding still verifies.
+	 * A review enumeration found two paths that had already escaped the three
+	 * explicit deletes: `generateDeviceIdentity()` (exported, wipes nothing) and
+	 * an interrupted `replaceDeviceIdentity`. Checking the owner at the point of
+	 * USE turns that into a fail-safe: a row belonging to anyone else is treated
+	 * as absent and replaced, whatever route left it there.
+	 */
+	ownerEd25519PubB64: string;
+	wrappedPrivateKeyRaw: ArrayBuffer; // AES-KW wrapped raw 32-byte X25519 scalar
+}
+
+/**
+ * Get or create the PERSISTED X25519 secret used for sealed 1:1 messaging.
+ *
+ * Deliberately a separate function from getOrCreateX25519Keypair() rather than
+ * a shared one parameterised by storage name: that function carries S8
+ * downgrade-recovery logic whose whole documented purpose is NOT regenerating
+ * the Noise key ("breaking TOFU trust with all peers"), and it is covered by
+ * __tests__/x25519-tofu-recovery.test.ts. Re-aiming it to serve two callers
+ * would put that recovery path on a refactor it never asked for. The shared
+ * pieces are the private helpers — the wrapping key, the IDB store, and the
+ * aes-kw wrap/unwrap — which is the part worth reusing.
+ *
+ * Returns a COPY of the raw 32-byte scalar. The copy matters: the value is
+ * public API (X25519Identity.priv), and a consumer that zeroizes its buffer
+ * after use — ordinary hygiene — would otherwise corrupt the session key, after
+ * which the next derivation would produce a different public key and sign THAT,
+ * while IDB and the server's registry still hold the original. Silently.
+ *
+ * Noble-only by construction — no WebCrypto branch. The consumer takes
+ * `Uint8Array` (verified: `recipientX25519Priv` in
+ * @oxpulse/crypto-primitives/pairwise-seal.ts), so a non-extractable CryptoKey
+ * could not be passed to it at all.
+ *
+ * @param ownerPublicKeyB64 the live identity's `publicKeyB64`. Passed in rather
+ *   than read via getOrCreateDeviceIdentity() because this runs under the same
+ *   lock that function takes, and Web Locks are not reentrant.
+ */
+export async function getOrCreateSealedX25519Secret(
+	ownerPublicKeyB64: string,
+): Promise<Uint8Array> {
+	const cached = cachedSealedX25519;
+	if (
+		cached &&
+		cached.owner === ownerPublicKeyB64 &&
+		cached.epoch === identityEpochCounter
+	) {
+		return cached.priv.slice();
+	}
+	// .slice() here too: sealedX25519Inner produces ONE copy, so every caller
+	// awaiting the shared promise would otherwise receive the same Uint8Array
+	// instance — two concurrent X25519Identity objects sharing one `priv`, where
+	// a consumer zeroizing either kills both.
+	// The epoch check is what makes joining safe: an entry created before an
+	// identity change is minting for an identity that no longer exists, and its
+	// result was deliberately not persisted. Falling through to a fresh locked
+	// mint is correct — it blocks on the lock the in-flight call holds, then runs
+	// against current state.
+	if (
+		inflightSealed &&
+		inflightSealed.owner === ownerPublicKeyB64 &&
+		inflightSealed.epoch === identityEpochCounter
+	) {
+		return (await inflightSealed.p).slice();
+	}
+
+	// Same lock as the identity mint, for two reasons: two tabs must not each
+	// mint a scalar and race the write (the loser publishes a public key whose
+	// private half no longer exists on the device — and the correcting publish
+	// is rate-limited to 1/hour by the server, so it does not self-heal), and
+	// getOrCreateWrappingKey below must not run beside an unlocked KEK mint.
+	const p = withIdentityLock(() => sealedX25519Inner(ownerPublicKeyB64));
+	const entry = { owner: ownerPublicKeyB64, epoch: identityEpochCounter, p };
+	inflightSealed = entry;
+	try {
+		return (await p).slice();
+	} finally {
+		if (inflightSealed === entry) inflightSealed = null;
+	}
+}
+
+/**
+ * Test seam: run between the IDB read and the IDB write inside the mint.
+ *
+ * The race this exists to gate cannot be reproduced by scheduling. IDB request
+ * APIs return synchronously and completion is dispatched by the implementation's
+ * own loop, so a test has no way to hold one racer between its `load` and its
+ * `save` from outside. Awaiting more turns only changes the odds — which is why
+ * an earlier version of the concurrency test stayed green with the dedup
+ * removed, and said so rather than pretending otherwise.
+ *
+ * Null in production; nothing reads it outside the suite.
+ */
+export const __sealedTestHooks: { betweenLoadAndSave: null | (() => Promise<void>) } = {
+	betweenLoadAndSave: null,
+};
+
+/**
+ * Classifies storage faults into SealedKeyUnavailableError, and lets everything
+ * else through untouched.
+ *
+ * Wrapping the whole mint rather than each call is deliberate: the wrapping key,
+ * the load and the save are three separate chances for IDB to be missing, and a
+ * per-call guard is a list that the next storage call added here would silently
+ * escape.
+ *
+ * Both event names are reused verbatim from the Ed25519 paths above rather than
+ * minted fresh. A new client event kind is a four-place lockstep across two
+ * repos (telemetry.ts CLIENT_EVENT_NAMES, crates/analytics kinds.rs, the
+ * handler match-arm, the allowlist test), and an unlisted kind is silently
+ * bucketed as unknown — so a fresh name would be worse observability, not
+ * better, until all four land. `identity_quota_exceeded_fallback` reads wrong
+ * here (there is no fallback on this path) — oxpulse-chat followup for a
+ * dedicated kind.
+ */
+async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
+	try {
+		return await sealedX25519Mint(owner);
+	} catch (e) {
+		if (e instanceof IDBUnavailableError) {
+			track('client.idb_unavailable', undefined, { reason: e.reason });
+			throw new SealedKeyUnavailableError(e.reason);
+		}
+		if ((e as { name?: string })?.name === 'QuotaExceededError') {
+			track('client.identity_quota_exceeded_fallback', undefined, {
+				error_class: 'idb_quota_exceeded',
+			});
+			throw new SealedKeyUnavailableError('quota_exceeded');
+		}
+		throw e;
+	}
+}
+
+async function sealedX25519Mint(owner: string): Promise<Uint8Array> {
+	// Sampled at entry: a wipe can land while this is awaiting IDB, and a mint
+	// that resumes afterwards must not write its key back. clearDeviceIdentity
+	// nulls the module cache and deletes the row — and then the in-flight mint
+	// would repopulate BOTH, handing the retired identity's key to every later
+	// caller without an IDB read. Found by the mid-flight-wipe test.
+	const epochAtEntry = identityEpochCounter;
+
+	// Re-check under the lock — another tab may have persisted one meanwhile.
+	const cached = cachedSealedX25519;
+	if (cached && cached.owner === owner && cached.epoch === epochAtEntry) {
+		return cached.priv.slice();
+	}
+
+	const wrappingKey = await getOrCreateWrappingKey();
+
+	const existing = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+	const usable =
+		existing?.kind === 'x25519-sealed-v1' &&
+		existing.ownerEd25519PubB64 === owner &&
+		existing.wrappedPrivateKeyRaw?.byteLength > 0;
+
+	if (__sealedTestHooks.betweenLoadAndSave) await __sealedTestHooks.betweenLoadAndSave();
+
+	if (usable) {
+		const priv = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
+		// Stamped with the epoch this call ENTERED at. A wipe landing during the
+		// unwrap above — two WebCrypto ops, a real window, and the steady-state
+		// path every session takes — would otherwise repopulate the cache with the
+		// retired key after clearDeviceIdentity had just nulled it. The unwrap
+		// still succeeds because the wrapping-key handle is already resolved in
+		// memory, so kekIdb.clear() does not stop it.
+		cachedSealedX25519 = { owner, epoch: epochAtEntry, priv };
+		return priv.slice();
+	}
+
+	// Absent, untagged (pre-owner-binding), or owned by a retired identity —
+	// all three mean "no scalar for THIS identity", and all three are replaced.
+	const priv = nobleX25519.utils.randomSecretKey();
+	const wrapped = await wrapSecretBytes(wrappingKey, priv);
+
+	// The identity moved while we were minting for the old one. Hand the caller
+	// what it asked for — it is valid for the identity it named — but persist
+	// NOTHING: a row written here would resurrect what clearDeviceIdentity just
+	// deleted. Note the consequence: a caller that seals to this scalar produces
+	// something no future session can decrypt. That is correct — there is no
+	// future session for a wiped identity — but it is not obvious.
+	if (identityEpochCounter !== epochAtEntry) return priv;
+
+	// The same refusal, for the case the epoch cannot see: a caller still holding
+	// a RETIRED identity that starts its mint AFTER the wipe has settled. Its
+	// entry epoch equals the current one, so the guard above passes.
+	//
+	// The row is a single slot discriminated only by its owner tag, and the mint
+	// path treats a foreign row as absent and replaces it — so the owner check
+	// protects READS and nothing protected writes. A stale component could
+	// therefore overwrite the LIVE identity's scalar with one of its own, and the
+	// live identity's next call would find a foreign row, mint again, and publish
+	// a different public key. Everything peers had already sealed to the old one
+	// would be unreadable, and the correction is throttled to 1/hour.
+	//
+	// `cachedIdentity` is the live identity by definition — it is what
+	// getOrCreateDeviceIdentity resolved and what clearDeviceIdentity nulls. Null
+	// means no identity is loaded and there is nothing live to overwrite.
+	const live = cachedIdentity;
+	if (live && live.publicKeyB64 !== owner) return priv;
+
+	// Persist BEFORE caching: a caller served from the cache while the write was
+	// still in flight would seal to a key the next session cannot unwrap, and
+	// the peer could never read those messages.
+	await idb.save<StoredSealedX25519>(SEALED_X25519_NAME, {
+		kind: 'x25519-sealed-v1',
+		ownerEd25519PubB64: owner,
+		wrappedPrivateKeyRaw: wrapped,
+	});
+	cachedSealedX25519 = { owner, epoch: epochAtEntry, priv };
+	return priv.slice();
 }
 
 // ─── X25519 static keypair (B.2-noise-s-key-derivation) ──────────────────────
@@ -1049,6 +1384,7 @@ let cachedX25519Keypair: X25519KeypairCache | null = null;
  *
  * @returns { publicKey: Uint8Array (32 bytes), privateKey: CryptoKey | null }
  */
+
 export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Array; privateKey: CryptoKey | null }> {
 	if (cachedX25519Keypair) return cachedX25519Keypair;
 
@@ -1473,6 +1809,70 @@ export async function replaceDeviceIdentity(
 			wrappedPrivateKey,
 		}],
 	]);
+
+	// The sealed-messaging scalar belongs to the identity being REPLACED: peers
+	// pinned its public key against the outgoing user_id. Carrying it forward
+	// would not look broken — self_sig is recomputed from whichever seed is
+	// current, so the binding still verifies — which is exactly why it has to be
+	// deleted deliberately rather than left to fail loudly. Ordered AFTER the
+	// pair write so an interrupted restore cannot destroy a decryption key while
+	// leaving the old identity in place.
+	//
+	// Deleted only when the identity actually CHANGED. Restoring your own backup
+	// onto a device that already holds that identity is a real and ordinary
+	// action, and an unconditional delete there destroys a key that is still
+	// correct — peers have it pinned, the registry has it published, and every
+	// message already sealed to it becomes unreadable. The replacement key then
+	// has to go out under the 1-rotation/hour throttle.
+	//
+	// Nothing is lost by the guard: when the owner differs, the delete was
+	// already redundant, because the owner tag on the row makes a foreign key
+	// unusable at the point of USE. That check is what carries the severance
+	// semantics; this delete only tidies up after it.
+	//
+	// Wrapped, and that is not defensive padding. These are the FIRST storage
+	// calls this function makes after the seed/pubkey pair has landed, so before
+	// this block the restore could not fail once it had succeeded. IDB can go
+	// away mid-call — the availability probe is TTL-cached for five minutes — and
+	// an escape here would report a failed restore for a device that has already
+	// switched to the restored identity, which is the worst possible thing to
+	// tell someone recovering an account.
+	//
+	// Same treatment the legacy-replacement path gives its own residue cleanup
+	// above: survivable, but never silent.
+	try {
+		const existingSealed = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+		if (existingSealed && existingSealed.ownerEd25519PubB64 !== publicB64u) {
+			await idb.delete(SEALED_X25519_NAME);
+		}
+	} catch (e) {
+		track('client.identity_legacy_residue_wipe_failed', undefined, {
+			error_class: classifyIdentityError(e, 'unwrap'),
+		});
+	}
+
+	// INVALIDATION LAST, and the order is the whole point.
+	//
+	// This function takes no lock, and `cachedIdentity` is null throughout, so a
+	// component calling getOrCreateX25519Identity for the just-restored identity
+	// can run between the load and the delete above — two awaited IDB round
+	// trips. It reads the OLD owner's row, judges it foreign, mints, and (with
+	// cachedIdentity null, so the live-identity guard cannot refuse it) persists
+	// a row for the RESTORED owner. The delete above, decided from the earlier
+	// read, then removes that brand-new row.
+	//
+	// With the epoch bumped BEFORE the cleanup, that mint's cache entry stayed
+	// valid for the rest of the session: the app would keep handing out — and
+	// publishing — a scalar with no durable copy, which is precisely the state
+	// SealedKeyUnavailableError exists to make unrepresentable. Everything peers
+	// sealed to it would be unreadable after the next reload.
+	//
+	// Bumping the epoch as the LAST mutation makes the window self-healing
+	// instead: anything minted inside it is invalidated by definition, so the
+	// next caller re-reads IDB, finds nothing, and mints and persists again. One
+	// wasted mint, and no undurable key can survive.
+	cachedSealedX25519 = null;
+	identityEpochCounter++;
 
 	cachedIdentity = null;
 }
