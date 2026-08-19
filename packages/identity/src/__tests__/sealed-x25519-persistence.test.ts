@@ -746,6 +746,62 @@ describe('replacing an identity with ITSELF keeps the key', () => {
 	});
 });
 
+describe('a restore that already succeeded must not report failure', () => {
+	// The residue cleanup runs AFTER the seed/pubkey pair has landed. Before it
+	// existed, replaceDeviceIdentity could not fail once it had succeeded; the
+	// cleanup added the first storage calls past that point. An escape there
+	// tells someone recovering their account that the restore failed, on a device
+	// that has already switched to the restored identity.
+	it('replaceDeviceIdentity resolves even when the residue cleanup throws', async () => {
+		if (!ed25519Supported) return;
+
+		const { vi } = await import('vitest');
+		vi.resetModules();
+		// Fault injected at the store boundary, and only on delete/load — the
+		// saveMany that persists the identity itself must still work, or the test
+		// would pass for the wrong reason (nothing was restored at all).
+		vi.doMock('../idb-store.js', async () => {
+			const actual = await vi.importActual<typeof import('../idb-store.js')>('../idb-store.js');
+			return {
+				...actual,
+				createIdbStore: (opts: Parameters<typeof actual.createIdbStore>[0]) => {
+					const real = actual.createIdbStore(opts);
+					return {
+						...real,
+						delete: async () => {
+							throw new actual.IDBUnavailableError('no_indexedDB');
+						},
+					};
+				},
+			};
+		});
+
+		try {
+			const device = (await import('../device-identity.js')) as DeviceIdentityModule;
+			const first = await device.getOrCreateDeviceIdentity();
+			await device.getOrCreateSealedX25519Secret(first.publicKeyB64);
+
+			// A DIFFERENT identity, so the cleanup actually reaches the delete.
+			const newSeed = ed25519.utils.randomSecretKey();
+			const newPub = ed25519.getPublicKey(newSeed);
+			const b64u = (b: Uint8Array) =>
+				btoa(String.fromCharCode(...b))
+					.replace(/\+/g, '-')
+					.replace(/\//g, '_')
+					.replace(/=+$/, '');
+
+			await expect(device.replaceDeviceIdentity(newSeed, b64u(newPub))).resolves.toBeUndefined();
+
+			// And the restore really happened — otherwise "it did not throw" is
+			// worth nothing.
+			expect((await device.getOrCreateDeviceIdentity()).publicKeyB64).toBe(b64u(newPub));
+		} finally {
+			vi.doUnmock('../idb-store.js');
+			vi.resetModules();
+		}
+	});
+});
+
 describe('sealed X25519 secret when IndexedDB is unavailable', () => {
 	let realIDB: IDBFactory | undefined;
 

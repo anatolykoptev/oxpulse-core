@@ -1831,9 +1831,26 @@ export async function replaceDeviceIdentity(
 	// already redundant, because the owner tag on the row makes a foreign key
 	// unusable at the point of USE. That check is what carries the severance
 	// semantics; this delete only tidies up after it.
-	const existingSealed = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
-	if (existingSealed && existingSealed.ownerEd25519PubB64 !== publicB64u) {
-		await idb.delete(SEALED_X25519_NAME);
+	//
+	// Wrapped, and that is not defensive padding. These are the FIRST storage
+	// calls this function makes after the seed/pubkey pair has landed, so before
+	// this block the restore could not fail once it had succeeded. IDB can go
+	// away mid-call — the availability probe is TTL-cached for five minutes — and
+	// an escape here would report a failed restore for a device that has already
+	// switched to the restored identity, which is the worst possible thing to
+	// tell someone recovering an account.
+	//
+	// Same treatment the legacy-replacement path gives its own residue cleanup
+	// above: survivable, but never silent.
+	try {
+		const existingSealed = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+		if (existingSealed && existingSealed.ownerEd25519PubB64 !== publicB64u) {
+			await idb.delete(SEALED_X25519_NAME);
+		}
+	} catch (e) {
+		track('client.identity_legacy_residue_wipe_failed', undefined, {
+			error_class: classifyIdentityError(e, 'unwrap'),
+		});
 	}
 
 	cachedIdentity = null;
