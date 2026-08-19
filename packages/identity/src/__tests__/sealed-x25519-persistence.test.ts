@@ -274,6 +274,72 @@ describe('concurrency', () => {
 	// remains when that ordering does not hold (a slower write, a real Web Lock
 	// across tabs), which single-process fake-indexeddb cannot reproduce on
 	// demand. Kept because the outcome is worth pinning; not claimed as the gate.
+	// Three racers, not two, and the assertion is on OBJECT IDENTITY.
+	//
+	// sealedX25519Inner produces exactly one copy. The owning caller slices it
+	// again, so with only two racers the deduped one could return the inner
+	// buffer unsliced and the two would still be distinct objects — the defect
+	// hides. With three, both deduped callers would receive the SAME instance,
+	// and a consumer zeroizing either would kill the other.
+	it('every concurrent caller gets its own buffer holding the same scalar', async () => {
+		if (!ed25519Supported) return;
+
+		const { device } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+		const owner = identity.publicKeyB64;
+
+		let parked!: () => void;
+		const atSeam = new Promise<void>((r) => {
+			parked = r;
+		});
+		let release!: () => void;
+		const go = new Promise<void>((r) => {
+			release = r;
+		});
+		let arrived = 0;
+		device.__sealedTestHooks.betweenLoadAndSave = async () => {
+			// Only the first parks. Release must NOT depend on another racer
+			// arriving — with the dedup live none ever does, and an earlier
+			// version of this test deadlocked on exactly that assumption.
+			if (++arrived === 1) {
+				parked();
+				await go;
+			}
+		};
+
+		try {
+			const p1 = device.getOrCreateSealedX25519Secret(owner);
+			await atSeam; // p1 is between its read and its write
+
+			const p2 = device.getOrCreateSealedX25519Secret(owner);
+			const p3 = device.getOrCreateSealedX25519Secret(owner);
+			await new Promise((r) => setTimeout(r, 50));
+			release();
+
+			const [a, b, c] = await Promise.all([p1, p2, p3]);
+
+			expect(hex(b)).toBe(hex(a));
+			expect(hex(c)).toBe(hex(a));
+			expect(b).not.toBe(a);
+			expect(c).not.toBe(a);
+			expect(c).not.toBe(b); // the assertion the third racer exists for
+		} finally {
+			device.__sealedTestHooks.betweenLoadAndSave = null;
+			release();
+		}
+	});
+
+	// HONEST SCOPE — measured, not assumed. Removing the in-flight dedup does
+	// NOT turn either concurrency test red in this environment. The seam above
+	// was added to force the interleaving and it still does not fire: racers
+	// reaching `getOrCreateSealedX25519Secret` while another is parked at the
+	// seam never arrive there themselves, so something upstream of it (the
+	// wrapping-key read and the IDB store's own request ordering) already
+	// serializes them under fake-indexeddb. The dedup's real job is cross-TAB
+	// serialization via Web Locks, and `navigator.locks` does not exist under
+	// vitest's node environment, so `withIdentityLock` falls through to a direct
+	// call in every test here. That half of the fix is untested and untestable
+	// in this suite — a green run says nothing about it.
 	it('two concurrent callers get ONE scalar and leave ONE row', async () => {
 		if (!ed25519Supported) return;
 
@@ -329,6 +395,63 @@ describe('concurrency', () => {
 });
 
 describe('getOrCreateX25519Identity uses the persisted scalar', () => {
+	it('a wipe landing MID-FLIGHT does not get memoised as current', async () => {
+		// The epoch must be sampled at ENTRY, not at write time. Sampling at the
+		// write means a wipe arriving during the await bumps it first, and the
+		// retired key is then stored under the POST-wipe epoch — matching every
+		// later call, served from memory, never reaching the owner check in IDB.
+		// clearDeviceIdentity takes no lock, so it interleaves freely, and it is
+		// the one operation where a surviving key is the worst outcome.
+		if (!ed25519Supported) return;
+
+		const { device, x25519Id } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+
+		let parked!: () => void;
+		const atSeam = new Promise<void>((r) => {
+			parked = r;
+		});
+		let release!: () => void;
+		const go = new Promise<void>((r) => {
+			release = r;
+		});
+		let fired = false;
+		device.__sealedTestHooks.betweenLoadAndSave = async () => {
+			if (fired) return;
+			fired = true;
+			parked();
+			await go;
+		};
+
+		try {
+			const inFlight = x25519Id.getOrCreateX25519Identity(identity);
+			await atSeam;
+
+			// The wipe lands while the sealed mint is parked.
+			await device.clearDeviceIdentity();
+			release();
+			const during = await inFlight;
+
+			// The discriminating question is whether that value was MEMOISED, not
+			// what it was. Comparing the two calls directly cannot answer it: the
+			// parked mint writes its row after the wipe, tagged with this same
+			// (retired) identity, so a re-read legitimately returns the same key.
+			// Remove the row instead — then a call that re-enters the store mints
+			// a fresh scalar, while a call answered from the memo does not.
+			const store = createIdbStore({
+				dbName: device.IDB_DB_NAME,
+				storeName: device.IDB_STORE_NAME,
+			});
+			await store.delete(SEALED_KEY_STORAGE_NAME);
+
+			const after = await x25519Id.getOrCreateX25519Identity(identity);
+			expect(hex(after.pub)).not.toBe(hex(during.pub));
+		} finally {
+			device.__sealedTestHooks.betweenLoadAndSave = null;
+			release();
+		}
+	});
+
 	it('does not serve a retired identity from the in-memory memo', async () => {
 		// The memo is keyed by the DeviceIdentity OBJECT. A caller still holding
 		// the retired reference would otherwise be handed that identity's sealed

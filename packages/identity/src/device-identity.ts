@@ -1111,7 +1111,13 @@ export async function getOrCreateSealedX25519Secret(
 ): Promise<Uint8Array> {
 	const cached = cachedSealedX25519;
 	if (cached && cached.owner === ownerPublicKeyB64) return cached.priv.slice();
-	if (inflightSealed && inflightSealed.owner === ownerPublicKeyB64) return inflightSealed.p;
+	// .slice() here too: sealedX25519Inner produces ONE copy, so every caller
+	// awaiting the shared promise would otherwise receive the same Uint8Array
+	// instance — two concurrent X25519Identity objects sharing one `priv`, where
+	// a consumer zeroizing either kills both.
+	if (inflightSealed && inflightSealed.owner === ownerPublicKeyB64) {
+		return (await inflightSealed.p).slice();
+	}
 
 	// Same lock as the identity mint, for two reasons: two tabs must not each
 	// mint a scalar and race the write (the loser publishes a public key whose
@@ -1122,13 +1128,36 @@ export async function getOrCreateSealedX25519Secret(
 	const entry = { owner: ownerPublicKeyB64, p };
 	inflightSealed = entry;
 	try {
-		return await p;
+		return (await p).slice();
 	} finally {
 		if (inflightSealed === entry) inflightSealed = null;
 	}
 }
 
+/**
+ * Test seam: run between the IDB read and the IDB write inside the mint.
+ *
+ * The race this exists to gate cannot be reproduced by scheduling. IDB request
+ * APIs return synchronously and completion is dispatched by the implementation's
+ * own loop, so a test has no way to hold one racer between its `load` and its
+ * `save` from outside. Awaiting more turns only changes the odds — which is why
+ * an earlier version of the concurrency test stayed green with the dedup
+ * removed, and said so rather than pretending otherwise.
+ *
+ * Null in production; nothing reads it outside the suite.
+ */
+export const __sealedTestHooks: { betweenLoadAndSave: null | (() => Promise<void>) } = {
+	betweenLoadAndSave: null,
+};
+
 async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
+	// Sampled at entry: a wipe can land while this is awaiting IDB, and a mint
+	// that resumes afterwards must not write its key back. clearDeviceIdentity
+	// nulls the module cache and deletes the row — and then the in-flight mint
+	// would repopulate BOTH, handing the retired identity's key to every later
+	// caller without an IDB read. Found by the mid-flight-wipe test.
+	const epochAtEntry = identityEpochCounter;
+
 	// Re-check under the lock — another tab may have persisted one meanwhile.
 	const cached = cachedSealedX25519;
 	if (cached && cached.owner === owner) return cached.priv.slice();
@@ -1147,10 +1176,20 @@ async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
 		return priv.slice();
 	}
 
+	if (__sealedTestHooks.betweenLoadAndSave) await __sealedTestHooks.betweenLoadAndSave();
+
 	// Absent, untagged (pre-owner-binding), or owned by a retired identity —
 	// all three mean "no scalar for THIS identity", and all three are replaced.
 	const priv = nobleX25519.utils.randomSecretKey();
 	const wrapped = await wrapSecretBytes(wrappingKey, priv);
+
+	// The identity moved while we were minting for the old one. Hand the caller
+	// what it asked for — it is valid for the identity it named — but write
+	// NOTHING: persisting here would resurrect a row clearDeviceIdentity had
+	// just deleted, and caching here would answer every later call with a key
+	// belonging to an identity that no longer exists.
+	if (identityEpochCounter !== epochAtEntry) return priv;
+
 	// Persist BEFORE caching: a caller served from the cache while the write was
 	// still in flight would seal to a key the next session cannot unwrap, and
 	// the peer could never read those messages.

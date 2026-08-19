@@ -94,8 +94,15 @@ const x25519Cache = new WeakMap<DeviceIdentity, { epoch: number; id: X25519Ident
 export async function getOrCreateX25519Identity(
 	identity: DeviceIdentity,
 ): Promise<X25519Identity> {
+	// Sampled ONCE, at entry. Reading the epoch again at write time is a TOCTOU:
+	// a wipe landing inside the await below would bump it, and the retired key
+	// would then be memoised under the POST-wipe epoch — matching forever after,
+	// served from memory with no IDB read, which is exactly what this guard
+	// exists to prevent. clearDeviceIdentity takes no lock, so it interleaves
+	// freely, and it is the one operation where a surviving key is worst.
+	const epochAtEntry = identityEpoch();
 	const cached = x25519Cache.get(identity);
-	if (cached && cached.epoch === identityEpoch()) return cached.id;
+	if (cached && cached.epoch === epochAtEntry) return cached.id;
 
 	// privateKeySeed is the raw 32-byte Ed25519 seed — always available for
 	// W7-P2b1+ identities. Pre-W7-P2b1 identities have privateKeySeed=null and
@@ -130,6 +137,11 @@ export async function getOrCreateX25519Identity(
 
 	const x25519Id: X25519Identity = { priv, pub, selfSig };
 
-	x25519Cache.set(identity, { epoch: identityEpoch(), id: x25519Id });
+	// Returning it is correct either way — the owner check validated the scalar
+	// when it was read. What must not happen is MEMOISING a value the identity
+	// moved out from under mid-flight.
+	if (identityEpoch() === epochAtEntry) {
+		x25519Cache.set(identity, { epoch: epochAtEntry, id: x25519Id });
+	}
 	return x25519Id;
 }
