@@ -452,6 +452,55 @@ describe('getOrCreateX25519Identity uses the persisted scalar', () => {
 		}
 	});
 
+	it('a wipe during the READ path does not repopulate the cache either', async () => {
+		// Sibling of the mid-flight-mint case, on the branch that runs every
+		// session for every existing key — so it is the MORE reachable of the
+		// two, not less. The unwrap still succeeds after clearDeviceIdentity
+		// because the wrapping-key handle is already resolved in memory.
+		if (!ed25519Supported) return;
+
+		// Session 1 persists a key so session 2 takes the read branch.
+		const first = await reload();
+		const id1 = await first.device.getOrCreateDeviceIdentity();
+		const owner = id1.publicKeyB64;
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(owner));
+
+		const second = await reload();
+		await second.device.getOrCreateDeviceIdentity();
+
+		let parked!: () => void;
+		const atSeam = new Promise<void>((r) => {
+			parked = r;
+		});
+		let release!: () => void;
+		const go = new Promise<void>((r) => {
+			release = r;
+		});
+		let fired = false;
+		second.device.__sealedTestHooks.betweenLoadAndSave = async () => {
+			if (fired) return;
+			fired = true;
+			parked();
+			await go;
+		};
+
+		try {
+			const inFlight = second.device.getOrCreateSealedX25519Secret(owner);
+			await atSeam;
+
+			await second.device.clearDeviceIdentity();
+			release();
+			await inFlight;
+
+			// The cache must not now answer for the retired owner.
+			const after = hex(await second.device.getOrCreateSealedX25519Secret(owner));
+			expect(after).not.toBe(before);
+		} finally {
+			second.device.__sealedTestHooks.betweenLoadAndSave = null;
+			release();
+		}
+	});
+
 	it('does not serve a retired identity from the in-memory memo', async () => {
 		// The memo is keyed by the DeviceIdentity OBJECT. A caller still holding
 		// the retired reference would otherwise be handed that identity's sealed

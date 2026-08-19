@@ -1037,7 +1037,13 @@ export async function clearDeviceIdentity(): Promise<void> {
 // ─── Sealed-messaging X25519 secret ──────────────────────────────────────────
 
 /** Cached sealed scalar for this session, with the identity it belongs to. */
-let cachedSealedX25519: { owner: string; priv: Uint8Array } | null = null;
+// The epoch lives IN the value, not in a check at each writer. Three point
+// fixes at three write sites did not converge — the memo write, the mint
+// write-back, and the read branch — because the invariant was being enforced by
+// whoever happened to write. Carried here, a stale entry cannot be served
+// whichever site produced it, and a fourth write site is covered for free.
+// Same move as ownerEd25519PubB64 for the durable copy, one layer in.
+let cachedSealedX25519: { owner: string; epoch: number; priv: Uint8Array } | null = null;
 
 /**
  * Bumped whenever the device identity is wiped or replaced.
@@ -1110,7 +1116,13 @@ export async function getOrCreateSealedX25519Secret(
 	ownerPublicKeyB64: string,
 ): Promise<Uint8Array> {
 	const cached = cachedSealedX25519;
-	if (cached && cached.owner === ownerPublicKeyB64) return cached.priv.slice();
+	if (
+		cached &&
+		cached.owner === ownerPublicKeyB64 &&
+		cached.epoch === identityEpochCounter
+	) {
+		return cached.priv.slice();
+	}
 	// .slice() here too: sealedX25519Inner produces ONE copy, so every caller
 	// awaiting the shared promise would otherwise receive the same Uint8Array
 	// instance — two concurrent X25519Identity objects sharing one `priv`, where
@@ -1160,7 +1172,9 @@ async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
 
 	// Re-check under the lock — another tab may have persisted one meanwhile.
 	const cached = cachedSealedX25519;
-	if (cached && cached.owner === owner) return cached.priv.slice();
+	if (cached && cached.owner === owner && cached.epoch === epochAtEntry) {
+		return cached.priv.slice();
+	}
 
 	const wrappingKey = await getOrCreateWrappingKey();
 
@@ -1170,13 +1184,19 @@ async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
 		existing.ownerEd25519PubB64 === owner &&
 		existing.wrappedPrivateKeyRaw?.byteLength > 0;
 
+	if (__sealedTestHooks.betweenLoadAndSave) await __sealedTestHooks.betweenLoadAndSave();
+
 	if (usable) {
 		const priv = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
-		cachedSealedX25519 = { owner, priv };
+		// Stamped with the epoch this call ENTERED at. A wipe landing during the
+		// unwrap above — two WebCrypto ops, a real window, and the steady-state
+		// path every session takes — would otherwise repopulate the cache with the
+		// retired key after clearDeviceIdentity had just nulled it. The unwrap
+		// still succeeds because the wrapping-key handle is already resolved in
+		// memory, so kekIdb.clear() does not stop it.
+		cachedSealedX25519 = { owner, epoch: epochAtEntry, priv };
 		return priv.slice();
 	}
-
-	if (__sealedTestHooks.betweenLoadAndSave) await __sealedTestHooks.betweenLoadAndSave();
 
 	// Absent, untagged (pre-owner-binding), or owned by a retired identity —
 	// all three mean "no scalar for THIS identity", and all three are replaced.
@@ -1184,10 +1204,11 @@ async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
 	const wrapped = await wrapSecretBytes(wrappingKey, priv);
 
 	// The identity moved while we were minting for the old one. Hand the caller
-	// what it asked for — it is valid for the identity it named — but write
-	// NOTHING: persisting here would resurrect a row clearDeviceIdentity had
-	// just deleted, and caching here would answer every later call with a key
-	// belonging to an identity that no longer exists.
+	// what it asked for — it is valid for the identity it named — but persist
+	// NOTHING: a row written here would resurrect what clearDeviceIdentity just
+	// deleted. Note the consequence: a caller that seals to this scalar produces
+	// something no future session can decrypt. That is correct — there is no
+	// future session for a wiped identity — but it is not obvious.
 	if (identityEpochCounter !== epochAtEntry) return priv;
 
 	// Persist BEFORE caching: a caller served from the cache while the write was
@@ -1198,7 +1219,7 @@ async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
 		ownerEd25519PubB64: owner,
 		wrappedPrivateKeyRaw: wrapped,
 	});
-	cachedSealedX25519 = { owner, priv };
+	cachedSealedX25519 = { owner, epoch: epochAtEntry, priv };
 	return priv.slice();
 }
 
