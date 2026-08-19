@@ -1061,7 +1061,22 @@ let identityEpochCounter = 0;
 export function identityEpoch(): number {
 	return identityEpochCounter;
 }
-let inflightSealed: { owner: string; p: Promise<Uint8Array> } | null = null;
+/**
+ * In-flight dedup slot. Carries the epoch for the same reason cachedSealedX25519
+ * does — a joiner must not be served across an identity change.
+ *
+ * The owner alone is not enough, and the gap is narrow but durable. A mint that
+ * starts at epoch 0 and resumes after a wipe deliberately returns its scalar
+ * WITHOUT persisting it. A second caller still holding the retired identity then
+ * samples the post-wipe epoch at ITS entry, joins this slot, receives that
+ * unpersisted scalar — and because its own entry epoch matches the current one,
+ * x25519-identity.ts memoises it as current for the rest of the session. The
+ * result is the exact state the epoch machinery exists to prevent: a scalar that
+ * lives only until the tab closes, treated as the durable one and publishable.
+ * Every peer sealing to that public key produces something permanently
+ * unreadable.
+ */
+let inflightSealed: { owner: string; epoch: number; p: Promise<Uint8Array> } | null = null;
 
 /**
  * Thrown when the sealed-messaging scalar cannot be PERSISTED: the runtime has
@@ -1164,7 +1179,16 @@ export async function getOrCreateSealedX25519Secret(
 	// awaiting the shared promise would otherwise receive the same Uint8Array
 	// instance — two concurrent X25519Identity objects sharing one `priv`, where
 	// a consumer zeroizing either kills both.
-	if (inflightSealed && inflightSealed.owner === ownerPublicKeyB64) {
+	// The epoch check is what makes joining safe: an entry created before an
+	// identity change is minting for an identity that no longer exists, and its
+	// result was deliberately not persisted. Falling through to a fresh locked
+	// mint is correct — it blocks on the lock the in-flight call holds, then runs
+	// against current state.
+	if (
+		inflightSealed &&
+		inflightSealed.owner === ownerPublicKeyB64 &&
+		inflightSealed.epoch === identityEpochCounter
+	) {
 		return (await inflightSealed.p).slice();
 	}
 
@@ -1174,7 +1198,7 @@ export async function getOrCreateSealedX25519Secret(
 	// is rate-limited to 1/hour by the server, so it does not self-heal), and
 	// getOrCreateWrappingKey below must not run beside an unlocked KEK mint.
 	const p = withIdentityLock(() => sealedX25519Inner(ownerPublicKeyB64));
-	const entry = { owner: ownerPublicKeyB64, p };
+	const entry = { owner: ownerPublicKeyB64, epoch: identityEpochCounter, p };
 	inflightSealed = entry;
 	try {
 		return (await p).slice();

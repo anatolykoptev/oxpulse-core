@@ -392,6 +392,67 @@ describe('concurrency', () => {
 			original,
 		);
 	});
+
+	// The in-flight slot was the last hand-out path without an epoch, and the
+	// consequence is worse than it looks: a mint that resumes after a wipe
+	// deliberately does NOT persist what it minted, so a joiner receives a scalar
+	// that lives only until the tab closes. That joiner sampled the POST-wipe
+	// epoch at its own entry, so x25519-identity.ts then memoises the value as
+	// current — an unpersisted key treated as durable, and publishable. Every
+	// peer sealing to it produces something permanently unreadable.
+	it('a caller joining a mint started BEFORE a wipe is not handed the unpersisted scalar', async () => {
+		if (!ed25519Supported) return;
+
+		const { device } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+		const retiredOwner = identity.publicKeyB64;
+
+		let parked!: () => void;
+		const atSeam = new Promise<void>((r) => {
+			parked = r;
+		});
+		let release!: () => void;
+		const go = new Promise<void>((r) => {
+			release = r;
+		});
+		// One-shot: the joiner's own mint must not park too, or it deadlocks
+		// waiting for a release that only the first racer's path triggers.
+		device.__sealedTestHooks.betweenLoadAndSave = async () => {
+			device.__sealedTestHooks.betweenLoadAndSave = null;
+			parked();
+			await go;
+		};
+
+		try {
+			const first = device.getOrCreateSealedX25519Secret(retiredOwner);
+			await atSeam; // parked between its read and its write
+
+			// The device is erased while that mint is parked.
+			await device.clearDeviceIdentity();
+
+			// A caller still holding the retired DeviceIdentity asks for its key.
+			// Before the fix, owner matched and it joined the in-flight promise.
+			const joiner = device.getOrCreateSealedX25519Secret(retiredOwner);
+
+			release();
+			const firstPriv = await first;
+			const joinerPriv = await joiner;
+
+			// Not the parked mint's scalar — that one was never written.
+			expect(hex(joinerPriv)).not.toBe(hex(firstPriv));
+
+			// The statement that actually matters: what the joiner holds is what a
+			// later session finds on disk. Comparing the two scalars alone would
+			// also pass if the joiner had been handed some other transient value.
+			const reloaded = await reload();
+			expect(hex(await reloaded.device.getOrCreateSealedX25519Secret(retiredOwner))).toBe(
+				hex(joinerPriv),
+			);
+		} finally {
+			device.__sealedTestHooks.betweenLoadAndSave = null;
+			release();
+		}
+	});
 });
 
 describe('getOrCreateX25519Identity uses the persisted scalar', () => {
