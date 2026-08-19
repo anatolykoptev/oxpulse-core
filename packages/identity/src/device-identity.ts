@@ -538,6 +538,7 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 		// replacement is already persisted — but must be visible.
 		cachedX25519Keypair = null;
 		cachedSealedX25519 = null;
+		identityEpochCounter++;
 		cachedProfileSeed = null;
 		hostKeypairCache.clear();
 		try {
@@ -1017,6 +1018,7 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedProfileSeed = null;
 	cachedX25519Keypair = null;
 	cachedSealedX25519 = null;
+	identityEpochCounter++;
 	hostKeypairCache.clear();
 	await idb.delete(DEVICE_KEY_NAME);
 	await idb.delete(DEVICE_PRIV_RAW_NAME);
@@ -1030,6 +1032,135 @@ export async function clearDeviceIdentity(): Promise<void> {
 	await clearRoomHostSeed();
 	await kekIdb.clear();  // new KEK DB
 	track('client.identity_wiped');
+}
+
+// ─── Sealed-messaging X25519 secret ──────────────────────────────────────────
+
+/** Cached sealed scalar for this session, with the identity it belongs to. */
+let cachedSealedX25519: { owner: string; priv: Uint8Array } | null = null;
+
+/**
+ * Bumped whenever the device identity is wiped or replaced.
+ *
+ * Cross-module in-memory caches read this instead of being reached into from
+ * here: x25519-identity.ts memoises per DeviceIdentity OBJECT, so a caller
+ * still holding a retired identity reference would otherwise be served that
+ * identity's sealed key from memory, after the wipe, with no IDB read. An
+ * exported reset would mean device-identity.ts importing x25519-identity.ts,
+ * which imports back — a cycle. A counter the other side polls has no direction.
+ */
+let identityEpochCounter = 0;
+
+/** @see identityEpochCounter */
+export function identityEpoch(): number {
+	return identityEpochCounter;
+}
+let inflightSealed: { owner: string; p: Promise<Uint8Array> } | null = null;
+
+interface StoredSealedX25519 {
+	/** Discriminator. One KEK wraps the Ed25519 seed, the Noise scalar and this
+	 *  one, and all three are 32 bytes — nothing about length could catch a
+	 *  crossed row, so the row says what it is. */
+	kind: 'x25519-sealed-v1';
+	/**
+	 * The identity this scalar belongs to (`DeviceIdentity.publicKeyB64`).
+	 *
+	 * This is the load-bearing field. Without it, "wipe the sealed key on every
+	 * path that changes the identity" is an invariant maintained by remembering
+	 * — and a carried-over key does NOT fail loudly, because self_sig is
+	 * recomputed from whichever seed is current, so the binding still verifies.
+	 * A review enumeration found two paths that had already escaped the three
+	 * explicit deletes: `generateDeviceIdentity()` (exported, wipes nothing) and
+	 * an interrupted `replaceDeviceIdentity`. Checking the owner at the point of
+	 * USE turns that into a fail-safe: a row belonging to anyone else is treated
+	 * as absent and replaced, whatever route left it there.
+	 */
+	ownerEd25519PubB64: string;
+	wrappedPrivateKeyRaw: ArrayBuffer; // AES-KW wrapped raw 32-byte X25519 scalar
+}
+
+/**
+ * Get or create the PERSISTED X25519 secret used for sealed 1:1 messaging.
+ *
+ * Deliberately a separate function from getOrCreateX25519Keypair() rather than
+ * a shared one parameterised by storage name: that function carries S8
+ * downgrade-recovery logic whose whole documented purpose is NOT regenerating
+ * the Noise key ("breaking TOFU trust with all peers"), and it is covered by
+ * __tests__/x25519-tofu-recovery.test.ts. Re-aiming it to serve two callers
+ * would put that recovery path on a refactor it never asked for. The shared
+ * pieces are the private helpers — the wrapping key, the IDB store, and the
+ * aes-kw wrap/unwrap — which is the part worth reusing.
+ *
+ * Returns a COPY of the raw 32-byte scalar. The copy matters: the value is
+ * public API (X25519Identity.priv), and a consumer that zeroizes its buffer
+ * after use — ordinary hygiene — would otherwise corrupt the session key, after
+ * which the next derivation would produce a different public key and sign THAT,
+ * while IDB and the server's registry still hold the original. Silently.
+ *
+ * Noble-only by construction — no WebCrypto branch. The consumer takes
+ * `Uint8Array` (verified: `recipientX25519Priv` in
+ * @oxpulse/crypto-primitives/pairwise-seal.ts), so a non-extractable CryptoKey
+ * could not be passed to it at all.
+ *
+ * @param ownerPublicKeyB64 the live identity's `publicKeyB64`. Passed in rather
+ *   than read via getOrCreateDeviceIdentity() because this runs under the same
+ *   lock that function takes, and Web Locks are not reentrant.
+ */
+export async function getOrCreateSealedX25519Secret(
+	ownerPublicKeyB64: string,
+): Promise<Uint8Array> {
+	const cached = cachedSealedX25519;
+	if (cached && cached.owner === ownerPublicKeyB64) return cached.priv.slice();
+	if (inflightSealed && inflightSealed.owner === ownerPublicKeyB64) return inflightSealed.p;
+
+	// Same lock as the identity mint, for two reasons: two tabs must not each
+	// mint a scalar and race the write (the loser publishes a public key whose
+	// private half no longer exists on the device — and the correcting publish
+	// is rate-limited to 1/hour by the server, so it does not self-heal), and
+	// getOrCreateWrappingKey below must not run beside an unlocked KEK mint.
+	const p = withIdentityLock(() => sealedX25519Inner(ownerPublicKeyB64));
+	const entry = { owner: ownerPublicKeyB64, p };
+	inflightSealed = entry;
+	try {
+		return await p;
+	} finally {
+		if (inflightSealed === entry) inflightSealed = null;
+	}
+}
+
+async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
+	// Re-check under the lock — another tab may have persisted one meanwhile.
+	const cached = cachedSealedX25519;
+	if (cached && cached.owner === owner) return cached.priv.slice();
+
+	const wrappingKey = await getOrCreateWrappingKey();
+
+	const existing = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+	const usable =
+		existing?.kind === 'x25519-sealed-v1' &&
+		existing.ownerEd25519PubB64 === owner &&
+		existing.wrappedPrivateKeyRaw?.byteLength > 0;
+
+	if (usable) {
+		const priv = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
+		cachedSealedX25519 = { owner, priv };
+		return priv.slice();
+	}
+
+	// Absent, untagged (pre-owner-binding), or owned by a retired identity —
+	// all three mean "no scalar for THIS identity", and all three are replaced.
+	const priv = nobleX25519.utils.randomSecretKey();
+	const wrapped = await wrapSecretBytes(wrappingKey, priv);
+	// Persist BEFORE caching: a caller served from the cache while the write was
+	// still in flight would seal to a key the next session cannot unwrap, and
+	// the peer could never read those messages.
+	await idb.save<StoredSealedX25519>(SEALED_X25519_NAME, {
+		kind: 'x25519-sealed-v1',
+		ownerEd25519PubB64: owner,
+		wrappedPrivateKeyRaw: wrapped,
+	});
+	cachedSealedX25519 = { owner, priv };
+	return priv.slice();
 }
 
 // ─── X25519 static keypair (B.2-noise-s-key-derivation) ──────────────────────
@@ -1078,53 +1209,6 @@ let cachedX25519Keypair: X25519KeypairCache | null = null;
  *
  * @returns { publicKey: Uint8Array (32 bytes), privateKey: CryptoKey | null }
  */
-/** Cached sealed-messaging X25519 secret for this session. */
-let cachedSealedX25519: Uint8Array | null = null;
-
-interface StoredSealedX25519 {
-	wrappedPrivateKeyRaw: ArrayBuffer; // AES-KW wrapped raw 32-byte X25519 scalar
-}
-
-/**
- * Get or create the PERSISTED X25519 secret used for sealed 1:1 messaging.
- *
- * Deliberately a separate function from getOrCreateX25519Keypair() rather than
- * a shared one parameterised by storage name: that function carries S8
- * downgrade-recovery logic whose whole documented purpose is NOT regenerating
- * the Noise key ("breaking TOFU trust with all peers"), and it is covered by
- * __tests__/x25519-tofu-recovery.test.ts. Re-aiming it to serve two callers
- * would put that recovery path on a refactor it never asked for. The shared
- * pieces are the private helpers — the wrapping key, the IDB store, and the
- * aes-kw wrap/unwrap — which is the part worth reusing.
- *
- * Returns the raw 32-byte scalar. Idempotent: first call generates and
- * persists, every later call in any session returns the SAME bytes.
- *
- * Noble-only by construction — no WebCrypto branch. The consumer needs raw
- * bytes (see SEALED_X25519_NAME), so a non-extractable CryptoKey would be
- * unusable, and the WebCrypto/noble split that getOrCreateX25519Keypair
- * maintains has no purpose here.
- */
-export async function getOrCreateSealedX25519Secret(): Promise<Uint8Array> {
-	if (cachedSealedX25519) return cachedSealedX25519;
-
-	const wrappingKey = await getOrCreateWrappingKey();
-
-	const existing = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
-	if (existing?.wrappedPrivateKeyRaw && existing.wrappedPrivateKeyRaw.byteLength > 0) {
-		cachedSealedX25519 = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
-		return cachedSealedX25519;
-	}
-
-	const priv = nobleX25519.utils.randomSecretKey();
-	const wrapped = await wrapSecretBytes(wrappingKey, priv);
-	// Persist BEFORE caching: a caller that got the bytes from the cache while
-	// the write was still in flight would seal to a key the next session cannot
-	// unwrap, and the peer would never be able to read those messages.
-	await idb.save<StoredSealedX25519>(SEALED_X25519_NAME, { wrappedPrivateKeyRaw: wrapped });
-	cachedSealedX25519 = priv;
-	return cachedSealedX25519;
-}
 
 export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Array; privateKey: CryptoKey | null }> {
 	if (cachedX25519Keypair) return cachedX25519Keypair;
@@ -1559,6 +1643,7 @@ export async function replaceDeviceIdentity(
 	// pair write so an interrupted restore cannot destroy a decryption key while
 	// leaving the old identity in place.
 	cachedSealedX25519 = null;
+	identityEpochCounter++;
 	await idb.delete(SEALED_X25519_NAME);
 
 	cachedIdentity = null;

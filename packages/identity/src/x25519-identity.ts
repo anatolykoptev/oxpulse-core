@@ -5,7 +5,11 @@
 //   Bound to the Ed25519 identity via a self-sig over "oxp/pkbind/v1" || x25519_pub.
 
 import { x25519, ed25519 } from '@noble/curves/ed25519.js';
-import { getOrCreateSealedX25519Secret, type DeviceIdentity } from './device-identity.js';
+import {
+	getOrCreateSealedX25519Secret,
+	identityEpoch,
+	type DeviceIdentity,
+} from './device-identity.js';
 
 const PKBIND_PREFIX = new TextEncoder().encode('oxp/pkbind/v1');
 
@@ -68,8 +72,14 @@ export function verifyX25519SelfSig(
 // now only a per-session memo over that read — the durable copy is the one on
 // disk, and it is what makes the key publishable at all.
 
-/** Module-scoped cache keyed by DeviceIdentity instance reference. */
-const x25519Cache = new WeakMap<DeviceIdentity, X25519Identity>();
+/**
+ * Module-scoped memo keyed by DeviceIdentity instance reference.
+ *
+ * Guarded by the identity epoch: a caller holding a RETIRED DeviceIdentity
+ * object would otherwise be served that identity's sealed key straight from
+ * memory after a wipe or a replace, never reaching the owner check in IDB.
+ */
+const x25519Cache = new WeakMap<DeviceIdentity, { epoch: number; id: X25519Identity }>();
 
 /**
  * Get or create the X25519 identity associated with the given Ed25519 DeviceIdentity.
@@ -85,7 +95,7 @@ export async function getOrCreateX25519Identity(
 	identity: DeviceIdentity,
 ): Promise<X25519Identity> {
 	const cached = x25519Cache.get(identity);
-	if (cached) return cached;
+	if (cached && cached.epoch === identityEpoch()) return cached.id;
 
 	// privateKeySeed is the raw 32-byte Ed25519 seed — always available for
 	// W7-P2b1+ identities. Pre-W7-P2b1 identities have privateKeySeed=null and
@@ -101,7 +111,11 @@ export async function getOrCreateX25519Identity(
 	// message sealed to the previous one permanently unreadable — and publishing
 	// such a key trips the server's 1-rotation/hour throttle and churns every
 	// peer's TOFU fingerprint. The scalar now comes from IDB, AES-KW wrapped.
-	const priv = await getOrCreateSealedX25519Secret();
+	//
+	// publicKeyB64 is passed so the store can verify the scalar belongs to THIS
+	// identity. That check, not this call site, is what makes a key left behind
+	// by any identity change unusable — including routes with no explicit wipe.
+	const priv = await getOrCreateSealedX25519Secret(identity.publicKeyB64);
 	const pub = x25519.getPublicKey(priv);
 
 	const signedBytes = new Uint8Array(PKBIND_PREFIX.length + 32);
@@ -116,6 +130,6 @@ export async function getOrCreateX25519Identity(
 
 	const x25519Id: X25519Identity = { priv, pub, selfSig };
 
-	x25519Cache.set(identity, x25519Id);
+	x25519Cache.set(identity, { epoch: identityEpoch(), id: x25519Id });
 	return x25519Id;
 }

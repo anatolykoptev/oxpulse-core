@@ -61,6 +61,11 @@ async function reload(): Promise<{
 	};
 }
 
+/** The live identity's publicKeyB64 — the owner the stored scalar is bound to. */
+async function ownerOf(device: DeviceIdentityModule): Promise<string> {
+	return (await device.getOrCreateDeviceIdentity()).publicKeyB64;
+}
+
 function hex(b: Uint8Array): string {
 	return Array.from(b)
 		.map((x) => x.toString(16).padStart(2, '0'))
@@ -73,35 +78,35 @@ afterEach(() => resetIDB());
 describe('sealed X25519 secret persistence', () => {
 	it('returns a 32-byte scalar', async () => {
 		const { device } = await reload();
-		const priv = await device.getOrCreateSealedX25519Secret();
+		const priv = await device.getOrCreateSealedX25519Secret(await ownerOf(device));
 		expect(priv).toBeInstanceOf(Uint8Array);
 		expect(priv.byteLength).toBe(32);
 	});
 
 	it('is idempotent within one session', async () => {
 		const { device } = await reload();
-		const a = await device.getOrCreateSealedX25519Secret();
-		const b = await device.getOrCreateSealedX25519Secret();
+		const a = await device.getOrCreateSealedX25519Secret(await ownerOf(device));
+		const b = await device.getOrCreateSealedX25519Secret(await ownerOf(device));
 		expect(hex(b)).toBe(hex(a));
 	});
 
 	// THE test. Without persistence this returns a different scalar and fails.
 	it('SURVIVES a reload — same scalar after the module cache is dropped', async () => {
 		const first = await reload();
-		const before = hex(await first.device.getOrCreateSealedX25519Secret());
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(await ownerOf(first.device)));
 
 		const second = await reload();
-		const after = hex(await second.device.getOrCreateSealedX25519Secret());
+		const after = hex(await second.device.getOrCreateSealedX25519Secret(await ownerOf(second.device)));
 
 		expect(after).toBe(before);
 	});
 
 	it('the PUBLIC key a peer encrypts to is stable across reloads', async () => {
 		const first = await reload();
-		const pubBefore = hex(x25519.getPublicKey(await first.device.getOrCreateSealedX25519Secret()));
+		const pubBefore = hex(x25519.getPublicKey(await first.device.getOrCreateSealedX25519Secret(await ownerOf(first.device))));
 
 		const second = await reload();
-		const pubAfter = hex(x25519.getPublicKey(await second.device.getOrCreateSealedX25519Secret()));
+		const pubAfter = hex(x25519.getPublicKey(await second.device.getOrCreateSealedX25519Secret(await ownerOf(second.device))));
 
 		expect(pubAfter).toBe(pubBefore);
 	});
@@ -112,13 +117,13 @@ describe('sealed X25519 secret persistence', () => {
 		// must still derive the same one in the next session.
 		const first = await reload();
 		const ourPubBefore = x25519.getPublicKey(
-			await first.device.getOrCreateSealedX25519Secret(),
+			await first.device.getOrCreateSealedX25519Secret(await ownerOf(first.device)),
 		);
 		const senderSk = x25519.utils.randomSecretKey();
 		const senderView = hex(x25519.getSharedSecret(senderSk, ourPubBefore));
 
 		const second = await reload();
-		const ourPrivAfter = await second.device.getOrCreateSealedX25519Secret();
+		const ourPrivAfter = await second.device.getOrCreateSealedX25519Secret(await ownerOf(second.device));
 		const ourView = hex(x25519.getSharedSecret(ourPrivAfter, x25519.getPublicKey(senderSk)));
 
 		expect(ourView).toBe(senderView);
@@ -133,7 +138,7 @@ describe('sealed X25519 secret persistence', () => {
 		// IDB after the user asked to be forgotten is exactly what "forget" is
 		// supposed to mean.
 		const first = await reload();
-		const before = hex(await first.device.getOrCreateSealedX25519Secret());
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(await ownerOf(first.device)));
 
 		const store = createIdbStore({
 			dbName: first.device.IDB_DB_NAME,
@@ -147,7 +152,7 @@ describe('sealed X25519 secret persistence', () => {
 		expect(await store.load(SEALED_KEY_STORAGE_NAME)).toBeFalsy();
 
 		const second = await reload();
-		const after = hex(await second.device.getOrCreateSealedX25519Secret());
+		const after = hex(await second.device.getOrCreateSealedX25519Secret(await ownerOf(second.device)));
 		expect(after).not.toBe(before);
 	});
 
@@ -161,7 +166,7 @@ describe('sealed X25519 secret persistence', () => {
 
 		const first = await reload();
 		await first.device.getOrCreateDeviceIdentity();
-		const before = hex(await first.device.getOrCreateSealedX25519Secret());
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(await ownerOf(first.device)));
 
 		const newSeed = ed25519.utils.randomSecretKey();
 		const newPub = ed25519.getPublicKey(newSeed);
@@ -170,7 +175,7 @@ describe('sealed X25519 secret persistence', () => {
 		await first.device.replaceDeviceIdentity(newSeed, b64u(newPub));
 
 		const second = await reload();
-		const after = hex(await second.device.getOrCreateSealedX25519Secret());
+		const after = hex(await second.device.getOrCreateSealedX25519Secret(await ownerOf(second.device)));
 
 		expect(after).not.toBe(before);
 	});
@@ -180,7 +185,7 @@ describe('sealed X25519 secret persistence', () => {
 		// have to answer; the two keys are separate by construction.
 		if (!ed25519Supported) return;
 		const { device } = await reload();
-		const sealed = x25519.getPublicKey(await device.getOrCreateSealedX25519Secret());
+		const sealed = x25519.getPublicKey(await device.getOrCreateSealedX25519Secret(await ownerOf(device)));
 		const noise = (await device.getOrCreateX25519Keypair()).publicKey;
 		expect(hex(sealed)).not.toBe(hex(noise));
 	});
@@ -192,17 +197,154 @@ describe('sealed X25519 secret persistence', () => {
 		if (!ed25519Supported) return;
 		const first = await reload();
 		const noiseBefore = hex((await first.device.getOrCreateX25519Keypair()).publicKey);
-		await first.device.getOrCreateSealedX25519Secret();
+		await first.device.getOrCreateSealedX25519Secret(await ownerOf(first.device));
 
 		const second = await reload();
-		await second.device.getOrCreateSealedX25519Secret();
+		await second.device.getOrCreateSealedX25519Secret(await ownerOf(second.device));
 		const noiseAfter = hex((await second.device.getOrCreateX25519Keypair()).publicKey);
 
 		expect(noiseAfter).toBe(noiseBefore);
 	});
 });
 
+describe('the owner binding is what makes wipe-completeness fail-safe', () => {
+	// Three explicit deletes are three places to remember. A carried-over key
+	// does NOT fail loudly — self_sig is recomputed from whichever seed is
+	// current, so the binding still verifies and the key simply outlives the
+	// identity that owned it. These cases assert the property at the point of
+	// USE, which holds no matter which route left the row behind.
+
+	it('a row belonging to another identity is replaced, not used', async () => {
+		if (!ed25519Supported) return;
+
+		const first = await reload();
+		const id1 = await first.device.getOrCreateDeviceIdentity();
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(id1.publicKeyB64));
+
+		// A DIFFERENT identity asks for its scalar while that row is still there.
+		const second = await reload();
+		const otherOwner = 'a'.repeat(43);
+		const after = hex(await second.device.getOrCreateSealedX25519Secret(otherOwner));
+
+		expect(after).not.toBe(before);
+	});
+
+	it('generateDeviceIdentity leaves a row behind, and it is not served', async () => {
+		// generateDeviceIdentity is exported and wipes nothing — a consumer
+		// calling it to "start fresh" would, without the owner check, be handed
+		// the previous identity's decryption key.
+		if (!ed25519Supported) return;
+
+		const first = await reload();
+		const id1 = await first.device.getOrCreateDeviceIdentity();
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(id1.publicKeyB64));
+
+		const fresh = await first.device.generateDeviceIdentity();
+		const after = hex(await first.device.getOrCreateSealedX25519Secret(fresh.publicKeyB64));
+
+		expect(after).not.toBe(before);
+	});
+
+	it('an untagged legacy row is replaced rather than trusted', async () => {
+		// Rows written before the discriminator existed carry no `kind`. One KEK
+		// wraps the Ed25519 seed, the Noise scalar and this one — all 32 bytes —
+		// so nothing about length could catch a crossed row.
+		const store = createIdbStore({ dbName: 'oxpulse-device-id', storeName: 'identity' });
+		const first = await reload();
+		const id1 = await first.device.getOrCreateDeviceIdentity();
+		const before = hex(await first.device.getOrCreateSealedX25519Secret(id1.publicKeyB64));
+
+		const row = (await store.load(SEALED_KEY_STORAGE_NAME)) as Record<string, unknown>;
+		delete row.kind;
+		await store.save(SEALED_KEY_STORAGE_NAME, row);
+
+		const second = await reload();
+		const after = hex(await second.device.getOrCreateSealedX25519Secret(id1.publicKeyB64));
+
+		expect(after).not.toBe(before);
+	});
+});
+
+describe('concurrency', () => {
+	// HONEST SCOPE: this asserts the observable outcome, and it does NOT gate the
+	// in-flight dedup. Removing the dedup leaves it green, because these racers
+	// converge for a second reason — they await the wrapping key first, so by the
+	// time the later ones reach `idb.load` the first has usually already written,
+	// and they read its row instead of minting. The dedup closes the window that
+	// remains when that ordering does not hold (a slower write, a real Web Lock
+	// across tabs), which single-process fake-indexeddb cannot reproduce on
+	// demand. Kept because the outcome is worth pinning; not claimed as the gate.
+	it('two concurrent callers get ONE scalar and leave ONE row', async () => {
+		if (!ed25519Supported) return;
+
+		const { device } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+
+		const [a, b, c] = await Promise.all([
+			device.getOrCreateSealedX25519Secret(identity.publicKeyB64),
+			device.getOrCreateSealedX25519Secret(identity.publicKeyB64),
+			device.getOrCreateSealedX25519Secret(identity.publicKeyB64),
+		]);
+
+		expect(hex(b)).toBe(hex(a));
+		expect(hex(c)).toBe(hex(a));
+
+		// And the persisted row is the one they all hold.
+		const reloaded = await reload();
+		const onDisk = hex(await reloaded.device.getOrCreateSealedX25519Secret(identity.publicKeyB64));
+		expect(onDisk).toBe(hex(a));
+	});
+
+	it('returns a COPY — a caller zeroizing its buffer cannot corrupt the session key', async () => {
+		// The value is public API (X25519Identity.priv). A consumer that wipes it
+		// after use — ordinary hygiene — must not corrupt the cached scalar: the
+		// next derivation would produce a DIFFERENT public key and sign that one,
+		// while IDB and the server's registry still hold the original. Silently.
+		//
+		// Both return paths are exercised: the first call misses the cache and
+		// returns from the store, the second and third are cache hits. Zeroing
+		// after each is what makes a shared reference on EITHER path show up.
+		if (!ed25519Supported) return;
+		const { device } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+
+		const first = await device.getOrCreateSealedX25519Secret(identity.publicKeyB64);
+		const original = hex(first);
+		expect(original).not.toBe('00'.repeat(32));
+		first.fill(0);
+
+		const second = await device.getOrCreateSealedX25519Secret(identity.publicKeyB64);
+		expect(hex(second)).toBe(original);
+		second.fill(0);
+
+		const third = await device.getOrCreateSealedX25519Secret(identity.publicKeyB64);
+		expect(hex(third)).toBe(original);
+
+		// And the durable copy is untouched by any of it.
+		const reloaded = await reload();
+		expect(hex(await reloaded.device.getOrCreateSealedX25519Secret(identity.publicKeyB64))).toBe(
+			original,
+		);
+	});
+});
+
 describe('getOrCreateX25519Identity uses the persisted scalar', () => {
+	it('does not serve a retired identity from the in-memory memo', async () => {
+		// The memo is keyed by the DeviceIdentity OBJECT. A caller still holding
+		// the retired reference would otherwise be handed that identity's sealed
+		// key from memory, after the wipe, without an IDB read.
+		if (!ed25519Supported) return;
+
+		const { device, x25519Id } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+		const before = await x25519Id.getOrCreateX25519Identity(identity);
+
+		await device.clearDeviceIdentity();
+
+		const after = await x25519Id.getOrCreateX25519Identity(identity);
+		expect(hex(after.pub)).not.toBe(hex(before.pub));
+	});
+
 	it('reports the same public key and self_sig across reloads', async () => {
 		if (!ed25519Supported) return;
 
