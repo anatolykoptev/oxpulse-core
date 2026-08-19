@@ -746,6 +746,94 @@ describe('replacing an identity with ITSELF keeps the key', () => {
 	});
 });
 
+describe('a key minted DURING a restore must not outlive the restore', () => {
+	// replaceDeviceIdentity takes no lock and leaves cachedIdentity null, so a
+	// component calling for the just-restored identity can run between the
+	// cleanup's load and its delete — two awaited IDB round trips. It mints,
+	// persists a row for the restored owner (the live-identity guard cannot
+	// refuse it while cachedIdentity is null), and the delete then removes that
+	// brand-new row.
+	//
+	// With the epoch bumped BEFORE the cleanup, that mint's cache entry stayed
+	// valid for the whole session: the app would keep handing out and publishing
+	// a scalar with no durable copy — exactly what SealedKeyUnavailableError
+	// exists to make unrepresentable, and unreadable to every peer after the
+	// next reload.
+	//
+	// The interleave is forced at the STORE boundary, not through
+	// __sealedTestHooks: that seam sits inside sealedX25519Mint, and the
+	// restore's cleanup does its own load/delete without going through it. A
+	// first version of this test used that seam, never entered the window at
+	// all, and stayed green with the fix reverted.
+	it('a scalar handed out mid-restore is not still served after it', async () => {
+		if (!ed25519Supported) return;
+
+		const { vi } = await import('vitest');
+		vi.resetModules();
+
+		// Fires ONCE, right after a read of the sealed row returns — which is
+		// exactly where the restore's cleanup sits when it decides to delete.
+		let onSealedRead: null | (() => Promise<unknown>) = null;
+		vi.doMock('../idb-store.js', async () => {
+			const actual = await vi.importActual<typeof import('../idb-store.js')>('../idb-store.js');
+			return {
+				...actual,
+				createIdbStore: (opts: Parameters<typeof actual.createIdbStore>[0]) => {
+					const real = actual.createIdbStore(opts);
+					return {
+						...real,
+						load: async <T,>(key: string): Promise<T | null> => {
+							const value = await real.load<T>(key);
+							if (key === SEALED_KEY_STORAGE_NAME && onSealedRead) {
+								const fire = onSealedRead;
+								onSealedRead = null; // one-shot: the mint below reads too
+								await fire();
+							}
+							return value;
+						},
+					};
+				},
+			};
+		});
+
+		try {
+			const device = (await import('../device-identity.js')) as DeviceIdentityModule;
+			const old = await device.getOrCreateDeviceIdentity();
+			await device.getOrCreateSealedX25519Secret(old.publicKeyB64);
+
+			const newSeed = ed25519.utils.randomSecretKey();
+			const newPub = ed25519.getPublicKey(newSeed);
+			const b64u = (b: Uint8Array) =>
+				btoa(String.fromCharCode(...b))
+					.replace(/\+/g, '-')
+					.replace(/\//g, '_')
+					.replace(/=+$/, '');
+			const restoredOwner = b64u(newPub);
+
+			// Armed only now, so the setup reads above do not consume it.
+			onSealedRead = () => device.getOrCreateSealedX25519Secret(restoredOwner);
+
+			await device.replaceDeviceIdentity(newSeed, restoredOwner);
+
+			// What this session hands out must be what the next session finds.
+			// Stated this way on purpose: comparing against the mid-flight value
+			// instead would pass whenever the race simply did not occur.
+			const served = hex(await device.getOrCreateSealedX25519Secret(restoredOwner));
+
+			vi.doUnmock('../idb-store.js');
+			vi.resetModules();
+			const after = (await import('../device-identity.js')) as DeviceIdentityModule;
+			const onDisk = hex(await after.getOrCreateSealedX25519Secret(restoredOwner));
+
+			expect(served).toBe(onDisk);
+		} finally {
+			onSealedRead = null;
+			vi.doUnmock('../idb-store.js');
+			vi.resetModules();
+		}
+	});
+});
+
 describe('a restore that already succeeded must not report failure', () => {
 	// The residue cleanup runs AFTER the seed/pubkey pair has landed. Before it
 	// existed, replaceDeviceIdentity could not fail once it had succeeded; the

@@ -1817,9 +1817,7 @@ export async function replaceDeviceIdentity(
 	// deleted deliberately rather than left to fail loudly. Ordered AFTER the
 	// pair write so an interrupted restore cannot destroy a decryption key while
 	// leaving the old identity in place.
-	cachedSealedX25519 = null;
-	identityEpochCounter++;
-
+	//
 	// Deleted only when the identity actually CHANGED. Restoring your own backup
 	// onto a device that already holds that identity is a real and ordinary
 	// action, and an unconditional delete there destroys a key that is still
@@ -1852,6 +1850,29 @@ export async function replaceDeviceIdentity(
 			error_class: classifyIdentityError(e, 'unwrap'),
 		});
 	}
+
+	// INVALIDATION LAST, and the order is the whole point.
+	//
+	// This function takes no lock, and `cachedIdentity` is null throughout, so a
+	// component calling getOrCreateX25519Identity for the just-restored identity
+	// can run between the load and the delete above — two awaited IDB round
+	// trips. It reads the OLD owner's row, judges it foreign, mints, and (with
+	// cachedIdentity null, so the live-identity guard cannot refuse it) persists
+	// a row for the RESTORED owner. The delete above, decided from the earlier
+	// read, then removes that brand-new row.
+	//
+	// With the epoch bumped BEFORE the cleanup, that mint's cache entry stayed
+	// valid for the rest of the session: the app would keep handing out — and
+	// publishing — a scalar with no durable copy, which is precisely the state
+	// SealedKeyUnavailableError exists to make unrepresentable. Everything peers
+	// sealed to it would be unreadable after the next reload.
+	//
+	// Bumping the epoch as the LAST mutation makes the window self-healing
+	// instead: anything minted inside it is invalidated by definition, so the
+	// next caller re-reads IDB, finds nothing, and mints and persists again. One
+	// wasted mint, and no undurable key can survive.
+	cachedSealedX25519 = null;
+	identityEpochCounter++;
 
 	cachedIdentity = null;
 }
