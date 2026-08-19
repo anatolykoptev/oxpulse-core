@@ -54,6 +54,24 @@ const DEVICE_PRIV_RAW_NAME = 'oxp/identity/ed25519-priv-raw'; // DO NOT RENAME a
 // New key — existing users get a fresh X25519 keypair on first B.2 boot.
 // NOT load-bearing for Ed25519 signing identity — safe to rename/regenerate.
 const X25519_KEYPAIR_NAME = 'x25519-keypair-v1';
+// Sealed-messaging X25519 secret (pairwise 1:1 chat). SEPARATE from the Noise
+// static key above, deliberately: sharing one static DH key across two
+// protocols is a cross-protocol-reuse question nobody should have to defend,
+// and the two have different lifetimes anyway.
+//
+// This key is what a peer encrypts to, so LOSING it makes every message sealed
+// to it permanently unreadable. It used to live only in a WeakMap in
+// x25519-identity.ts (FOLLOWUP T0.5b), so it was regenerated on every page
+// load: each session published a different public key, every peer saw a TOFU
+// fingerprint change, and anything sealed to the previous key was already
+// undecryptable by the time it arrived. That is why sealed 1:1 could never be
+// enrolled — publishing an ephemeral key is worse than publishing none.
+//
+// Stored as the raw 32-byte scalar, AES-KW wrapped with the same wrapping key
+// as the Ed25519 seed. Raw rather than a non-extractable CryptoKey because the
+// consumer (sealMessage / openMessage in @oxpulse/crypto-primitives) takes
+// Uint8Array — a WebCrypto handle could not be passed to it at all.
+const SEALED_X25519_NAME = 'x25519-sealed-v1'; // DO NOT RENAME after first user
 
 // LOAD-BEARING: IDB database + store name used by all installed users. NEVER rename.
 // See identity-extraction-adr.md §3.4 and __tests__/storage-keys.test.ts.
@@ -519,10 +537,19 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 		// for the profile seed). Deletion failures are survivable — the
 		// replacement is already persisted — but must be visible.
 		cachedX25519Keypair = null;
+		cachedSealedX25519 = null;
 		cachedProfileSeed = null;
 		hostKeypairCache.clear();
 		try {
 			await idb.delete(X25519_KEYPAIR_NAME);
+			// The sealed key is the RETIRED identity's decryption key. Its
+			// self_sig would still verify — that is recomputed from whichever
+			// seed is current — so nothing would look broken; the key would
+			// simply follow the user across an identity change it was supposed
+			// to be severed by. Peers pinned that public key against the OLD
+			// user_id, and a replacement exists precisely to break that
+			// continuity, so the scalar goes with the identity that owned it.
+			await idb.delete(SEALED_X25519_NAME);
 			await idb.delete(PROFILE_SEED_NAME);
 			await clearRoomHostSeed();
 		} catch (e) {
@@ -989,12 +1016,14 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedWrappingKey = null;
 	cachedProfileSeed = null;
 	cachedX25519Keypair = null;
+	cachedSealedX25519 = null;
 	hostKeypairCache.clear();
 	await idb.delete(DEVICE_KEY_NAME);
 	await idb.delete(DEVICE_PRIV_RAW_NAME);
 	await idb.delete(WRAPPING_KEY_NAME);  // old entry — kept by migration, cleared on explicit forget
 	await idb.delete(PROFILE_SEED_NAME);
 	await idb.delete(X25519_KEYPAIR_NAME);
+	await idb.delete(SEALED_X25519_NAME);
 	// Same rationale as the profile seed: the room-host seed derives every
 	// per-room host signing key, so a forgotten device must not keep host
 	// authority over rooms the retired identity hosted (SEC-CR-004).
@@ -1049,6 +1078,54 @@ let cachedX25519Keypair: X25519KeypairCache | null = null;
  *
  * @returns { publicKey: Uint8Array (32 bytes), privateKey: CryptoKey | null }
  */
+/** Cached sealed-messaging X25519 secret for this session. */
+let cachedSealedX25519: Uint8Array | null = null;
+
+interface StoredSealedX25519 {
+	wrappedPrivateKeyRaw: ArrayBuffer; // AES-KW wrapped raw 32-byte X25519 scalar
+}
+
+/**
+ * Get or create the PERSISTED X25519 secret used for sealed 1:1 messaging.
+ *
+ * Deliberately a separate function from getOrCreateX25519Keypair() rather than
+ * a shared one parameterised by storage name: that function carries S8
+ * downgrade-recovery logic whose whole documented purpose is NOT regenerating
+ * the Noise key ("breaking TOFU trust with all peers"), and it is covered by
+ * __tests__/x25519-tofu-recovery.test.ts. Re-aiming it to serve two callers
+ * would put that recovery path on a refactor it never asked for. The shared
+ * pieces are the private helpers — the wrapping key, the IDB store, and the
+ * aes-kw wrap/unwrap — which is the part worth reusing.
+ *
+ * Returns the raw 32-byte scalar. Idempotent: first call generates and
+ * persists, every later call in any session returns the SAME bytes.
+ *
+ * Noble-only by construction — no WebCrypto branch. The consumer needs raw
+ * bytes (see SEALED_X25519_NAME), so a non-extractable CryptoKey would be
+ * unusable, and the WebCrypto/noble split that getOrCreateX25519Keypair
+ * maintains has no purpose here.
+ */
+export async function getOrCreateSealedX25519Secret(): Promise<Uint8Array> {
+	if (cachedSealedX25519) return cachedSealedX25519;
+
+	const wrappingKey = await getOrCreateWrappingKey();
+
+	const existing = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+	if (existing?.wrappedPrivateKeyRaw && existing.wrappedPrivateKeyRaw.byteLength > 0) {
+		cachedSealedX25519 = await unwrapSecretBytes(wrappingKey, existing.wrappedPrivateKeyRaw);
+		return cachedSealedX25519;
+	}
+
+	const priv = nobleX25519.utils.randomSecretKey();
+	const wrapped = await wrapSecretBytes(wrappingKey, priv);
+	// Persist BEFORE caching: a caller that got the bytes from the cache while
+	// the write was still in flight would seal to a key the next session cannot
+	// unwrap, and the peer would never be able to read those messages.
+	await idb.save<StoredSealedX25519>(SEALED_X25519_NAME, { wrappedPrivateKeyRaw: wrapped });
+	cachedSealedX25519 = priv;
+	return cachedSealedX25519;
+}
+
 export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Array; privateKey: CryptoKey | null }> {
 	if (cachedX25519Keypair) return cachedX25519Keypair;
 
@@ -1473,6 +1550,16 @@ export async function replaceDeviceIdentity(
 			wrappedPrivateKey,
 		}],
 	]);
+
+	// The sealed-messaging scalar belongs to the identity being REPLACED: peers
+	// pinned its public key against the outgoing user_id. Carrying it forward
+	// would not look broken — self_sig is recomputed from whichever seed is
+	// current, so the binding still verifies — which is exactly why it has to be
+	// deleted deliberately rather than left to fail loudly. Ordered AFTER the
+	// pair write so an interrupted restore cannot destroy a decryption key while
+	// leaving the old identity in place.
+	cachedSealedX25519 = null;
+	await idb.delete(SEALED_X25519_NAME);
 
 	cachedIdentity = null;
 }

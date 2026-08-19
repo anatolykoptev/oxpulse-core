@@ -5,7 +5,7 @@
 //   Bound to the Ed25519 identity via a self-sig over "oxp/pkbind/v1" || x25519_pub.
 
 import { x25519, ed25519 } from '@noble/curves/ed25519.js';
-import type { DeviceIdentity } from './device-identity.js';
+import { getOrCreateSealedX25519Secret, type DeviceIdentity } from './device-identity.js';
 
 const PKBIND_PREFIX = new TextEncoder().encode('oxp/pkbind/v1');
 
@@ -63,10 +63,10 @@ export function verifyX25519SelfSig(
 
 // ─── Session-level X25519 identity cache ─────────────────────────────────────
 //
-// FOLLOWUP(T0.5b): persist X25519 keypair to IDB with same AES-KW wrap pattern
-// as Ed25519 (device-identity.ts). For now, in-memory generation on first call
-// per session is functionally correct for Phase 2 testing. Persistence requires
-// extending the IDB schema without stranding existing users' identities.
+// T0.5b DONE: the scalar is persisted in IDB, AES-KW wrapped, by
+// getOrCreateSealedX25519Secret() in device-identity.ts. The WeakMap below is
+// now only a per-session memo over that read — the durable copy is the one on
+// disk, and it is what makes the key publishable at all.
 
 /** Module-scoped cache keyed by DeviceIdentity instance reference. */
 const x25519Cache = new WeakMap<DeviceIdentity, X25519Identity>();
@@ -74,10 +74,10 @@ const x25519Cache = new WeakMap<DeviceIdentity, X25519Identity>();
 /**
  * Get or create the X25519 identity associated with the given Ed25519 DeviceIdentity.
  *
- * FOLLOWUP(T0.5b): currently in-memory only — regenerated on each page load.
- * Persistence to IDB is deferred. The TOFU store (T9) compensates: recipients
- * see a new fingerprint on each session, triggering the "key changed" warn-and-send
- * path. This is acceptable for Phase 2 (decision #5 — warn, don't block).
+ * The keypair is PERSISTED (IDB, AES-KW wrapped) as of T0.5b, so the public key
+ * is stable across sessions and reloads. Before that it was regenerated per
+ * page load, which is why the TOFU store saw a new fingerprint every session
+ * and why the key could never be published to the server's registry.
  *
  * Idempotent within a session: multiple calls return the same keypair.
  */
@@ -87,32 +87,34 @@ export async function getOrCreateX25519Identity(
 	const cached = x25519Cache.get(identity);
 	if (cached) return cached;
 
-	// Generate fresh X25519 keypair and self-sign with @noble/curves ed25519.
 	// privateKeySeed is the raw 32-byte Ed25519 seed — always available for
-	// W7-P2b1+ identities (which include all new enrollments after the noble-universal
-	// swap). Pre-W7-P2b1 identities have privateKeySeed=null and cannot produce
-	// a self-sig — they show a migration banner instead.
-	//
-	// Previously this path called crypto.subtle.sign() with identity.privateKey
-	// (CryptoKey). That is now unnecessary: noble ed25519.sign() works on all
-	// runtimes including HyperOS/HarmonyOS where WebCrypto Ed25519 is absent,
-	// and produces byte-identical signatures. The workaround comment is removed.
+	// W7-P2b1+ identities. Pre-W7-P2b1 identities have privateKeySeed=null and
+	// cannot produce a self-sig; they show a migration banner instead. Signing
+	// goes through noble, which works on runtimes where WebCrypto Ed25519 is
+	// absent (HyperOS/HarmonyOS) and is byte-identical where it is present.
 	if (!identity.privateKeySeed) {
 		throw new Error('[x25519-identity] getOrCreateX25519Identity: privateKeySeed null — identity migration required');
 	}
-	const kp = x25519.keygen();
+
+	// PERSISTED, not generated per session (T0.5b, done). A peer encrypts to
+	// this public key, so a key that changes on every page load makes every
+	// message sealed to the previous one permanently unreadable — and publishing
+	// such a key trips the server's 1-rotation/hour throttle and churns every
+	// peer's TOFU fingerprint. The scalar now comes from IDB, AES-KW wrapped.
+	const priv = await getOrCreateSealedX25519Secret();
+	const pub = x25519.getPublicKey(priv);
 
 	const signedBytes = new Uint8Array(PKBIND_PREFIX.length + 32);
 	signedBytes.set(PKBIND_PREFIX, 0);
-	signedBytes.set(kp.publicKey, PKBIND_PREFIX.length);
+	signedBytes.set(pub, PKBIND_PREFIX.length);
 
+	// Recomputed rather than stored: Ed25519 signing is deterministic (RFC 8032
+	// §5.1.6 derives the nonce from the key and message), so this reproduces the
+	// same 64 bytes every session — and storing a signature next to the key it
+	// signs only adds a way for the two to disagree.
 	const selfSig = ed25519.sign(signedBytes, identity.privateKeySeed.bytes());
 
-	const x25519Id: X25519Identity = {
-		priv: kp.secretKey,
-		pub: kp.publicKey,
-		selfSig,
-	};
+	const x25519Id: X25519Identity = { priv, pub, selfSig };
 
 	x25519Cache.set(identity, x25519Id);
 	return x25519Id;
