@@ -664,6 +664,88 @@ describe('getOrCreateX25519Identity uses the persisted scalar', () => {
  * So the contract is a typed refusal, and what these pin is that there is no
  * value for a caller to publish by accident.
  */
+describe('a stale caller cannot damage the live identity', () => {
+	// The single storage slot is discriminated only by its owner tag, and the
+	// mint path treats a foreign row as absent and replaces it. So the owner
+	// check protected READS and nothing protected writes — while this PR's whole
+	// premise is that callers holding retired identities exist.
+	it('a retired identity minting AFTER a wipe does not overwrite the live key', async () => {
+		if (!ed25519Supported) return;
+
+		const { device } = await reload();
+
+		// Identity A enrolls and persists.
+		const a = await device.getOrCreateDeviceIdentity();
+		const retiredOwner = a.publicKeyB64;
+		await device.getOrCreateSealedX25519Secret(retiredOwner);
+
+		// A is discarded; B becomes the live identity and persists its own key.
+		await device.clearDeviceIdentity();
+		const b = await device.getOrCreateDeviceIdentity();
+		const liveKey = hex(await device.getOrCreateSealedX25519Secret(b.publicKeyB64));
+
+		// A component still holding A asks for A's key. The epoch has long since
+		// settled, so the mid-flight guard cannot see this one.
+		await device.getOrCreateSealedX25519Secret(retiredOwner);
+
+		// B's key must be untouched — in memory AND on disk. Checking only the
+		// in-memory value would pass while the row was already clobbered.
+		expect(hex(await device.getOrCreateSealedX25519Secret(b.publicKeyB64))).toBe(liveKey);
+
+		const reloaded = await reload();
+		expect(hex(await reloaded.device.getOrCreateSealedX25519Secret(b.publicKeyB64))).toBe(liveKey);
+	});
+});
+
+describe('replacing an identity with ITSELF keeps the key', () => {
+	// Re-importing your own backup onto a device that already holds that identity
+	// is ordinary. An unconditional delete there throws away a key that is still
+	// correct: peers have it pinned, the registry has it published, and every
+	// message already sealed to it becomes unreadable — with the replacement
+	// throttled to one rotation per hour.
+	it('a same-identity restore preserves the sealed scalar', async () => {
+		if (!ed25519Supported) return;
+
+		const { device } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+		const before = hex(await device.getOrCreateSealedX25519Secret(identity.publicKeyB64));
+
+		// Round-trips the identity through the real export/restore pair — the
+		// same path the backup-restore UI takes.
+		const exported = await device.exportRawDeviceSecret();
+		expect(exported.publicB64u).toBe(identity.publicKeyB64);
+		await device.replaceDeviceIdentity(exported.secret, exported.publicB64u);
+
+		const after = await device.getOrCreateDeviceIdentity();
+		expect(after.publicKeyB64).toBe(identity.publicKeyB64);
+		expect(hex(await device.getOrCreateSealedX25519Secret(after.publicKeyB64))).toBe(before);
+	});
+
+	it('but a restore of a DIFFERENT identity still severs the old key', async () => {
+		// The guard must not soften the severance it was carved out of.
+		if (!ed25519Supported) return;
+
+		const { device } = await reload();
+		const first = await device.getOrCreateDeviceIdentity();
+		const firstKey = hex(await device.getOrCreateSealedX25519Secret(first.publicKeyB64));
+
+		// A DIFFERENT identity, exported elsewhere and imported over the top.
+		// Captured before the wipe restores `first`, so the two really differ.
+		await device.clearDeviceIdentity();
+		await device.getOrCreateDeviceIdentity();
+		const other = await device.exportRawDeviceSecret();
+		expect(other.publicB64u).not.toBe(first.publicKeyB64);
+
+		const back = await reload();
+		await back.device.replaceDeviceIdentity(other.secret, other.publicB64u);
+
+		const live = await back.device.getOrCreateDeviceIdentity();
+		expect(hex(await back.device.getOrCreateSealedX25519Secret(live.publicKeyB64))).not.toBe(
+			firstKey,
+		);
+	});
+});
+
 describe('sealed X25519 secret when IndexedDB is unavailable', () => {
 	let realIDB: IDBFactory | undefined;
 

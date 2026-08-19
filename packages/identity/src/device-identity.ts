@@ -1308,6 +1308,24 @@ async function sealedX25519Mint(owner: string): Promise<Uint8Array> {
 	// future session for a wiped identity — but it is not obvious.
 	if (identityEpochCounter !== epochAtEntry) return priv;
 
+	// The same refusal, for the case the epoch cannot see: a caller still holding
+	// a RETIRED identity that starts its mint AFTER the wipe has settled. Its
+	// entry epoch equals the current one, so the guard above passes.
+	//
+	// The row is a single slot discriminated only by its owner tag, and the mint
+	// path treats a foreign row as absent and replaces it — so the owner check
+	// protects READS and nothing protected writes. A stale component could
+	// therefore overwrite the LIVE identity's scalar with one of its own, and the
+	// live identity's next call would find a foreign row, mint again, and publish
+	// a different public key. Everything peers had already sealed to the old one
+	// would be unreadable, and the correction is throttled to 1/hour.
+	//
+	// `cachedIdentity` is the live identity by definition — it is what
+	// getOrCreateDeviceIdentity resolved and what clearDeviceIdentity nulls. Null
+	// means no identity is loaded and there is nothing live to overwrite.
+	const live = cachedIdentity;
+	if (live && live.publicKeyB64 !== owner) return priv;
+
 	// Persist BEFORE caching: a caller served from the cache while the write was
 	// still in flight would seal to a key the next session cannot unwrap, and
 	// the peer could never read those messages.
@@ -1801,7 +1819,22 @@ export async function replaceDeviceIdentity(
 	// leaving the old identity in place.
 	cachedSealedX25519 = null;
 	identityEpochCounter++;
-	await idb.delete(SEALED_X25519_NAME);
+
+	// Deleted only when the identity actually CHANGED. Restoring your own backup
+	// onto a device that already holds that identity is a real and ordinary
+	// action, and an unconditional delete there destroys a key that is still
+	// correct — peers have it pinned, the registry has it published, and every
+	// message already sealed to it becomes unreadable. The replacement key then
+	// has to go out under the 1-rotation/hour throttle.
+	//
+	// Nothing is lost by the guard: when the owner differs, the delete was
+	// already redundant, because the owner tag on the row makes a foreign key
+	// unusable at the point of USE. That check is what carries the severance
+	// semantics; this delete only tidies up after it.
+	const existingSealed = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+	if (existingSealed && existingSealed.ownerEd25519PubB64 !== publicB64u) {
+		await idb.delete(SEALED_X25519_NAME);
+	}
 
 	cachedIdentity = null;
 }
