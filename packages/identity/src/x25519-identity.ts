@@ -82,6 +82,27 @@ export function verifyX25519SelfSig(
 const x25519Cache = new WeakMap<DeviceIdentity, { epoch: number; id: X25519Identity }>();
 
 /**
+ * A fresh object with fresh buffers on every hand-out.
+ *
+ * getOrCreateSealedX25519Secret already returns a COPY of the scalar precisely
+ * so a consumer zeroizing its buffer after use — ordinary hygiene — cannot
+ * corrupt the session key. That guarantee stopped one layer short of the public
+ * entry point: the memo holds ONE X25519Identity, and returning that same object
+ * reference to every caller meant wiping `id.priv` left the memo holding 32 zero
+ * bytes while `pub` and `selfSig` still described the original key. Every later
+ * caller in the session then derived a wrong DH, with the stored and published
+ * key unchanged and nothing anywhere surfacing the mismatch.
+ *
+ * `pub` and `selfSig` are copied too. They are public values, so no secret
+ * hygiene applies — but the hazard is a consumer mutating what it was handed,
+ * and a guarantee that covers one field of three is the harder one to reason
+ * about at the call site.
+ */
+function handOut(id: X25519Identity): X25519Identity {
+	return { priv: id.priv.slice(), pub: id.pub.slice(), selfSig: id.selfSig.slice() };
+}
+
+/**
  * Get or create the X25519 identity associated with the given Ed25519 DeviceIdentity.
  *
  * The keypair is PERSISTED (IDB, AES-KW wrapped) as of T0.5b, so the public key
@@ -102,7 +123,7 @@ export async function getOrCreateX25519Identity(
 	// freely, and it is the one operation where a surviving key is worst.
 	const epochAtEntry = identityEpoch();
 	const cached = x25519Cache.get(identity);
-	if (cached && cached.epoch === epochAtEntry) return cached.id;
+	if (cached && cached.epoch === epochAtEntry) return handOut(cached.id);
 
 	// privateKeySeed is the raw 32-byte Ed25519 seed — always available for
 	// W7-P2b1+ identities. Pre-W7-P2b1 identities have privateKeySeed=null and
@@ -143,5 +164,8 @@ export async function getOrCreateX25519Identity(
 	if (identityEpoch() === epochAtEntry) {
 		x25519Cache.set(identity, { epoch: epochAtEntry, id: x25519Id });
 	}
-	return x25519Id;
+	// handOut here too: x25519Id is the object the memo now holds, so returning
+	// it directly would hand the first caller the memo's own buffers and reopen
+	// the hole for exactly one call — the one that minted the key.
+	return handOut(x25519Id);
 }

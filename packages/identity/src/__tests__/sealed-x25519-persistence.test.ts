@@ -551,4 +551,151 @@ describe('getOrCreateX25519Identity uses the persisted scalar', () => {
 		const sealed = await x25519Id.getOrCreateX25519Identity(identity);
 		expect(hex(sealed.pub)).toBe(hex(x25519.getPublicKey(sealed.priv)));
 	});
+
+	// Both hand-out paths, separately. The memo holds ONE X25519Identity object;
+	// handing out that reference means a consumer wiping its own copy silently
+	// leaves the memo holding 32 zero bytes while pub/selfSig still describe the
+	// original key — every later DH in the session is then wrong, and nothing
+	// anywhere reports it. One probe covering only one path survives a mutation
+	// of the other, which is why these are two tests and not one.
+	it('zeroizing the priv from the MINTING call does not poison the memo', async () => {
+		if (!ed25519Supported) return;
+		const { device, x25519Id } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+
+		const minted = await x25519Id.getOrCreateX25519Identity(identity);
+		const expected = hex(minted.priv);
+		minted.priv.fill(0); // ordinary secret hygiene by a well-behaved consumer
+
+		const later = await x25519Id.getOrCreateX25519Identity(identity);
+		expect(hex(later.priv)).toBe(expected);
+		expect(hex(later.pub)).toBe(hex(x25519.getPublicKey(later.priv)));
+	});
+
+	it('zeroizing the priv from a MEMO-HIT call does not poison the memo', async () => {
+		if (!ed25519Supported) return;
+		const { device, x25519Id } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+
+		const minted = await x25519Id.getOrCreateX25519Identity(identity);
+		const expected = hex(minted.priv);
+
+		const hit = await x25519Id.getOrCreateX25519Identity(identity); // memo hit
+		hit.priv.fill(0);
+
+		const later = await x25519Id.getOrCreateX25519Identity(identity);
+		expect(hex(later.priv)).toBe(expected);
+		expect(hex(later.pub)).toBe(hex(x25519.getPublicKey(later.priv)));
+	});
+});
+
+/**
+ * Runtimes with no working IndexedDB — Instagram/TikTok in-app WebViews, some
+ * private modes.
+ *
+ * The Ed25519 paths in this package degrade to an ephemeral in-memory identity
+ * there, so the SPA still boots. This key must NOT follow that pattern: it
+ * exists to be published so a peer can seal to it, and a key that dies at reload
+ * is worse in the registry than no key at all — messages sealed to it are
+ * permanently unreadable, the server throttles the correcting publish to 1/hour,
+ * and every peer's TOFU fingerprint churns on each load.
+ *
+ * So the contract is a typed refusal, and what these pin is that there is no
+ * value for a caller to publish by accident.
+ */
+describe('sealed X25519 secret when IndexedDB is unavailable', () => {
+	let realIDB: IDBFactory | undefined;
+
+	beforeEach(() => {
+		realIDB = (globalThis as { indexedDB?: IDBFactory }).indexedDB;
+		delete (globalThis as { indexedDB?: IDBFactory }).indexedDB;
+	});
+
+	afterEach(() => {
+		(globalThis as { indexedDB?: IDBFactory }).indexedDB = realIDB;
+	});
+
+	it('refuses with SealedKeyUnavailableError rather than returning a scalar', async () => {
+		const { device } = await reload();
+		// The Ed25519 identity still resolves — it degrades to ephemeral by
+		// design, which is what makes this a test of the sealed key alone.
+		const owner = await ownerOf(device);
+
+		await expect(device.getOrCreateSealedX25519Secret(owner)).rejects.toBeInstanceOf(
+			device.SealedKeyUnavailableError,
+		);
+	});
+
+	it('names the reason so an operator can tell absent IDB from a full quota', async () => {
+		const { device } = await reload();
+		const owner = await ownerOf(device);
+
+		await expect(device.getOrCreateSealedX25519Secret(owner)).rejects.toMatchObject({
+			name: 'SealedKeyUnavailableError',
+			reason: 'no_indexedDB',
+		});
+	});
+
+	// The public entry point is what enrollment calls, so the refusal has to
+	// survive the trip through it — a catch anywhere in between that substituted
+	// a fresh keypair would put an unpersisted key back on the publish path.
+	it('propagates through getOrCreateX25519Identity — no substituted keypair', async () => {
+		if (!ed25519Supported) return;
+		const { device, x25519Id } = await reload();
+		const identity = await device.getOrCreateDeviceIdentity();
+
+		await expect(x25519Id.getOrCreateX25519Identity(identity)).rejects.toBeInstanceOf(
+			device.SealedKeyUnavailableError,
+		);
+	});
+
+	it('a quota-exhausted store refuses too, and says so', async () => {
+		// Quota is a DISTINCT failure from absent IDB: the store opens fine, then
+		// the write fails — so absent-IDB coverage says nothing about it. The two
+		// map to different reasons precisely so an operator can tell an in-app
+		// WebView from a device that has run out of room.
+		//
+		// fake-indexeddb has no quota to exhaust, so the fault is injected at the
+		// store boundary — the same seam device-identity.ts reads. Scoped with
+		// doMock/doUnmock rather than a file-level vi.mock, which would replace
+		// the real store for the ~20 persistence tests above that depend on it.
+		const { vi } = await import('vitest');
+		(globalThis as { indexedDB?: IDBFactory }).indexedDB = realIDB; // IDB works; the ROOM is what is gone
+
+		vi.resetModules();
+		vi.doMock('../idb-store.js', async () => {
+			const actual =
+				await vi.importActual<typeof import('../idb-store.js')>('../idb-store.js');
+			return {
+				...actual,
+				createIdbStore: (opts: Parameters<typeof actual.createIdbStore>[0]) => {
+					const real = actual.createIdbStore(opts);
+					return {
+						...real,
+						save: async () => {
+							throw Object.assign(new Error('no room'), {
+								name: 'QuotaExceededError',
+							});
+						},
+					};
+				},
+			};
+		});
+
+		try {
+			const device = (await import('../device-identity.js')) as DeviceIdentityModule;
+			// Degrades to an ephemeral identity on the same quota fault, by design
+			// — which is exactly the asymmetry under test: it still returns, and
+			// the sealed key still must not.
+			const owner = (await device.getOrCreateDeviceIdentity()).publicKeyB64;
+
+			await expect(device.getOrCreateSealedX25519Secret(owner)).rejects.toMatchObject({
+				name: 'SealedKeyUnavailableError',
+				reason: 'quota_exceeded',
+			});
+		} finally {
+			vi.doUnmock('../idb-store.js');
+			vi.resetModules();
+		}
+	});
 });

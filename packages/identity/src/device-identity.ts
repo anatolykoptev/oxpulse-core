@@ -1063,6 +1063,43 @@ export function identityEpoch(): number {
 }
 let inflightSealed: { owner: string; p: Promise<Uint8Array> } | null = null;
 
+/**
+ * Thrown when the sealed-messaging scalar cannot be PERSISTED: the runtime has
+ * no working IndexedDB (Instagram/TikTok in-app WebViews, some private modes)
+ * or its quota is exhausted.
+ *
+ * Deliberately a throw, where every other storage-touching entry point in this
+ * file degrades to an ephemeral in-memory value instead. That asymmetry is the
+ * design, not an oversight:
+ *
+ *   - The Ed25519 identity degrades because the alternative is the SPA not
+ *     booting at all, and a session-scoped signing key still signs. Nothing is
+ *     published, so nothing outlives the session to be wrong later.
+ *   - This key exists to be PUBLISHED, so a peer can seal to it. A key that
+ *     dies at reload is worse in the registry than no key at all: every message
+ *     sealed to it is permanently unreadable, the server throttles the
+ *     correcting publish to 1/hour so it does not self-heal, and every peer's
+ *     TOFU fingerprint churns on each page load.
+ *
+ * Returning an `{ priv, ephemeral: true }` pair instead would put the whole
+ * weight on a caller remembering to read the flag — a marker with no reader is
+ * the same defect as a gate with no writer. With no value returned at all,
+ * publishing a non-persisted key is unrepresentable rather than merely
+ * discouraged.
+ *
+ * Callers should treat this as "sealed messaging is unavailable on this
+ * runtime" and say so, rather than retrying.
+ */
+export class SealedKeyUnavailableError extends Error {
+	/** Bounded — mirrors IDBUnavailableError.reason plus the quota case. */
+	readonly reason: IDBUnavailableError['reason'] | 'quota_exceeded';
+	constructor(reason: IDBUnavailableError['reason'] | 'quota_exceeded') {
+		super(`sealed X25519 key cannot be persisted: ${reason}`);
+		this.name = 'SealedKeyUnavailableError';
+		this.reason = reason;
+	}
+}
+
 interface StoredSealedX25519 {
 	/** Discriminator. One KEK wraps the Ed25519 seed, the Noise scalar and this
 	 *  one, and all three are 32 bytes — nothing about length could catch a
@@ -1162,7 +1199,43 @@ export const __sealedTestHooks: { betweenLoadAndSave: null | (() => Promise<void
 	betweenLoadAndSave: null,
 };
 
+/**
+ * Classifies storage faults into SealedKeyUnavailableError, and lets everything
+ * else through untouched.
+ *
+ * Wrapping the whole mint rather than each call is deliberate: the wrapping key,
+ * the load and the save are three separate chances for IDB to be missing, and a
+ * per-call guard is a list that the next storage call added here would silently
+ * escape.
+ *
+ * Both event names are reused verbatim from the Ed25519 paths above rather than
+ * minted fresh. A new client event kind is a four-place lockstep across two
+ * repos (telemetry.ts CLIENT_EVENT_NAMES, crates/analytics kinds.rs, the
+ * handler match-arm, the allowlist test), and an unlisted kind is silently
+ * bucketed as unknown — so a fresh name would be worse observability, not
+ * better, until all four land. `identity_quota_exceeded_fallback` reads wrong
+ * here (there is no fallback on this path) — oxpulse-chat followup for a
+ * dedicated kind.
+ */
 async function sealedX25519Inner(owner: string): Promise<Uint8Array> {
+	try {
+		return await sealedX25519Mint(owner);
+	} catch (e) {
+		if (e instanceof IDBUnavailableError) {
+			track('client.idb_unavailable', undefined, { reason: e.reason });
+			throw new SealedKeyUnavailableError(e.reason);
+		}
+		if ((e as { name?: string })?.name === 'QuotaExceededError') {
+			track('client.identity_quota_exceeded_fallback', undefined, {
+				error_class: 'idb_quota_exceeded',
+			});
+			throw new SealedKeyUnavailableError('quota_exceeded');
+		}
+		throw e;
+	}
+}
+
+async function sealedX25519Mint(owner: string): Promise<Uint8Array> {
 	// Sampled at entry: a wipe can land while this is awaiting IDB, and a mint
 	// that resumes afterwards must not write its key back. clearDeviceIdentity
 	// nulls the module cache and deletes the row — and then the in-flight mint
