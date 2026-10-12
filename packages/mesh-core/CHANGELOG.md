@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.3.0...mesh-core-v0.4.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **mesh-core:** require Capacitor 8 and bluetooth-le 8 ([#122](https://github.com/anatolykoptev/oxpulse-core/issues/122))
+
+### Added
+
+* **mesh-core:** require Capacitor 8 and bluetooth-le 8 ([#122](https://github.com/anatolykoptev/oxpulse-core/issues/122)) ([e6d8b93](https://github.com/anatolykoptev/oxpulse-core/commit/e6d8b932a91bd1b01cf9e36760779e20c879d35c))
+
 ## [0.3.0](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.2.2...mesh-core-v0.3.0) (2026-08-05)
 
 
