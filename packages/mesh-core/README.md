@@ -21,6 +21,10 @@ BLE transport runs inside [Capacitor](https://capacitorjs.com/). Those peer depe
 pnpm add @capacitor/core @capacitor-community/bluetooth-le
 ```
 
+Both must be **major version 8** (`@capacitor/core ^8`, `@capacitor-community/bluetooth-le ^8`). The
+JS and native halves of the bluetooth-le plugin must be the same major, so a dual range would not be
+safe; stay on `@oxpulse/mesh-core@0.3.x` for Capacitor 6.
+
 Without them the pure-logic parts still work anywhere (Node ≥ 18 or a browser): frame codec,
 router, outbox, dedupe, mailbox, channel derivation, `mesh-wrap`.
 
