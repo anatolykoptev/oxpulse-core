@@ -52,11 +52,11 @@ importers:
         version: 0.6.1
     devDependencies:
       '@capacitor-community/bluetooth-le':
-        specifier: ^6.1.0
-        version: 6.1.0(@capacitor/core@6.2.1)
+        specifier: ^8.3.0
+        version: 8.3.0(@capacitor/core@8.5.3)
       '@capacitor/core':
-        specifier: ^6.2.1
-        version: 6.2.1
+        specifier: ^8.5.3
+        version: 8.5.3
       '@types/node':
         specifier: ^22
         version: 22.20.1
@@ -84,13 +84,13 @@ packages:
   '@bokuweb/zstd-wasm@0.0.27':
     resolution: {integrity: sha512-GDm2uOTK3ESjnYmSeLQifJnBsRCWajKLvN32D2ZcQaaCIJI/Hse9s74f7APXjHit95S10UImsRGkTsbwHmrtmg==}
 
-  '@capacitor-community/bluetooth-le@6.1.0':
-    resolution: {integrity: sha512-hnNChEwV+xNOVqDYI4bfkQtFtvEyzBMlgYs+6xsLYTJVl0v8h6Hn3nCwjW9l6LH0tMzYaRYlFLCiGHKPHt1N0Q==}
+  '@capacitor-community/bluetooth-le@8.3.0':
+    resolution: {integrity: sha512-bjI+m8mZ2AB9xIgwPu9T40QoAC7NErYt6q13zMHBzW3hIAITqQKFiElKOUsX813ItXzb81GoRqjlbSeHlKEzQg==}
     peerDependencies:
-      '@capacitor/core': ^6.0.0
+      '@capacitor/core': '>=8.0.0'
 
-  '@capacitor/core@6.2.1':
-    resolution: {integrity: sha512-urZwxa7hVE/BnA18oCFAdizXPse6fCKanQyEqpmz6cBJ2vObwMpyJDG5jBeoSsgocS9+Ax+9vb4ducWJn0y2qQ==}
+  '@capacitor/core@8.5.3':
+    resolution: {integrity: sha512-oBE1oGuYE4ZzYYrulC75OuHdSsD6zLUy7d5o1tFwDLG4govGoubY15cxpiI5l0+q87Lm5p0bhbehMdzJg4aFag==}
 
   '@cbor-extract/cbor-extract-darwin-arm64@2.2.2':
     resolution: {integrity: sha512-ZKZ/F8US7JR92J4DMct6cLW/Y66o2K576+zjlEN/MevH70bFIsB10wkZEQPLzl2oNh2SMGy55xpJ9JoBRl5DOA==}
@@ -989,12 +989,12 @@ snapshots:
 
   '@bokuweb/zstd-wasm@0.0.27': {}
 
-  '@capacitor-community/bluetooth-le@6.1.0(@capacitor/core@6.2.1)':
+  '@capacitor-community/bluetooth-le@8.3.0(@capacitor/core@8.5.3)':
     dependencies:
-      '@capacitor/core': 6.2.1
+      '@capacitor/core': 8.5.3
       '@types/web-bluetooth': 0.0.20
 
-  '@capacitor/core@6.2.1':
+  '@capacitor/core@8.5.3':
     dependencies:
       tslib: 2.8.1
 
