@@ -65,6 +65,29 @@ export interface IdbStoreOptions {
 	version?: number; // default 1
 }
 
+/** One step of an {@link IdbStore.transact} batch. */
+export type IdbTxOp =
+	| { readonly op: 'put'; readonly key: string; readonly value: unknown }
+	| { readonly op: 'delete'; readonly key: string }
+	/** Delete every key starting with `prefix` (string keys only). */
+	| { readonly op: 'deletePrefix'; readonly prefix: string };
+
+/**
+ * Thrown by {@link IdbStore.transact} when its `guard` would be exceeded. The
+ * transaction is aborted: nothing was written.
+ */
+export class IdbCapExceededError extends Error {
+	constructor() {
+		super('IndexedDB transaction refused: prefix capacity would be exceeded');
+		this.name = 'IdbCapExceededError';
+	}
+}
+
+/** Key range covering exactly the string keys that start with `prefix`. */
+function prefixRange(prefix: string): IDBKeyRange {
+	return IDBKeyRange.bound(prefix, prefix + '\uffff');
+}
+
 export interface IdbStore {
 	save<T>(key: string, value: T): Promise<void>;
 	/**
@@ -75,6 +98,39 @@ export interface IdbStore {
 	 * the device does not hold.
 	 */
 	saveMany(entries: ReadonlyArray<readonly [string, unknown]>): Promise<void>;
+	/**
+	 * Apply puts and deletes in ONE readwrite transaction — all land or none do.
+	 * Every request is issued synchronously, so callers must finish any async
+	 * work (WebCrypto wrapping) BEFORE calling: awaiting inside an open IDB
+	 * transaction lets it auto-commit.
+	 */
+	transact(
+		ops: ReadonlyArray<IdbTxOp>,
+		/**
+		 * Capacity checked INSIDE the transaction: the number of records already
+		 * under `prefix` plus the puts under it must not exceed `max`, else the
+		 * transaction aborts with IdbCapExceededError. This is what makes a cap
+		 * hold across tabs and runtimes with no Web Locks, where a read-then-write
+		 * check in the caller can be raced.
+		 */
+		guard?: { prefix: string; max: number },
+	): Promise<void>;
+	/**
+	 * Point-in-time read of several keys plus the key NAMES under a prefix, in ONE
+	 * readonly transaction: the answers are mutually consistent, which separate
+	 * load() calls are not (a commit can land between them).
+	 */
+	snapshot(
+		keys: ReadonlyArray<string>,
+		prefix: string,
+		limit?: number,
+	): Promise<{ values: unknown[]; prefixKeys: string[] }>;
+	/**
+	 * Every record whose string key starts with `prefix`, in key order. `limit`
+	 * bounds the read itself, so a corrupt store cannot make the caller allocate
+	 * an unbounded result.
+	 */
+	loadPrefix<T>(prefix: string, limit?: number): Promise<Array<{ key: string; value: T }>>;
 	load<T>(key: string): Promise<T | null>;
 	delete(key: string): Promise<void>;
 	clear(): Promise<void>;
@@ -139,6 +195,107 @@ export function createIdbStore(opts: IdbStoreOptions): IdbStore {
 				// completion is the atomicity boundary; a request can succeed
 				// and the transaction still abort.
 				tx.oncomplete = () => resolve();
+				tx.onerror = () => reject(tx.error);
+				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
+			});
+		},
+
+		async transact(
+			ops: ReadonlyArray<IdbTxOp>,
+			guard?: { prefix: string; max: number },
+		): Promise<void> {
+			const db = await openIDB();
+			return new Promise((resolve, reject) => {
+				const tx = db.transaction(storeName, 'readwrite');
+				const store = tx.objectStore(storeName);
+				// Completion, not per-request success: see saveMany.
+				tx.oncomplete = () => resolve();
+				tx.onerror = () => reject(tx.error);
+				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
+				const abort = (err: unknown) => {
+					try { tx.abort(); } catch { /* already aborting */ }
+					reject(err);
+				};
+				const apply = () => {
+					try {
+						for (const o of ops) {
+							if (o.op === 'put') store.put(o.value, o.key);
+							else if (o.op === 'delete') store.delete(o.key);
+							else store.delete(prefixRange(o.prefix));
+						}
+					} catch (err) {
+						abort(err);
+					}
+				};
+				if (!guard) {
+					apply();
+					return;
+				}
+				// Only keys that do not exist yet consume capacity: re-putting a held key
+				// (an identical concurrent import) is an overwrite, not growth.
+				const putKeys = [
+					...new Set(
+						ops
+							.filter((o): o is Extract<IdbTxOp, { op: 'put' }> => o.op === 'put')
+							.map((o) => o.key)
+							.filter((k) => k.startsWith(guard.prefix)),
+					),
+				];
+				const counted = store.count(prefixRange(guard.prefix));
+				counted.onsuccess = () => {
+					const have = counted.result;
+					const decide = (adding: number) => {
+						if (have + adding > guard.max) abort(new IdbCapExceededError());
+						else apply();
+					};
+					if (putKeys.length === 0) return decide(0);
+					let pending = putKeys.length;
+					let adding = 0;
+					for (const k of putKeys) {
+						const probe = store.getKey(k);
+						probe.onsuccess = () => {
+							if (probe.result === undefined) adding++;
+							if (--pending === 0) decide(adding);
+						};
+					}
+				};
+			});
+		},
+
+		async snapshot(
+			keys: ReadonlyArray<string>,
+			prefix: string,
+			limit?: number,
+		): Promise<{ values: unknown[]; prefixKeys: string[] }> {
+			const db = await openIDB();
+			return new Promise((resolve, reject) => {
+				const tx = db.transaction(storeName, 'readonly');
+				const store = tx.objectStore(storeName);
+				const gets = keys.map((k) => store.get(k));
+				const names = store.getAllKeys(prefixRange(prefix), limit);
+				tx.oncomplete = () =>
+					resolve({
+						values: gets.map((g) => g.result ?? null),
+						prefixKeys: (names.result as IDBValidKey[]).map(String),
+					});
+				tx.onerror = () => reject(tx.error);
+				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
+			});
+		},
+
+		async loadPrefix<T>(prefix: string, limit?: number): Promise<Array<{ key: string; value: T }>> {
+			const db = await openIDB();
+			return new Promise((resolve, reject) => {
+				const tx = db.transaction(storeName, 'readonly');
+				const store = tx.objectStore(storeName);
+				const range = prefixRange(prefix);
+				const keysReq = store.getAllKeys(range, limit);
+				const valuesReq = store.getAll(range, limit);
+				tx.oncomplete = () => {
+					const keys = keysReq.result as IDBValidKey[];
+					const values = valuesReq.result as T[];
+					resolve(keys.map((k, i) => ({ key: String(k), value: values[i] as T })));
+				};
 				tx.onerror = () => reject(tx.error);
 				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
 			});
