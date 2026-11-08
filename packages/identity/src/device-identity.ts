@@ -1046,6 +1046,19 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedHistory = null;
 	identityEpochCounter++;
 	hostKeypairCache.clear();
+	// Block history BEFORE any teardown step can fail. The latch is set first and
+	// the marker persisted next (best effort — the latch covers this session): if
+	// any delete below throws, the old identity row may survive, but no history
+	// can be read until a retry has wiped it. The wipe itself clears the marker.
+	historyWipeLatch = true;
+	try {
+		await idb.save(HISTORY_WIPE_PENDING_NAME, {
+			kind: 'x25519-history-wipe-pending-v1',
+			atMs: Date.now(),
+		});
+	} catch {
+		/* latch only */
+	}
 	await idb.delete(DEVICE_KEY_NAME);
 	await idb.delete(DEVICE_PRIV_RAW_NAME);
 	await idb.delete(WRAPPING_KEY_NAME);  // old entry — kept by migration, cleared on explicit forget
@@ -1685,12 +1698,18 @@ const copyHistory = (keys: HistoryKey[]): HistoryKey[] =>
  */
 async function cacheStillCurrent(owner: string, rowKeys: string[]): Promise<boolean> {
 	try {
-		if ((await idb.load(HISTORY_WIPE_PENDING_NAME)) != null) return false;
-		const live = await idb.load<StoredIdentity>(DEVICE_KEY_NAME);
+		// ONE readonly transaction: marker, owner and row names are a single
+		// point-in-time view, so a commit by another tab cannot land between them.
+		const snap = await idb.snapshot(
+			[HISTORY_WIPE_PENDING_NAME, DEVICE_KEY_NAME],
+			HISTORY_PREFIX,
+			MAX_HISTORY_KEYS + 1,
+		);
+		const [marker, live] = snap.values as [unknown, StoredIdentity | null];
+		if (marker != null) return false;
 		if (!live || live.publicKeyB64 !== owner) return false;
-		const rows = await idb.loadPrefix<unknown>(HISTORY_PREFIX, MAX_HISTORY_KEYS + 1);
-		if (rows.length !== rowKeys.length) return false;
-		const have = new Set(rows.map((r) => r.key));
+		if (snap.prefixKeys.length !== rowKeys.length) return false;
+		const have = new Set(snap.prefixKeys);
 		return rowKeys.every((k) => have.has(k));
 	} catch {
 		return false;

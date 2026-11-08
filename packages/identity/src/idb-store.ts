@@ -116,6 +116,16 @@ export interface IdbStore {
 		guard?: { prefix: string; max: number },
 	): Promise<void>;
 	/**
+	 * Point-in-time read of several keys plus the key NAMES under a prefix, in ONE
+	 * readonly transaction: the answers are mutually consistent, which separate
+	 * load() calls are not (a commit can land between them).
+	 */
+	snapshot(
+		keys: ReadonlyArray<string>,
+		prefix: string,
+		limit?: number,
+	): Promise<{ values: unknown[]; prefixKeys: string[] }>;
+	/**
 	 * Every record whose string key starts with `prefix`, in key order. `limit`
 	 * bounds the read itself, so a corrupt store cannot make the caller allocate
 	 * an unbounded result.
@@ -221,14 +231,55 @@ export function createIdbStore(opts: IdbStoreOptions): IdbStore {
 					apply();
 					return;
 				}
-				const adding = ops.filter(
-					(o) => o.op === 'put' && o.key.startsWith(guard.prefix),
-				).length;
+				// Only keys that do not exist yet consume capacity: re-putting a held key
+				// (an identical concurrent import) is an overwrite, not growth.
+				const putKeys = [
+					...new Set(
+						ops
+							.filter((o): o is Extract<IdbTxOp, { op: 'put' }> => o.op === 'put')
+							.map((o) => o.key)
+							.filter((k) => k.startsWith(guard.prefix)),
+					),
+				];
 				const counted = store.count(prefixRange(guard.prefix));
 				counted.onsuccess = () => {
-					if (counted.result + adding > guard.max) abort(new IdbCapExceededError());
-					else apply();
+					const have = counted.result;
+					const decide = (adding: number) => {
+						if (have + adding > guard.max) abort(new IdbCapExceededError());
+						else apply();
+					};
+					if (putKeys.length === 0) return decide(0);
+					let pending = putKeys.length;
+					let adding = 0;
+					for (const k of putKeys) {
+						const probe = store.getKey(k);
+						probe.onsuccess = () => {
+							if (probe.result === undefined) adding++;
+							if (--pending === 0) decide(adding);
+						};
+					}
 				};
+			});
+		},
+
+		async snapshot(
+			keys: ReadonlyArray<string>,
+			prefix: string,
+			limit?: number,
+		): Promise<{ values: unknown[]; prefixKeys: string[] }> {
+			const db = await openIDB();
+			return new Promise((resolve, reject) => {
+				const tx = db.transaction(storeName, 'readonly');
+				const store = tx.objectStore(storeName);
+				const gets = keys.map((k) => store.get(k));
+				const names = store.getAllKeys(prefixRange(prefix), limit);
+				tx.oncomplete = () =>
+					resolve({
+						values: gets.map((g) => g.result ?? null),
+						prefixKeys: (names.result as IDBValidKey[]).map(String),
+					});
+				tx.onerror = () => reject(tx.error);
+				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
 			});
 		},
 

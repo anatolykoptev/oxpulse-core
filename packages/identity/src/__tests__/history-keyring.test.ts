@@ -71,10 +71,14 @@ interface Faults {
 	weakAddress: boolean;
 	/** one-shot: runs right after the next loadPrefix() returns (mid-read interleave). */
 	afterLoadPrefix: null | (() => Promise<unknown>);
+	/** delete() of this key throws (a teardown step failing part-way). */
+	failDeleteKey: string | null;
+	/** names of store calls made, in order (cache-probe shape assertions). */
+	calls: string[];
 }
 
 async function boot(f: Partial<Faults> = {}): Promise<{ device: Device; faults: Faults }> {
-	const faults: Faults = { failWipe: false, failMarker: false, poisonLastPut: false, weakAddress: false, afterLoadPrefix: null, ...f };
+	const faults: Faults = { failWipe: false, failMarker: false, poisonLastPut: false, weakAddress: false, afterLoadPrefix: null, failDeleteKey: null, calls: [], ...f };
 	vi.resetModules();
 	vi.doMock('../idb-store.js', async () => {
 		const actual = await vi.importActual<typeof import('../idb-store.js')>('../idb-store.js');
@@ -84,7 +88,20 @@ async function boot(f: Partial<Faults> = {}): Promise<{ device: Device; faults: 
 				const real = actual.createIdbStore(opts);
 				return {
 					...real,
+					load: async <T,>(key: string) => {
+						faults.calls.push('load');
+						return real.load<T>(key);
+					},
+					snapshot: async (keys: ReadonlyArray<string>, prefix: string, limit?: number) => {
+						faults.calls.push('snapshot');
+						return real.snapshot(keys, prefix, limit);
+					},
+					delete: async (key: string) => {
+						if (faults.failDeleteKey === key) throw new DOMException('injected delete fault', 'UnknownError');
+						return real.delete(key);
+					},
 					loadPrefix: async <T,>(prefix: string, limit?: number) => {
+						faults.calls.push('loadPrefix');
 						const out = await real.loadPrefix<T>(prefix, limit);
 						if (faults.afterLoadPrefix) {
 							const fire = faults.afterLoadPrefix;
@@ -803,6 +820,86 @@ describe('a failed wipe blocks history until it is retried successfully', () => 
 		await expect(device.clearDeviceIdentity()).rejects.toMatchObject({ name: 'HistoryWipePendingError' });
 		expect(await raw.load(MARKER)).toBeNull(); // the marker write really failed
 		expect(await device.isHistoryWipePending()).toBe(true);
+	});
+});
+
+describe('forget: history is blocked before teardown can fail', () => {
+	it('a failure on the FIRST delete leaves no readable history and reports failure', async () => {
+		if (!ed25519Supported) return;
+		const { device, faults } = await boot();
+		const owner = await liveOwner(device);
+		await device.importSealedHistoryKeys(owner, [wire(pair())]);
+
+		faults.failDeleteKey = 'device-key'; // the very first teardown step
+		await expect(device.clearDeviceIdentity()).rejects.toThrow();
+		// the old identity row survived, so only the block stands between the
+		// rows and the reader
+		expect(await raw.load('device-key')).not.toBeNull();
+		expect(await raw.load(MARKER)).not.toBeNull();
+		expect(await historyRowCount()).toBe(1);
+
+		faults.failWipe = true; // the retry keeps failing: reads stay blocked
+		expect(await device.readHistoryKeys(owner)).toEqual({ status: 'storage_failure', reason: 'wipe_pending' });
+		faults.failWipe = false; // a healthy retry wipes, then nothing is served
+		const after = await device.readHistoryKeys(owner);
+		expect(after.status === 'ok' && after.keys.length).toBe(0);
+		expect(await historyRowCount()).toBe(0);
+	});
+
+	it('the block survives a reload even when the in-memory latch is gone', async () => {
+		if (!ed25519Supported) return;
+		const first = await boot();
+		const owner = await liveOwner(first.device);
+		await first.device.importSealedHistoryKeys(owner, [wire(pair())]);
+		first.faults.failDeleteKey = 'device-key';
+		await expect(first.device.clearDeviceIdentity()).rejects.toThrow();
+		const second = await boot({ failWipe: true }); // new session, wipe still failing
+		expect(await second.device.readHistoryKeys(owner)).toEqual({ status: 'storage_failure', reason: 'wipe_pending' });
+	});
+});
+
+describe('cache probe is one consistent snapshot', () => {
+	it('a warm-cache hit reads marker, owner and row names in a single store call', async () => {
+		if (!ed25519Supported) return;
+		const { device, faults } = await boot();
+		const owner = await liveOwner(device);
+		await device.importSealedHistoryKeys(owner, [wire(pair())]);
+		expect((await device.readHistoryKeys(owner)).status).toBe('ok'); // warm
+		faults.calls.length = 0;
+		const hit = await device.readHistoryKeys(owner);
+		expect(hit.status === 'ok' && hit.keys.length).toBe(1);
+		expect(faults.calls).toEqual(['snapshot']);
+	});
+});
+
+describe('the in-transaction cap counts only NEW keys', () => {
+	it('re-putting held keys at capacity is an overwrite, a new key is refused (store level)', async () => {
+		const { createIdbStore: mk, IdbCapExceededError } = await import('../idb-store.js');
+		const st = mk({ dbName: 'cap-guard-test', storeName: 's' });
+		const guard = { prefix: 'p/', max: 2 };
+		await st.transact([{ op: 'put', key: 'p/a', value: 1 }, { op: 'put', key: 'p/b', value: 1 }], guard);
+		await st.transact([{ op: 'put', key: 'p/a', value: 2 }, { op: 'put', key: 'p/b', value: 2 }], guard);
+		await expect(st.transact([{ op: 'put', key: 'p/c', value: 1 }], guard)).rejects.toBeInstanceOf(IdbCapExceededError);
+		expect(await st.load('p/a')).toBe(2);
+		expect(await st.load('p/c')).toBeNull();
+	});
+
+	it('two identical concurrent 64-key imports with no Web Locks both succeed', async () => {
+		if (!ed25519Supported) return;
+		vi.stubGlobal('navigator', {});
+		try {
+			const { device } = await boot();
+			const owner = await liveOwner(device);
+			const batch = Array.from({ length: 64 }, () => wire(pair()));
+			const [r1, r2] = await Promise.all([
+				device.importSealedHistoryKeys(owner, batch),
+				device.importSealedHistoryKeys(owner, batch),
+			]);
+			expect([r1.status, r2.status]).toEqual(['ok', 'ok']);
+			expect(await historyRowCount()).toBe(64);
+		} finally {
+			vi.unstubAllGlobals();
+		}
 	});
 });
 

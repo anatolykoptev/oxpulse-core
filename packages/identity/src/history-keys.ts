@@ -28,12 +28,13 @@ export const HISTORY_SOURCES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Curve25519 u-coordinates of low-order points (little-endian, bit 255 already
- * masked), byte-for-byte the list in oxpulse-chat `crates/sdk/src/keys.rs`
- * (`X25519_SMALL_ORDER`): 0, 1, the two order-8 points, p-1, and the
- * non-canonical encodings p and p+1. This is the set libsodium's
- * `has_small_order` blocklists. X25519 against any of them yields the
- * all-zero shared secret.
+ * The server's pinned X25519 public-key rejection set, byte-for-byte
+ * `X25519_SMALL_ORDER` in oxpulse-chat `crates/sdk/src/keys.rs` (little-endian,
+ * bit 255 masked): 0, 1, the two order-8 points and p-1 are the low-order
+ * points; p and p+1 are NON-canonical encodings of 0 and 1, rejected for the
+ * same reason (they reduce to low-order points). It is the set libsodium's
+ * `has_small_order` blocklists. X25519 against any entry yields the all-zero
+ * shared secret.
  *
  * The design called for one shared constant in crypto-primitives; that package
  * lives in another repo and identity depends only on @noble/curves, so this is
