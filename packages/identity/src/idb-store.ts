@@ -72,6 +72,17 @@ export type IdbTxOp =
 	/** Delete every key starting with `prefix` (string keys only). */
 	| { readonly op: 'deletePrefix'; readonly prefix: string };
 
+/**
+ * Thrown by {@link IdbStore.transact} when its `guard` would be exceeded. The
+ * transaction is aborted: nothing was written.
+ */
+export class IdbCapExceededError extends Error {
+	constructor() {
+		super('IndexedDB transaction refused: prefix capacity would be exceeded');
+		this.name = 'IdbCapExceededError';
+	}
+}
+
 /** Key range covering exactly the string keys that start with `prefix`. */
 function prefixRange(prefix: string): IDBKeyRange {
 	return IDBKeyRange.bound(prefix, prefix + '\uffff');
@@ -93,7 +104,17 @@ export interface IdbStore {
 	 * work (WebCrypto wrapping) BEFORE calling: awaiting inside an open IDB
 	 * transaction lets it auto-commit.
 	 */
-	transact(ops: ReadonlyArray<IdbTxOp>): Promise<void>;
+	transact(
+		ops: ReadonlyArray<IdbTxOp>,
+		/**
+		 * Capacity checked INSIDE the transaction: the number of records already
+		 * under `prefix` plus the puts under it must not exceed `max`, else the
+		 * transaction aborts with IdbCapExceededError. This is what makes a cap
+		 * hold across tabs and runtimes with no Web Locks, where a read-then-write
+		 * check in the caller can be raced.
+		 */
+		guard?: { prefix: string; max: number },
+	): Promise<void>;
 	/**
 	 * Every record whose string key starts with `prefix`, in key order. `limit`
 	 * bounds the read itself, so a corrupt store cannot make the caller allocate
@@ -169,26 +190,45 @@ export function createIdbStore(opts: IdbStoreOptions): IdbStore {
 			});
 		},
 
-		async transact(ops: ReadonlyArray<IdbTxOp>): Promise<void> {
+		async transact(
+			ops: ReadonlyArray<IdbTxOp>,
+			guard?: { prefix: string; max: number },
+		): Promise<void> {
 			const db = await openIDB();
 			return new Promise((resolve, reject) => {
 				const tx = db.transaction(storeName, 'readwrite');
 				const store = tx.objectStore(storeName);
-				try {
-					for (const o of ops) {
-						if (o.op === 'put') store.put(o.value, o.key);
-						else if (o.op === 'delete') store.delete(o.key);
-						else store.delete(prefixRange(o.prefix));
-					}
-				} catch (err) {
-					try { tx.abort(); } catch { /* already aborting */ }
-					reject(err);
-					return;
-				}
 				// Completion, not per-request success: see saveMany.
 				tx.oncomplete = () => resolve();
 				tx.onerror = () => reject(tx.error);
 				tx.onabort = () => reject(tx.error ?? new DOMException('transaction aborted', 'AbortError'));
+				const abort = (err: unknown) => {
+					try { tx.abort(); } catch { /* already aborting */ }
+					reject(err);
+				};
+				const apply = () => {
+					try {
+						for (const o of ops) {
+							if (o.op === 'put') store.put(o.value, o.key);
+							else if (o.op === 'delete') store.delete(o.key);
+							else store.delete(prefixRange(o.prefix));
+						}
+					} catch (err) {
+						abort(err);
+					}
+				};
+				if (!guard) {
+					apply();
+					return;
+				}
+				const adding = ops.filter(
+					(o) => o.op === 'put' && o.key.startsWith(guard.prefix),
+				).length;
+				const counted = store.count(prefixRange(guard.prefix));
+				counted.onsuccess = () => {
+					if (counted.result + adding > guard.max) abort(new IdbCapExceededError());
+					else apply();
+				};
 			});
 		},
 

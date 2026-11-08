@@ -93,7 +93,7 @@ async function boot(f: Partial<Faults> = {}): Promise<{ device: Device; faults: 
 						}
 						return out;
 					},
-					transact: async (ops: ReadonlyArray<IdbTxOp>) => {
+					transact: async (ops: ReadonlyArray<IdbTxOp>, guard?: { prefix: string; max: number }) => {
 						if (faults.failWipe && ops.some((o) => o.op === 'deletePrefix')) {
 							throw new DOMException('injected wipe fault', 'UnknownError');
 						}
@@ -101,9 +101,9 @@ async function boot(f: Partial<Faults> = {}): Promise<{ device: Device; faults: 
 							const copy = [...ops];
 							const last = copy[copy.length - 1] as Extract<IdbTxOp, { op: 'put' }>;
 							copy[copy.length - 1] = { op: 'put', key: last.key, value: () => 'uncloneable' };
-							return real.transact(copy);
+							return real.transact(copy, guard);
 						}
-						return real.transact(ops);
+						return real.transact(ops, guard);
 					},
 					save: async <T,>(key: string, value: T) => {
 						if (faults.failMarker && key === MARKER) throw new DOMException('injected marker fault', 'UnknownError');
@@ -343,6 +343,102 @@ describe('import is strict, and rejection persists NOTHING', () => {
 		// exactly reaching the cap is fine
 		expect((await device.importSealedHistoryKeys(owner, three.slice(0, 2))).status).toBe('ok');
 		expect(await historyRowCount()).toBe(64);
+	});
+});
+
+describe('the cap holds under concurrency and with unusable rows', () => {
+	it('two concurrent imports with no Web Locks cannot exceed 64 rows, and the keyring stays readable', async () => {
+		if (!ed25519Supported) return;
+		vi.stubGlobal('navigator', {}); // no navigator.locks: withIdentityLock falls through
+		try {
+			const { device } = await boot();
+			const owner = await liveOwner(device);
+			const batch = () => Array.from({ length: 40 }, () => wire(pair()));
+			const [r1, r2] = await Promise.all([
+				device.importSealedHistoryKeys(owner, batch()),
+				device.importSealedHistoryKeys(owner, batch()),
+			]);
+			const statuses = [r1.status, r2.status].sort();
+			expect(statuses).toEqual(['invalid', 'ok']);
+			expect(await historyRowCount()).toBe(40);
+			const read = await device.readHistoryKeys(owner);
+			expect(read.status === 'ok' && read.keys.length).toBe(40);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it('an unusable row still occupies a slot: 63 valid + 1 broken leaves room for none beyond 64', async () => {
+		if (!ed25519Supported) return;
+		const { device } = await boot();
+		const owner = await liveOwner(device);
+		const sixtyThree = Array.from({ length: 63 }, () => wire(pair()));
+		expect((await device.importSealedHistoryKeys(owner, sixtyThree)).status).toBe('ok');
+		const any = (await rows())[0]!;
+		await raw.save(HISTORY_PREFIX + 'z'.repeat(43), { ...any.value, pubB64u: 'z'.repeat(43), kind: 'garbage' });
+		expect(await historyRowCount()).toBe(64);
+		expect(await device.importSealedHistoryKeys(owner, [wire(pair())])).toEqual({ status: 'invalid', reason: 'too_many' });
+		expect(await historyRowCount()).toBe(64);
+		const read = await device.readHistoryKeys(owner);
+		expect(read.status === 'ok' && read.keys.length).toBe(63);
+	});
+});
+
+describe('a corrupt CURRENT sealed key does not strand valid history', () => {
+	it('read and import still work; export refuses rather than dropping the current key from a backup', async () => {
+		if (!ed25519Supported) return;
+		const { device } = await boot();
+		const owner = await liveOwner(device);
+		await device.getOrCreateSealedX25519Secret(owner);
+		const a = pair();
+		await device.importSealedHistoryKeys(owner, [wire(a)]);
+		const sealed = (await raw.load<Record<string, unknown>>(SEALED))!;
+		await raw.save(SEALED, { ...sealed, wrappedPrivateKeyRaw: crypto.getRandomValues(new Uint8Array(40)).buffer });
+
+		const fresh = await boot();
+		const read = await fresh.device.readHistoryKeys(owner);
+		expect(read.status === 'ok' && read.keys.map((k) => k.pubB64u).join()).toBe(a.pubB64u);
+		expect((await fresh.device.importSealedHistoryKeys(owner, [wire(pair())])).status).toBe('ok');
+		expect(await fresh.device.exportSealedKeyring(owner)).toEqual({ status: 'storage_failure', reason: 'io_error' });
+	});
+});
+
+describe('another tab changed the store: a warm cache must not hide it', () => {
+	it('an import in another tab becomes visible', async () => {
+		if (!ed25519Supported) return;
+		const tabA = await boot();
+		const owner = await liveOwner(tabA.device);
+		const warm = await tabA.device.readHistoryKeys(owner);
+		expect(warm.status === 'ok' && warm.keys.length).toBe(0);
+		const tabB = await boot();
+		const k = pair();
+		expect((await tabB.device.importSealedHistoryKeys(owner, [wire(k)])).status).toBe('ok');
+		const seen = await tabA.device.readHistoryKeys(owner);
+		expect(seen.status === 'ok' && seen.keys.map((x) => x.pubB64u).join()).toBe(k.pubB64u);
+	});
+
+	it('a forget in another tab stops this tab serving the forgotten keys', async () => {
+		if (!ed25519Supported) return;
+		const tabA = await boot();
+		const owner = await liveOwner(tabA.device);
+		await tabA.device.importSealedHistoryKeys(owner, [wire(pair())]);
+		const warm = await tabA.device.readHistoryKeys(owner);
+		expect(warm.status === 'ok' && warm.keys.length).toBe(1);
+		const tabB = await boot();
+		await tabB.device.clearDeviceIdentity();
+		const after = await tabA.device.readHistoryKeys(owner);
+		expect(after.status === 'ok' && after.keys.length > 0).toBe(false);
+	});
+
+	it('a wipe-pending marker written by another tab blocks this tab while the wipe keeps failing', async () => {
+		if (!ed25519Supported) return;
+		const tabA = await boot();
+		const owner = await liveOwner(tabA.device);
+		await tabA.device.importSealedHistoryKeys(owner, [wire(pair())]);
+		expect((await tabA.device.readHistoryKeys(owner)).status).toBe('ok'); // warm
+		await raw.save(MARKER, { kind: 'x25519-history-wipe-pending-v1', atMs: 1 });
+		tabA.faults.failWipe = true;
+		expect(await tabA.device.readHistoryKeys(owner)).toEqual({ status: 'storage_failure', reason: 'wipe_pending' });
 	});
 });
 

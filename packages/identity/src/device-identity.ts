@@ -21,7 +21,7 @@
 
 import { ed25519 as nobleEd25519, x25519 as nobleX25519 } from '@noble/curves/ed25519.js';
 import { emit as track } from './tracker-shim.js';
-import { createIdbStore, IDBUnavailableError } from './idb-store.js';
+import { createIdbStore, IDBUnavailableError, IdbCapExceededError } from './idb-store.js';
 import { toArrayBuffer } from './crypto-utils.js';
 import { toBase64url, fromBase64url } from './base64url.js';
 import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw, classifyKekEntry } from './aes-kw.js';
@@ -1445,7 +1445,13 @@ export class HistoryWipePendingError extends Error {
 }
 
 /** In-memory validated history, stamped like cachedSealedX25519. */
-let cachedHistory: { owner: string; epoch: number; keys: HistoryKey[] } | null = null;
+let cachedHistory: {
+	owner: string;
+	epoch: number;
+	keys: HistoryKey[];
+	/** Names of every physical row the snapshot was built from. */
+	rowKeys: string[];
+} | null = null;
 
 /**
  * In-memory twin of the persisted wipe-pending marker. Set whenever a wipe
@@ -1542,11 +1548,16 @@ export async function isHistoryWipePending(): Promise<boolean> {
 	return (await idb.load(HISTORY_WIPE_PENDING_NAME)) != null;
 }
 
-/** The sealed key for `owner`, read from its stored row; never mints one. */
+/**
+ * The sealed key for `owner`, read from its stored row; never mints one.
+ * `unreadable` means a row for this owner exists but cannot be unwrapped: that
+ * must not stop history (its rows are independent ciphertexts) from being
+ * served, but export must not pretend the current key was absent.
+ */
 async function readCurrentSealedKey(
 	owner: string,
 	wrappingKey: CryptoKey,
-): Promise<{ pub: Uint8Array; priv: Uint8Array } | null> {
+): Promise<{ key: { pub: Uint8Array; priv: Uint8Array } | null; unreadable: boolean }> {
 	const row = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
 	if (
 		!row ||
@@ -1554,11 +1565,15 @@ async function readCurrentSealedKey(
 		row.ownerEd25519PubB64 !== owner ||
 		!(row.wrappedPrivateKeyRaw?.byteLength > 0)
 	) {
-		return null;
+		return { key: null, unreadable: false };
 	}
-	const priv = await unwrapSecretBytes(wrappingKey, row.wrappedPrivateKeyRaw);
-	if (priv.byteLength !== 32) return null;
-	return { priv, pub: nobleX25519.getPublicKey(priv) };
+	try {
+		const priv = await unwrapSecretBytes(wrappingKey, row.wrappedPrivateKeyRaw);
+		if (priv.byteLength !== 32) return { key: null, unreadable: true };
+		return { key: { priv, pub: nobleX25519.getPublicKey(priv) }, unreadable: false };
+	} catch {
+		return { key: null, unreadable: true };
+	}
 }
 
 /** Re-prove one stored record. Null = unusable (dropped and counted by the caller). */
@@ -1592,8 +1607,11 @@ type KeyringState =
 			status: 'ok';
 			wrappingKey: CryptoKey;
 			current: { pub: Uint8Array; priv: Uint8Array } | null;
+			currentUnreadable: boolean;
 			history: HistoryKey[];
 			dropped: number;
+			/** Physical rows under the history prefix, valid or not: they all count toward the cap. */
+			rowKeys: string[];
 	  }
 	| KeyringFailure;
 
@@ -1613,7 +1631,10 @@ async function loadKeyringState(owner: string): Promise<KeyringState> {
 	if (!live || live.publicKeyB64 !== owner) return { status: 'invalid', reason: 'owner_mismatch' };
 
 	const wrappingKey = await getOrCreateWrappingKey();
-	const current = await readCurrentSealedKey(owner, wrappingKey);
+	const { key: current, unreadable: currentUnreadable } = await readCurrentSealedKey(
+		owner,
+		wrappingKey,
+	);
 
 	// Bounded at the READ: a corrupt or hostile store cannot make this allocate
 	// more than cap+1 rows.
@@ -1641,11 +1662,40 @@ async function loadKeyringState(owner: string): Promise<KeyringState> {
 		return !clash;
 	});
 
-	return { status: 'ok', wrappingKey, current, history, dropped };
+	return {
+		status: 'ok',
+		wrappingKey,
+		current,
+		currentUnreadable,
+		history,
+		dropped,
+		rowKeys: rows.map((r) => r.key),
+	};
 }
 
 const copyHistory = (keys: HistoryKey[]): HistoryKey[] =>
 	keys.map((k) => ({ ...k, pub: k.pub.slice(), priv: k.priv.slice() }));
+
+/**
+ * A cache hit must still honour what OTHER tabs did to the store: the epoch and
+ * the latch are per-module, so a forget, a failed wipe or an import elsewhere is
+ * invisible to them. Three small reads, no crypto: the pending marker, the live
+ * owner, and the set of row names the snapshot was built from. Any doubt means
+ * "not current", and the caller falls through to the full validated path.
+ */
+async function cacheStillCurrent(owner: string, rowKeys: string[]): Promise<boolean> {
+	try {
+		if ((await idb.load(HISTORY_WIPE_PENDING_NAME)) != null) return false;
+		const live = await idb.load<StoredIdentity>(DEVICE_KEY_NAME);
+		if (!live || live.publicKeyB64 !== owner) return false;
+		const rows = await idb.loadPrefix<unknown>(HISTORY_PREFIX, MAX_HISTORY_KEYS + 1);
+		if (rows.length !== rowKeys.length) return false;
+		const have = new Set(rows.map((r) => r.key));
+		return rowKeys.every((k) => have.has(k));
+	} catch {
+		return false;
+	}
+}
 
 /**
  * The validated history keys for `owner`, for the inbox decrypt gate.
@@ -1654,7 +1704,13 @@ const copyHistory = (keys: HistoryKey[]): HistoryKey[] =>
 export async function readHistoryKeys(owner: string): Promise<HistoryReadResult> {
 	const epochAtEntry = identityEpochCounter;
 	const c = cachedHistory;
-	if (!historyWipeLatch && c && c.owner === owner && c.epoch === epochAtEntry) {
+	if (
+		!historyWipeLatch &&
+		c &&
+		c.owner === owner &&
+		c.epoch === epochAtEntry &&
+		(await cacheStillCurrent(owner, c.rowKeys))
+	) {
 		return { status: 'ok', keys: copyHistory(c.keys), dropped: 0 };
 	}
 	return withIdentityLock(async (): Promise<HistoryReadResult> => {
@@ -1670,7 +1726,7 @@ export async function readHistoryKeys(owner: string): Promise<HistoryReadResult>
 			// (same rule as sealedX25519Mint). The check and the write below have no
 			// await between them.
 			if (identityEpochCounter !== epoch) return staleKeyring('read');
-			cachedHistory = { owner, epoch, keys: st.history };
+			cachedHistory = { owner, epoch, keys: st.history, rowKeys: st.rowKeys };
 			if (st.dropped > 0) trackKeyring('read', 'ok', { dropped: st.dropped });
 			return { status: 'ok', keys: copyHistory(st.history), dropped: st.dropped };
 		} catch (e) {
@@ -1700,6 +1756,12 @@ export async function exportSealedKeyring(owner: string): Promise<KeyringExportR
 				pubB64u: toBase64url(pub),
 				secretB64u: toBase64url(priv),
 			});
+			// A current key that exists but cannot be unwrapped must not silently vanish
+			// from a backup: report it instead of exporting history alone.
+			if (st.currentUnreadable) {
+				trackKeyring('export', 'storage_failure', { reason: 'io_error' });
+				return { status: 'storage_failure', reason: 'io_error' };
+			}
 			const current = st.current ? pair(st.current.pub, st.current.priv) : null;
 			const history = st.history.map((k) => pair(k.pub, k.priv));
 			if (!current && history.length === 0) {
@@ -1775,7 +1837,8 @@ export async function importSealedHistoryKeys(
 					}
 					fresh.push({ pubB64u: e.pubB64u, secret: e.secret, addrHex });
 				}
-				if (st.history.length + fresh.length > MAX_HISTORY_KEYS) return importInvalid('too_many');
+				// Physical rows, not validated ones: an unusable row still occupies a slot.
+				if (st.rowKeys.length + fresh.length > MAX_HISTORY_KEYS) return importInvalid('too_many');
 				if (fresh.length === 0) {
 					trackKeyring('import', 'ok', { count: 0 });
 					return { status: 'ok', added: 0, alreadyHeld };
@@ -1802,7 +1865,19 @@ export async function importSealedHistoryKeys(
 				// for a retired owner would be inert anyway — every read re-checks the
 				// owner — but there is no reason to leave them.)
 				if (identityEpochCounter !== epoch) return staleKeyring('import');
-				await idb.transact(records.map(([key, value]) => ({ op: 'put', key, value }) as const));
+				// The cap is enforced INSIDE the transaction as well: with no Web Locks (or
+				// another tab) two imports can each pass the check above on the same
+				// count, and together exceed the cap — which would make the whole
+				// keyring unreadable (loadKeyringState refuses a store over the cap).
+				try {
+					await idb.transact(
+						records.map(([key, value]) => ({ op: 'put', key, value }) as const),
+						{ prefix: HISTORY_PREFIX, max: MAX_HISTORY_KEYS },
+					);
+				} catch (e) {
+					if (e instanceof IdbCapExceededError) return importInvalid('too_many');
+					throw e;
+				}
 				cachedHistory = null;
 				trackKeyring('import', 'ok', { count: fresh.length });
 				return { status: 'ok', added: fresh.length, alreadyHeld };
