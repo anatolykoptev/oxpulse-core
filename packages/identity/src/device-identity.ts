@@ -28,6 +28,18 @@ import { wrapSecretBytes, unwrapSecretBytes, generateAesKwKey, importAesKwRaw, c
 import { OpaquePrivateKey } from './opaque-private-key.js';
 import { clearRoomHostSeed } from './room-host-seed.js';
 import { hostKeypairCache } from './host-identity.js';
+import {
+	MAX_HISTORY_KEYS,
+	HISTORY_SOURCES,
+	bytesEqual,
+	checkKeyPair,
+	decodeCanonicalKey32,
+	derivePeerAddress,
+	parseKeyringEntries,
+	toHex,
+	type HistorySource,
+	type KeyringInvalidReason,
+} from './history-keys.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
 // Structure: SEQUENCE { version=0, AlgorithmIdentifier { OID 1.3.101.112 }, OCTET STRING { OCTET STRING { seed } } }
@@ -72,6 +84,14 @@ const X25519_KEYPAIR_NAME = 'x25519-keypair-v1';
 // consumer (sealMessage / openMessage in @oxpulse/crypto-primitives) takes
 // Uint8Array — a WebCrypto handle could not be passed to it at all.
 const SEALED_X25519_NAME = 'x25519-sealed-v1'; // DO NOT RENAME after first user
+// History keyring: decrypt-only X25519 keys this device no longer publishes
+// (restored from a backup or a linked device). One record per key, string keys
+// under HISTORY_PREFIX in the SAME store as the sealed key — a prefix range
+// delete wipes them all in one request, and no object store is added to a
+// LOAD-BEARING database. The pending marker deliberately sits OUTSIDE the
+// prefix range so the range delete cannot take it with the rows by accident.
+const HISTORY_PREFIX = 'x25519-history-v1/'; // DO NOT RENAME after first user
+const HISTORY_WIPE_PENDING_NAME = 'x25519-history-wipe-pending-v1'; // DO NOT RENAME after first user
 
 // LOAD-BEARING: IDB database + store name used by all installed users. NEVER rename.
 // See identity-extraction-adr.md §3.4 and __tests__/storage-keys.test.ts.
@@ -431,6 +451,9 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 	// may have resolved the identity while this caller waited.
 	if (cachedIdentity) return cachedIdentity;
 
+	// Finish a history wipe a previous session could not complete.
+	await retryPendingHistoryWipe();
+
 	const t0 = nowMs();
 
 	// Try to load existing identity from IDB
@@ -550,7 +573,9 @@ async function getOrCreateDeviceIdentityInner(): Promise<DeviceIdentity> {
 			// to be severed by. Peers pinned that public key against the OLD
 			// user_id, and a replacement exists precisely to break that
 			// continuity, so the scalar goes with the identity that owned it.
-			await idb.delete(SEALED_X25519_NAME);
+			// Sealed key and history keyring leave together, transactionally. A failed
+			// wipe leaves the pending marker; the boot retry finishes it.
+			await wipeKeyRows(true);
 			await idb.delete(PROFILE_SEED_NAME);
 			await clearRoomHostSeed();
 		} catch (e) {
@@ -1018,6 +1043,7 @@ export async function clearDeviceIdentity(): Promise<void> {
 	cachedProfileSeed = null;
 	cachedX25519Keypair = null;
 	cachedSealedX25519 = null;
+	cachedHistory = null;
 	identityEpochCounter++;
 	hostKeypairCache.clear();
 	await idb.delete(DEVICE_KEY_NAME);
@@ -1025,13 +1051,20 @@ export async function clearDeviceIdentity(): Promise<void> {
 	await idb.delete(WRAPPING_KEY_NAME);  // old entry — kept by migration, cleared on explicit forget
 	await idb.delete(PROFILE_SEED_NAME);
 	await idb.delete(X25519_KEYPAIR_NAME);
-	await idb.delete(SEALED_X25519_NAME);
+	// The sealed key and the whole history keyring go in ONE transaction: a
+	// forgotten device must not keep a key that decrypts the old identity's
+	// messages. On failure the wipe records a pending marker (blocking every
+	// history read) and the teardown below still runs — the KEK clear at the end
+	// additionally crypto-erases any record that survived.
+	const historyGone = await wipeKeyRows(true);
 	// Same rationale as the profile seed: the room-host seed derives every
 	// per-room host signing key, so a forgotten device must not keep host
 	// authority over rooms the retired identity hosted (SEC-CR-004).
 	await clearRoomHostSeed();
 	await kekIdb.clear();  // new KEK DB
 	track('client.identity_wiped');
+	// Success is reported only when the history is actually gone.
+	if (!historyGone) throw new HistoryWipePendingError();
 }
 
 // ─── Sealed-messaging X25519 secret ──────────────────────────────────────────
@@ -1336,6 +1369,457 @@ async function sealedX25519Mint(owner: string): Promise<Uint8Array> {
 	});
 	cachedSealedX25519 = { owner, epoch: epochAtEntry, priv };
 	return priv.slice();
+}
+
+// ─── History keyring (decrypt-only X25519 keys) ──────────────────────────────
+//
+// Keys this device can DECRYPT with but never publishes and never signs with.
+// They arrive from outside (backup restore, device link, escrow) through
+// importSealedHistoryKeys, which is the trust boundary; stored records are
+// owner-tagged and KEK-wrapped like the sealed key, and EVERY read re-proves
+// them (loadKeyringState is the one read path — export, import's duplicate
+// check and the public reader all go through it, so there is no sibling that
+// forgets a check).
+
+interface StoredHistoryKey {
+	kind: 'x25519-history-v1';
+	/** The identity this key belongs to. Checked at every read. */
+	ownerEd25519PubB64: string;
+	pubB64u: string;
+	/** `derivePeerIdTarget(pub)` as 16 lowercase hex chars; re-derived at read. */
+	addrHex: string;
+	wrappedSecret: ArrayBuffer; // AES-KW wrapped raw 32-byte X25519 scalar
+	importedAtMs: number;
+	source: HistorySource;
+}
+
+/** A validated history key, as handed to a decrypt call site. Fresh buffers per call. */
+export interface HistoryKey {
+	pubB64u: string;
+	pub: Uint8Array;
+	priv: Uint8Array;
+	/** 8-byte routing address, lowercase hex. */
+	addrHex: string;
+}
+
+/** A `{pub, secret}` pair in exactly the shape importSealedHistoryKeys accepts. */
+export interface KeyringPair {
+	pubB64u: string;
+	secretB64u: string;
+}
+
+export type KeyringFailure =
+	| { status: 'invalid'; reason: KeyringInvalidReason }
+	| {
+			status: 'storage_failure';
+			reason: 'idb_unavailable' | 'quota_exceeded' | 'io_error' | 'wipe_pending' | 'stale_identity';
+	  };
+
+/** `absent`: the caller supplied no keyring field (an old-format bundle). Not an error. */
+export type KeyringImportResult =
+	| { status: 'ok'; added: number; alreadyHeld: number }
+	| { status: 'absent' }
+	| KeyringFailure;
+
+/** `absent`: this identity holds no sealed key and no history. */
+export type KeyringExportResult =
+	| { status: 'ok'; current: KeyringPair | null; history: KeyringPair[] }
+	| { status: 'absent' }
+	| KeyringFailure;
+
+export type HistoryReadResult =
+	| { status: 'ok'; keys: HistoryKey[]; dropped: number }
+	| KeyringFailure;
+
+/**
+ * Thrown by clearDeviceIdentity when the identity is gone but the history
+ * keyring could not be deleted. A wipe-pending marker is persisted (and an
+ * in-memory latch set), so no history can be read until a retry succeeds —
+ * but the caller must not tell the user the device was forgotten.
+ */
+export class HistoryWipePendingError extends Error {
+	constructor() {
+		super('history keyring could not be wiped; reads are blocked until a retry succeeds');
+		this.name = 'HistoryWipePendingError';
+	}
+}
+
+/** In-memory validated history, stamped like cachedSealedX25519. */
+let cachedHistory: { owner: string; epoch: number; keys: HistoryKey[] } | null = null;
+
+/**
+ * In-memory twin of the persisted wipe-pending marker. Set whenever a wipe
+ * fails, BEFORE the marker write is attempted: if the store is what is broken,
+ * the marker cannot be written either, and the rest of the session must still
+ * refuse to serve history.
+ */
+let historyWipeLatch = false;
+
+function trackKeyring(
+	op: 'import' | 'export' | 'read' | 'wipe',
+	outcome: 'ok' | 'absent' | 'invalid' | 'storage_failure' | 'failed',
+	extra?: { reason?: string; dropped?: number; count?: number },
+): void {
+	// Aggregate outcome only: no key, owner, address or count of a specific user's
+	// keys beyond a bucketed number. Reasons are the bounded enums above.
+	track('client.identity_history_keyring', undefined, { op, outcome, ...extra });
+}
+
+function storageFailure(e: unknown): KeyringFailure {
+	if (e instanceof IDBUnavailableError) return { status: 'storage_failure', reason: 'idb_unavailable' };
+	if ((e as { name?: string })?.name === 'QuotaExceededError') {
+		return { status: 'storage_failure', reason: 'quota_exceeded' };
+	}
+	return { status: 'storage_failure', reason: 'io_error' };
+}
+
+/**
+ * Delete every history record (and, when `includeSealed`, the sealed key) in
+ * ONE transaction, clearing the pending marker in the same breath. Returns true
+ * only when the rows are gone.
+ *
+ * On failure it latches, persists the marker, and returns false — it never
+ * throws, so a caller in the middle of a larger teardown can finish the
+ * teardown and then decide what to report.
+ */
+async function wipeKeyRows(includeSealed: boolean): Promise<boolean> {
+	cachedHistory = null;
+	try {
+		await idb.transact([
+			...(includeSealed ? [{ op: 'delete', key: SEALED_X25519_NAME } as const] : []),
+			{ op: 'deletePrefix', prefix: HISTORY_PREFIX },
+			{ op: 'delete', key: HISTORY_WIPE_PENDING_NAME },
+		]);
+		historyWipeLatch = false;
+		return true;
+	} catch (e) {
+		historyWipeLatch = true;
+		try {
+			await idb.save(HISTORY_WIPE_PENDING_NAME, {
+				kind: 'x25519-history-wipe-pending-v1',
+				atMs: Date.now(),
+			});
+		} catch {
+			// The latch alone blocks this session; the next boot cannot know, which
+			// is why the failure is reported below rather than swallowed.
+		}
+		trackKeyring('wipe', 'failed', { reason: storageFailure(e).reason });
+		return false;
+	}
+}
+
+/**
+ * Is history usable? false = a wipe is pending and a retry did not clear it
+ * (or the marker could not be read, which cannot prove "clean"). Runs the retry
+ * itself, so every history entry point settles a pending wipe before it looks
+ * at a single row.
+ */
+async function settlePendingHistoryWipe(): Promise<boolean> {
+	let pending = historyWipeLatch;
+	if (!pending) {
+		try {
+			pending = (await idb.load(HISTORY_WIPE_PENDING_NAME)) != null;
+		} catch {
+			return false;
+		}
+	}
+	if (!pending) return true;
+	return wipeKeyRows(false);
+}
+
+/** Boot hook: retry a wipe a previous session could not finish. Never throws. */
+async function retryPendingHistoryWipe(): Promise<void> {
+	try {
+		await settlePendingHistoryWipe();
+	} catch {
+		/* the readers settle again before serving anything */
+	}
+}
+
+/** True while a history wipe is pending (in memory or persisted). Does not retry. */
+export async function isHistoryWipePending(): Promise<boolean> {
+	if (historyWipeLatch) return true;
+	return (await idb.load(HISTORY_WIPE_PENDING_NAME)) != null;
+}
+
+/** The sealed key for `owner`, read from its stored row; never mints one. */
+async function readCurrentSealedKey(
+	owner: string,
+	wrappingKey: CryptoKey,
+): Promise<{ pub: Uint8Array; priv: Uint8Array } | null> {
+	const row = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
+	if (
+		!row ||
+		row.kind !== 'x25519-sealed-v1' ||
+		row.ownerEd25519PubB64 !== owner ||
+		!(row.wrappedPrivateKeyRaw?.byteLength > 0)
+	) {
+		return null;
+	}
+	const priv = await unwrapSecretBytes(wrappingKey, row.wrappedPrivateKeyRaw);
+	if (priv.byteLength !== 32) return null;
+	return { priv, pub: nobleX25519.getPublicKey(priv) };
+}
+
+/** Re-prove one stored record. Null = unusable (dropped and counted by the caller). */
+async function validateHistoryRow(
+	key: string,
+	r: StoredHistoryKey | null | undefined,
+	owner: string,
+	wrappingKey: CryptoKey,
+): Promise<HistoryKey | null> {
+	if (!r || typeof r !== 'object' || r.kind !== 'x25519-history-v1') return null;
+	if (r.ownerEd25519PubB64 !== owner) return null;
+	if (typeof r.pubB64u !== 'string' || key !== HISTORY_PREFIX + r.pubB64u) return null;
+	if (typeof r.addrHex !== 'string' || !/^[0-9a-f]{16}$/.test(r.addrHex)) return null;
+	if (!HISTORY_SOURCES.has(r.source) || typeof r.importedAtMs !== 'number') return null;
+	if (!(r.wrappedSecret?.byteLength > 0)) return null;
+	const pub = decodeCanonicalKey32(r.pubB64u);
+	if (!pub) return null;
+	let priv: Uint8Array;
+	try {
+		priv = await unwrapSecretBytes(wrappingKey, r.wrappedSecret);
+	} catch {
+		return null;
+	}
+	if (priv.byteLength !== 32 || checkKeyPair(pub, priv) !== null) return null;
+	if (toHex(await derivePeerAddress(pub)) !== r.addrHex) return null;
+	return { pubB64u: r.pubB64u, pub, priv, addrHex: r.addrHex };
+}
+
+type KeyringState =
+	| {
+			status: 'ok';
+			wrappingKey: CryptoKey;
+			current: { pub: Uint8Array; priv: Uint8Array } | null;
+			history: HistoryKey[];
+			dropped: number;
+	  }
+	| KeyringFailure;
+
+/**
+ * THE read path. Order: pending-wipe block, owner is the live identity, current
+ * key, then every history row re-proven (owner, key name, canonical pub,
+ * unwrap, `X25519(secret) == pub`, address re-derived) and finally address
+ * uniqueness against both its siblings and the current key. A row that fails
+ * any of it is dropped, counted and never returned. Callers hold the identity
+ * lock; this never mints anything.
+ */
+async function loadKeyringState(owner: string): Promise<KeyringState> {
+	if (!(await settlePendingHistoryWipe())) {
+		return { status: 'storage_failure', reason: 'wipe_pending' };
+	}
+	const live = await idb.load<StoredIdentity>(DEVICE_KEY_NAME);
+	if (!live || live.publicKeyB64 !== owner) return { status: 'invalid', reason: 'owner_mismatch' };
+
+	const wrappingKey = await getOrCreateWrappingKey();
+	const current = await readCurrentSealedKey(owner, wrappingKey);
+
+	// Bounded at the READ: a corrupt or hostile store cannot make this allocate
+	// more than cap+1 rows.
+	const rows = await idb.loadPrefix<StoredHistoryKey>(HISTORY_PREFIX, MAX_HISTORY_KEYS + 1);
+	if (rows.length > MAX_HISTORY_KEYS) return { status: 'invalid', reason: 'corrupt_store' };
+
+	const valid: HistoryKey[] = [];
+	let dropped = 0;
+	for (const { key, value } of rows) {
+		const k = await validateHistoryRow(key, value, owner, wrappingKey);
+		if (k) valid.push(k);
+		else dropped++;
+	}
+
+	// Two keys sharing an 8-byte address make routing ambiguous: a message for
+	// that address could be opened with the wrong key or not at all. Drop every
+	// member of a collision rather than pick one — and a history key colliding
+	// with the current key's address is dropped for the same reason.
+	const currentAddr = current ? toHex(await derivePeerAddress(current.pub)) : null;
+	const byAddr = new Map<string, number>();
+	for (const k of valid) byAddr.set(k.addrHex, (byAddr.get(k.addrHex) ?? 0) + 1);
+	const history = valid.filter((k) => {
+		const clash = byAddr.get(k.addrHex)! > 1 || k.addrHex === currentAddr;
+		if (clash) dropped++;
+		return !clash;
+	});
+
+	return { status: 'ok', wrappingKey, current, history, dropped };
+}
+
+const copyHistory = (keys: HistoryKey[]): HistoryKey[] =>
+	keys.map((k) => ({ ...k, pub: k.pub.slice(), priv: k.priv.slice() }));
+
+/**
+ * The validated history keys for `owner`, for the inbox decrypt gate.
+ * Decrypt-only: nothing returned here may be published or sign anything.
+ */
+export async function readHistoryKeys(owner: string): Promise<HistoryReadResult> {
+	const epochAtEntry = identityEpochCounter;
+	const c = cachedHistory;
+	if (!historyWipeLatch && c && c.owner === owner && c.epoch === epochAtEntry) {
+		return { status: 'ok', keys: copyHistory(c.keys), dropped: 0 };
+	}
+	return withIdentityLock(async (): Promise<HistoryReadResult> => {
+		const epoch = identityEpochCounter;
+		try {
+			const st = await loadKeyringState(owner);
+			if (st.status !== 'ok') {
+				trackKeyring('read', st.status, { reason: st.reason });
+				return st;
+			}
+			// A wipe landing while this awaited IDB must not leave the retired
+			// owner's keys in the cache (same rule as sealedX25519Mint).
+			if (identityEpochCounter === epoch) cachedHistory = { owner, epoch, keys: st.history };
+			if (st.dropped > 0) trackKeyring('read', 'ok', { dropped: st.dropped });
+			return { status: 'ok', keys: copyHistory(st.history), dropped: st.dropped };
+		} catch (e) {
+			const f = storageFailure(e);
+			trackKeyring('read', f.status, { reason: f.reason });
+			return f;
+		}
+	});
+}
+
+/**
+ * Current sealed key plus history keys, as `{pub, secret}` pairs ready for a
+ * bundle. Reads the stored rows only — it never mints a current key. History
+ * pairs go through the same validated loader as every other read.
+ */
+export async function exportSealedKeyring(owner: string): Promise<KeyringExportResult> {
+	return withIdentityLock(async (): Promise<KeyringExportResult> => {
+		try {
+			const st = await loadKeyringState(owner);
+			if (st.status !== 'ok') {
+				trackKeyring('export', st.status, { reason: st.reason });
+				return st;
+			}
+			const pair = (pub: Uint8Array, priv: Uint8Array): KeyringPair => ({
+				pubB64u: toBase64url(pub),
+				secretB64u: toBase64url(priv),
+			});
+			const current = st.current ? pair(st.current.pub, st.current.priv) : null;
+			const history = st.history.map((k) => pair(k.pub, k.priv));
+			if (!current && history.length === 0) {
+				trackKeyring('export', 'absent');
+				return { status: 'absent' };
+			}
+			trackKeyring('export', 'ok', { count: history.length });
+			return { status: 'ok', current, history };
+		} catch (e) {
+			const f = storageFailure(e);
+			trackKeyring('export', f.status, { reason: f.reason });
+			return f;
+		}
+	});
+}
+
+/**
+ * Import history keys for `owner`. ALL-OR-NOTHING: every entry is validated
+ * (exact lengths, canonical base64url, bounded count before decode, not
+ * small-order, `X25519(secret) == pub`, unique pub and unique address within
+ * the batch, against held history and against the current key) before ONE IDB
+ * transaction writes them all. Any failure persists nothing.
+ *
+ * `keys` is `unknown` on purpose: it is parsed JSON from a file or a frame.
+ * `undefined`/`null` means the carrier had no keyring field and returns
+ * `absent`, which is not an error. An entry whose pub is already held (or is
+ * the current key) is an idempotent no-op; an address shared with a DIFFERENT
+ * key is `invalid`.
+ */
+export async function importSealedHistoryKeys(
+	owner: string,
+	keys: unknown,
+	source: HistorySource = 'oxp',
+): Promise<KeyringImportResult> {
+	if (keys === undefined || keys === null) {
+		trackKeyring('import', 'absent');
+		return { status: 'absent' };
+	}
+	if (!HISTORY_SOURCES.has(source)) return importInvalid('bad_source');
+	const parsed = parseKeyringEntries(keys);
+	if (!parsed.ok) return importInvalid(parsed.reason);
+	const { entries } = parsed;
+	try {
+		return await withIdentityLock(async (): Promise<KeyringImportResult> => {
+			const epoch = identityEpochCounter;
+			try {
+				const st = await loadKeyringState(owner);
+				if (st.status !== 'ok') {
+					trackKeyring('import', st.status, { reason: st.reason });
+					return st;
+				}
+				const heldPubs = new Set(st.history.map((k) => k.pubB64u));
+				const heldAddrs = new Set(st.history.map((k) => k.addrHex));
+				const currentPub = st.current ? toBase64url(st.current.pub) : null;
+				const currentAddr = st.current ? toHex(await derivePeerAddress(st.current.pub)) : null;
+
+				const seenPubs = new Set<string>();
+				const seenAddrs = new Set<string>();
+				const fresh: Array<{ pubB64u: string; secret: Uint8Array; addrHex: string }> = [];
+				let alreadyHeld = 0;
+				for (const e of entries) {
+					if (seenPubs.has(e.pubB64u)) return importInvalid('duplicate_pub');
+					const addrHex = toHex(await derivePeerAddress(e.pub));
+					if (seenAddrs.has(addrHex)) return importInvalid('duplicate_address');
+					seenPubs.add(e.pubB64u);
+					seenAddrs.add(addrHex);
+					if (e.pubB64u === currentPub || heldPubs.has(e.pubB64u)) {
+						alreadyHeld++;
+						continue;
+					}
+					if (addrHex === currentAddr || heldAddrs.has(addrHex)) {
+						return importInvalid('address_collision');
+					}
+					fresh.push({ pubB64u: e.pubB64u, secret: e.secret, addrHex });
+				}
+				if (st.history.length + fresh.length > MAX_HISTORY_KEYS) return importInvalid('too_many');
+				if (fresh.length === 0) {
+					trackKeyring('import', 'ok', { count: 0 });
+					return { status: 'ok', added: 0, alreadyHeld };
+				}
+
+				// Wrap EVERYTHING first: WebCrypto awaits inside an open IDB transaction
+				// let it auto-commit, which would turn "one transaction" into several.
+				const now = Date.now();
+				const records = await Promise.all(
+					fresh.map(async (f): Promise<[string, StoredHistoryKey]> => [
+						HISTORY_PREFIX + f.pubB64u,
+						{
+							kind: 'x25519-history-v1',
+							ownerEd25519PubB64: owner,
+							pubB64u: f.pubB64u,
+							addrHex: f.addrHex,
+							wrappedSecret: await wrapSecretBytes(st.wrappingKey, f.secret),
+							importedAtMs: now,
+							source,
+						},
+					]),
+				);
+				// The identity moved while we validated: write nothing. (Rows written
+				// for a retired owner would be inert anyway — every read re-checks the
+				// owner — but there is no reason to leave them.)
+				if (identityEpochCounter !== epoch) {
+					trackKeyring('import', 'storage_failure', { reason: 'stale_identity' });
+					return { status: 'storage_failure', reason: 'stale_identity' };
+				}
+				await idb.transact(records.map(([key, value]) => ({ op: 'put', key, value }) as const));
+				cachedHistory = null;
+				trackKeyring('import', 'ok', { count: fresh.length });
+				return { status: 'ok', added: fresh.length, alreadyHeld };
+			} catch (e) {
+				const f = storageFailure(e);
+				trackKeyring('import', f.status, { reason: f.reason });
+				return f;
+			}
+		});
+	} finally {
+		// Hygiene, not a guarantee (see DeviceIdentity.privateKeySeed): the decoded
+		// copies do not need to outlive the call.
+		for (const e of entries) e.secret.fill(0);
+	}
+}
+
+function importInvalid(reason: KeyringInvalidReason): KeyringFailure {
+	trackKeyring('import', 'invalid', { reason });
+	return { status: 'invalid', reason };
 }
 
 // ─── X25519 static keypair (B.2-noise-s-key-derivation) ──────────────────────
@@ -1770,6 +2254,12 @@ export async function replaceDeviceIdentity(
 	secret: Uint8Array,
 	publicB64u: string,
 ): Promise<void> {
+	// FIRST, before any state is touched: the supplied public key is stored as
+	// given, so an unchecked mismatch would persist a seed beside a public key
+	// it does not derive — every signature then fails verification under the
+	// stored identity, silently and permanently.
+	assertEd25519Pair(secret, publicB64u);
+
 	cachedIdentity = null;
 	cachedWrappingKey = null;
 
@@ -1842,10 +2332,40 @@ export async function replaceDeviceIdentity(
 	// above: survivable, but never silent.
 	try {
 		const existingSealed = await idb.load<StoredSealedX25519>(SEALED_X25519_NAME);
-		if (existingSealed && existingSealed.ownerEd25519PubB64 !== publicB64u) {
-			await idb.delete(SEALED_X25519_NAME);
+		const sealedForeign =
+			!!existingSealed && existingSealed.ownerEd25519PubB64 !== publicB64u;
+		// History follows the sealed key's rule: any record not owned by the
+		// restored identity (or any unreadable one) means the keyring belongs to
+		// the outgoing identity, and it goes — in the same transaction as the
+		// sealed key. A pending marker from an earlier failed wipe also forces it.
+		// Same-identity restore keeps its history, exactly as it keeps its key.
+		const historyRows = await idb.loadPrefix<{ ownerEd25519PubB64?: unknown }>(
+			HISTORY_PREFIX,
+			MAX_HISTORY_KEYS + 1,
+		);
+		const historyForeign =
+			historyRows.length > MAX_HISTORY_KEYS ||
+			historyRows.some((r) => r.value?.ownerEd25519PubB64 !== publicB64u);
+		if (sealedForeign || historyForeign || (await isHistoryWipePending())) {
+			// Never throws: on failure it latches and persists the marker, which
+			// blocks every history read. This function keeps its contract of
+			// resolving once the identity pair has landed (see the test "a restore
+			// that already succeeded must not report failure").
+			await wipeKeyRows(sealedForeign);
 		}
 	} catch (e) {
+		// Could not even establish whose keyring this is: fail closed. Block
+		// history until a retry can prove it clean; a same-identity restore loses
+		// nothing it cannot re-import from the bundle it was restored from.
+		historyWipeLatch = true;
+		try {
+			await idb.save(HISTORY_WIPE_PENDING_NAME, {
+				kind: 'x25519-history-wipe-pending-v1',
+				atMs: Date.now(),
+			});
+		} catch {
+			/* latch only */
+		}
 		track('client.identity_legacy_residue_wipe_failed', undefined, {
 			error_class: classifyIdentityError(e, 'unwrap'),
 		});
@@ -1872,9 +2392,46 @@ export async function replaceDeviceIdentity(
 	// next caller re-reads IDB, finds nothing, and mints and persists again. One
 	// wasted mint, and no undurable key can survive.
 	cachedSealedX25519 = null;
+	cachedHistory = null;
 	identityEpochCounter++;
 
 	cachedIdentity = null;
+}
+
+/** Why replaceDeviceIdentity refused the supplied Ed25519 pair. Bounded. */
+export type IdentityKeyPairMismatchReason =
+	| 'bad_secret_length'
+	| 'non_canonical_public'
+	| 'pair_mismatch';
+
+/**
+ * Thrown by replaceDeviceIdentity when the supplied Ed25519 secret does not
+ * derive the supplied public key. Typed and separate from IdentityDataError:
+ * classifyIdentityError maps that to `unwrap_failed`, which would mislabel
+ * "the backup is inconsistent" as "the stored key is corrupt".
+ */
+export class IdentityKeyPairMismatchError extends Error {
+	readonly reason: IdentityKeyPairMismatchReason;
+	constructor(reason: IdentityKeyPairMismatchReason) {
+		super(`Ed25519 secret and public key do not form a pair: ${reason}`);
+		this.name = 'IdentityKeyPairMismatchError';
+		this.reason = reason;
+	}
+}
+
+function assertEd25519Pair(secret: Uint8Array, publicB64u: string): void {
+	if (!(secret instanceof Uint8Array) || secret.byteLength !== 32) {
+		throw new IdentityKeyPairMismatchError('bad_secret_length');
+	}
+	const claimed = decodeCanonicalKey32(publicB64u);
+	if (!claimed) throw new IdentityKeyPairMismatchError('non_canonical_public');
+	let derived: Uint8Array;
+	try {
+		derived = nobleEd25519.getPublicKey(secret);
+	} catch {
+		throw new IdentityKeyPairMismatchError('pair_mismatch');
+	}
+	if (!bytesEqual(derived, claimed)) throw new IdentityKeyPairMismatchError('pair_mismatch');
 }
 
 /**

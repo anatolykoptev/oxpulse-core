@@ -15,8 +15,32 @@ export {
 	replaceDeviceIdentity,
 	probeBrowserSupport,
 	SealedKeyUnavailableError,
+	IdentityKeyPairMismatchError,
+	HistoryWipePendingError,
+	type IdentityKeyPairMismatchReason,
 	type DeviceIdentity,
 } from './device-identity.js';
+
+// History keyring: decrypt-only X25519 keys carried across restore / device link
+export {
+	exportSealedKeyring,
+	importSealedHistoryKeys,
+	readHistoryKeys,
+	isHistoryWipePending,
+	type HistoryKey,
+	type KeyringPair,
+	type KeyringFailure,
+	type KeyringImportResult,
+	type KeyringExportResult,
+	type HistoryReadResult,
+} from './device-identity.js';
+export {
+	MAX_HISTORY_KEYS,
+	X25519_SMALL_ORDER,
+	isSmallOrderX25519,
+	type HistorySource,
+	type KeyringInvalidReason,
+} from './history-keys.js';
 
 // X25519 static keypair for Noise XX es/se DH (B.2-noise-s-key-derivation)
 export {
