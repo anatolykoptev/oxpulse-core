@@ -1665,9 +1665,12 @@ export async function readHistoryKeys(owner: string): Promise<HistoryReadResult>
 				trackKeyring('read', st.status, { reason: st.reason });
 				return st;
 			}
-			// A wipe landing while this awaited IDB must not leave the retired
-			// owner's keys in the cache (same rule as sealedX25519Mint).
-			if (identityEpochCounter === epoch) cachedHistory = { owner, epoch, keys: st.history };
+			// A wipe or replace landed while this awaited IDB: what was read belongs to
+			// an identity that no longer exists. Hand back nothing — and cache nothing
+			// (same rule as sealedX25519Mint). The check and the write below have no
+			// await between them.
+			if (identityEpochCounter !== epoch) return staleKeyring('read');
+			cachedHistory = { owner, epoch, keys: st.history };
 			if (st.dropped > 0) trackKeyring('read', 'ok', { dropped: st.dropped });
 			return { status: 'ok', keys: copyHistory(st.history), dropped: st.dropped };
 		} catch (e) {
@@ -1685,12 +1688,14 @@ export async function readHistoryKeys(owner: string): Promise<HistoryReadResult>
  */
 export async function exportSealedKeyring(owner: string): Promise<KeyringExportResult> {
 	return withIdentityLock(async (): Promise<KeyringExportResult> => {
+		const epoch = identityEpochCounter;
 		try {
 			const st = await loadKeyringState(owner);
 			if (st.status !== 'ok') {
 				trackKeyring('export', st.status, { reason: st.reason });
 				return st;
 			}
+			if (identityEpochCounter !== epoch) return staleKeyring('export');
 			const pair = (pub: Uint8Array, priv: Uint8Array): KeyringPair => ({
 				pubB64u: toBase64url(pub),
 				secretB64u: toBase64url(priv),
@@ -1796,10 +1801,7 @@ export async function importSealedHistoryKeys(
 				// The identity moved while we validated: write nothing. (Rows written
 				// for a retired owner would be inert anyway — every read re-checks the
 				// owner — but there is no reason to leave them.)
-				if (identityEpochCounter !== epoch) {
-					trackKeyring('import', 'storage_failure', { reason: 'stale_identity' });
-					return { status: 'storage_failure', reason: 'stale_identity' };
-				}
+				if (identityEpochCounter !== epoch) return staleKeyring('import');
 				await idb.transact(records.map(([key, value]) => ({ op: 'put', key, value }) as const));
 				cachedHistory = null;
 				trackKeyring('import', 'ok', { count: fresh.length });
@@ -1815,6 +1817,11 @@ export async function importSealedHistoryKeys(
 		// copies do not need to outlive the call.
 		for (const e of entries) e.secret.fill(0);
 	}
+}
+
+function staleKeyring(op: 'import' | 'export' | 'read'): KeyringFailure {
+	trackKeyring(op, 'storage_failure', { reason: 'stale_identity' });
+	return { status: 'storage_failure', reason: 'stale_identity' };
 }
 
 function importInvalid(reason: KeyringInvalidReason): KeyringFailure {

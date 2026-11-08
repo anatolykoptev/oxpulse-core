@@ -69,10 +69,12 @@ interface Faults {
 	poisonLastPut: boolean;
 	/** collapse the routing address to 1 byte so collisions are findable. */
 	weakAddress: boolean;
+	/** one-shot: runs right after the next loadPrefix() returns (mid-read interleave). */
+	afterLoadPrefix: null | (() => Promise<unknown>);
 }
 
 async function boot(f: Partial<Faults> = {}): Promise<{ device: Device; faults: Faults }> {
-	const faults: Faults = { failWipe: false, failMarker: false, poisonLastPut: false, weakAddress: false, ...f };
+	const faults: Faults = { failWipe: false, failMarker: false, poisonLastPut: false, weakAddress: false, afterLoadPrefix: null, ...f };
 	vi.resetModules();
 	vi.doMock('../idb-store.js', async () => {
 		const actual = await vi.importActual<typeof import('../idb-store.js')>('../idb-store.js');
@@ -82,6 +84,15 @@ async function boot(f: Partial<Faults> = {}): Promise<{ device: Device; faults: 
 				const real = actual.createIdbStore(opts);
 				return {
 					...real,
+					loadPrefix: async <T,>(prefix: string, limit?: number) => {
+						const out = await real.loadPrefix<T>(prefix, limit);
+						if (faults.afterLoadPrefix) {
+							const fire = faults.afterLoadPrefix;
+							faults.afterLoadPrefix = null;
+							await fire();
+						}
+						return out;
+					},
 					transact: async (ops: ReadonlyArray<IdbTxOp>) => {
 						if (faults.failWipe && ops.some((o) => o.op === 'deletePrefix')) {
 							throw new DOMException('injected wipe fault', 'UnknownError');
@@ -497,6 +508,38 @@ describe('read-time validation (every record is re-proven at every read)', () =>
 		await device.clearDeviceIdentity();
 		const after = await device.readHistoryKeys(owner);
 		expect(after.status === 'ok' && after.keys.length > 0).toBe(false);
+	});
+
+	it('a read that STARTS before a wipe and finishes after it returns nothing, and caches nothing', async () => {
+		if (!ed25519Supported) return;
+		const { device, faults } = await boot();
+		const owner = await liveOwner(device);
+		await device.importSealedHistoryKeys(owner, [wire(pair())]);
+		// the read has the old owner's rows in hand when the identity is wiped
+		faults.afterLoadPrefix = () => device.clearDeviceIdentity();
+		const racing = await device.readHistoryKeys(owner);
+		expect(racing).toEqual({ status: 'storage_failure', reason: 'stale_identity' });
+		const later = await device.readHistoryKeys(owner);
+		expect(later.status === 'ok' && later.keys.length > 0).toBe(false);
+	});
+
+	it('an export that races a wipe returns no key material', async () => {
+		if (!ed25519Supported) return;
+		const { device, faults } = await boot();
+		const owner = await liveOwner(device);
+		await device.importSealedHistoryKeys(owner, [wire(pair())]);
+		faults.afterLoadPrefix = () => device.clearDeviceIdentity();
+		expect(await device.exportSealedKeyring(owner)).toEqual({ status: 'storage_failure', reason: 'stale_identity' });
+	});
+
+	it('an import that races a wipe writes nothing after the wipe', async () => {
+		if (!ed25519Supported) return;
+		const { device, faults } = await boot();
+		const owner = await liveOwner(device);
+		faults.afterLoadPrefix = () => device.clearDeviceIdentity();
+		const r = await device.importSealedHistoryKeys(owner, [wire(pair())]);
+		expect(r).toEqual({ status: 'storage_failure', reason: 'stale_identity' });
+		expect(await historyRowCount()).toBe(0);
 	});
 
 	it('returns fresh buffers: zeroizing a result cannot corrupt the next read', async () => {
