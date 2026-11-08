@@ -903,6 +903,23 @@ describe('the in-transaction cap counts only NEW keys', () => {
 	});
 });
 
+describe('wipe failure latch outside the forget path', () => {
+	it('replace to a new owner with a failing wipe AND a failing marker write still blocks via the latch', async () => {
+		if (!ed25519Supported) return;
+		const { device, faults } = await boot();
+		const owner = await liveOwner(device);
+		await device.importSealedHistoryKeys(owner, [wire(pair())]);
+		faults.failWipe = true;
+		faults.failMarker = true;
+		const next = otherIdentity();
+		await expect(device.replaceDeviceIdentity(next.secret, next.pub)).resolves.toBeUndefined();
+		expect(await raw.load(MARKER)).toBeNull(); // marker write really failed
+		expect(await historyRowCount()).toBe(1);
+		expect(await device.isHistoryWipePending()).toBe(true);
+		expect(await device.readHistoryKeys(next.pub)).toEqual({ status: 'storage_failure', reason: 'wipe_pending' });
+	});
+});
+
 describe('Ed25519 pair check on replaceDeviceIdentity', () => {
 	it('rejects a public key the secret does not derive, and changes NOTHING', async () => {
 		if (!ed25519Supported) return;
