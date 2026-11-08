@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.6...identity-v0.2.7) (2026-11-08)
+
+
+### Added
+
+* **identity:** history keyring + Ed25519 pair check (P1) ([#126](https://github.com/anatolykoptev/oxpulse-core/issues/126)) ([c41727d](https://github.com/anatolykoptev/oxpulse-core/commit/c41727dd9b6d508d89a8c43fa93b17369b2d7472))
+
 ## [0.2.6](https://github.com/anatolykoptev/oxpulse-core/compare/identity-v0.2.5...identity-v0.2.6) (2026-08-19)
 
 
