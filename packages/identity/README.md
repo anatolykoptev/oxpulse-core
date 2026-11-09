@@ -74,6 +74,19 @@ re-registered). The `CryptoKey` handles matter only if you drive WebCrypto yours
 Room-host keys are **in-memory only** and HKDF-derived from a dedicated seed — they are never
 persisted alongside the device key.
 
+## History keyring
+
+Decrypt-only X25519 keys a device no longer publishes (carried across a backup restore or a device
+link). `importSealedHistoryKeys(owner, keys)` is the trust boundary: strict schema, 64-entry cap,
+small-order / mismatched-pair / duplicate-address rejection, all-or-nothing in one IDB transaction,
+typed `ok | absent | invalid | storage_failure` result. `exportSealedKeyring(owner)` returns the
+current key plus history; `readHistoryKeys(owner)` is the validated read for a decrypt gate. Records
+are owner-tagged, KEK-wrapped and re-proven at every read. History is wiped in the same transaction
+as the sealed key; a failed wipe leaves a pending marker that blocks all history reads until a retry
+(at boot, or on the next read) succeeds, and `clearDeviceIdentity` throws `HistoryWipePendingError`
+until it has. `replaceDeviceIdentity` now throws `IdentityKeyPairMismatchError` when the Ed25519
+secret does not derive the supplied public key.
+
 ## Storage contract
 
 The IndexedDB database name, store name and key names are **load-bearing for already-installed
