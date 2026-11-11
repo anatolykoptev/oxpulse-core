@@ -42,7 +42,7 @@ import {
 } from './history-keys.js';
 
 // PKCS#8 DER prefix for a bare 32-byte Ed25519 private key seed.
-// Structure: SEQUENCE { version=0, AlgorithmIdentifier { OID 1.3.101.112 }, OCTET STRING { OCTET STRING { seed } } }
+// Structure: SEQUENCE { version=0, AlgorithmIdentifier { OID id-Ed25519, RFC 8410 }, OCTET STRING { OCTET STRING { seed } } }
 // This is the encoding WebCrypto importKey('pkcs8') expects for Ed25519.
 // Verified against replaceDeviceIdentity() usage in this same file.
 const ED25519_PKCS8_PREFIX = new Uint8Array([
