@@ -88,7 +88,7 @@ The workflow now asserts the registry actually serves the version before the run
 ### Two things that bind outside this repo
 
 - **npm trusted publishing binds package -> repo -> workflow FILENAME.** Renaming `release-please.yml` breaks publishing until the npm side is updated. That binding is invisible from this repo and is the most common way the setup silently stops working.
-- **Release PRs are opened by the krolik-release-bot GitHub App**, not `GITHUB_TOKEN`. GitHub suppresses workflow runs on PRs opened by `GITHUB_TOKEN`, so those release PRs sat unapproved and were merged on a hand-approved run or on nothing at all. An App-opened PR gets CI normally, which is what lets branch protection gate the artifact that ships.
+- **Release PRs are opened by the release-bot GitHub App**, not `GITHUB_TOKEN`. GitHub suppresses workflow runs on PRs opened by `GITHUB_TOKEN`, so those release PRs sat unapproved and were merged on a hand-approved run or on nothing at all. An App-opened PR gets CI normally, which is what lets branch protection gate the artifact that ships.
 
 ### Commit types in the changelog
 
