@@ -178,7 +178,7 @@ const REGION_DISPLAY_NAMES: Record<string, string> = {
   tolyatti: 'Тольятти',
   izhevsk: 'Ижевск',
   barnaul: 'Барнаул',
-  // International — protest-relevant
+  // International — high-priority cities
   tehran: 'Тегеран',
   minsk: 'Минск',
   kyiv: 'Київ',
@@ -204,7 +204,7 @@ const REGION_DISPLAY_NAMES: Record<string, string> = {
 
 /**
  * Known city centroids for manual region selection when GPS is denied.
- * Top cities relevant to OxPulse use cases (RU/EU/protest-relevant).
+ * Top cities relevant to OxPulse use cases (RU/EU/high-priority regions).
  * Extensible — add new entries without changing API.
  */
 const REGION_FALLBACKS: Record<string, { lat: number; lon: number }> = {
@@ -228,7 +228,7 @@ const REGION_FALLBACKS: Record<string, { lat: number; lon: number }> = {
   tolyatti: { lat: 53.5303, lon: 49.3461 },
   izhevsk: { lat: 56.8526, lon: 53.2048 },
   barnaul: { lat: 53.3606, lon: 83.7636 },
-  // International — protest-relevant
+  // International — high-priority cities
   tehran: { lat: 35.6892, lon: 51.389 },
   minsk: { lat: 53.9006, lon: 27.559 },
   kyiv: { lat: 50.4501, lon: 30.5234 },
