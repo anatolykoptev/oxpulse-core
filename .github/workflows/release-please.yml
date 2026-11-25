@@ -160,7 +160,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '26.13.1'
           cache: 'pnpm'
           # Puts the registry into .npmrc. OIDC does not use NODE_AUTH_TOKEN, but
           # `npm publish` and `npm view` still need the registry URL.

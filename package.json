@@ -16,6 +16,6 @@
     "typecheck": "pnpm -r exec tsc --noEmit"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=26.13.1"
   }
 }
