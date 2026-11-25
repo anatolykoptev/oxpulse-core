@@ -26,7 +26,7 @@ packages/
 
 ## Build
 
-Node 22 and pnpm 10 (the `packageManager` field pins the exact version):
+Node 26 (26.13.1, the CI pin; the published packages support Node >=22) and pnpm 10 (the `packageManager` field pins the exact version):
 
 ```bash
 pnpm install --frozen-lockfile
