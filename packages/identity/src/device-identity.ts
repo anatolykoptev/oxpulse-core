@@ -2033,8 +2033,16 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 		// later WebCrypto X25519 downgrade (browser update removes X25519
 		// support) can recover via the noble path at line 654-666 instead of
 		// regenerating a fresh keypair and breaking TOFU trust with all peers.
-		const rawPrivBytes = await crypto.subtle.exportKey('raw', kp.privateKey);
-		const wrappedPrivRaw = await wrapSecretBytes(wrappingKey, new Uint8Array(rawPrivBytes));
+		// WebCrypto exports 'raw' for X25519 PUBLIC keys only (Secure Curves spec);
+		// a private key throws InvalidAccessError (Node 26 enforces it, Node 22 did
+		// not). The scalar is the last 32 bytes of the 48-byte RFC 8410 PKCS#8 envelope.
+		const pkcs8Priv = new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey));
+		if (pkcs8Priv.byteLength !== 48) {
+			throw new Error('Unexpected PKCS#8 length for X25519 key');
+		}
+		const rawPrivBytes = pkcs8Priv.slice(16);
+		pkcs8Priv.fill(0);
+		const wrappedPrivRaw = await wrapSecretBytes(wrappingKey, rawPrivBytes);
 
 		// Persist before re-importing as non-extractable (window ≈ one tick, only WebCrypto awaits).
 		await idb.save<StoredX25519NobleKeypair>(X25519_KEYPAIR_NAME, {
