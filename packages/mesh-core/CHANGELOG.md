@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.4.0...mesh-core-v0.5.0) (2026-11-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* Node 26 toolchain; verified PKCS#8 export of identity private keys ([#132](https://github.com/anatolykoptev/oxpulse-core/issues/132))
+* **identity:** the published packages require Node >=22 (engines.node).
+
+* Node 26 toolchain; verified PKCS[#8](https://github.com/anatolykoptev/oxpulse-core/issues/8) export of identity private keys ([#132](https://github.com/anatolykoptev/oxpulse-core/issues/132)) ([439eb5f](https://github.com/anatolykoptev/oxpulse-core/commit/439eb5f6df9d506ad3e1931693853b08ea3f6569))
+
+
+### Fixed
+
+* **identity:** exportKey('raw', X25519 private) throws on every runtime ([439eb5f](https://github.com/anatolykoptev/oxpulse-core/commit/439eb5f6df9d506ad3e1931693853b08ea3f6569))
+
 ## [0.4.0](https://github.com/anatolykoptev/oxpulse-core/compare/mesh-core-v0.3.0...mesh-core-v0.4.0) (2026-10-12)
 
 
