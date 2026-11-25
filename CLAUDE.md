@@ -19,7 +19,7 @@ indexed in [docs/INDEX.md](docs/INDEX.md).
 
 ## Gate
 
-CI (`.github/workflows/preflight.yml`, job `preflight`) runs in this order on Node 22 and pnpm 10:
+CI (`.github/workflows/preflight.yml`, job `preflight`) runs in this order on Node 26.13.1 and pnpm 10 (job `floor-node22` repeats build and tests on Node 22.23.5, the engines floor):
 
 ```sh
 pnpm install --frozen-lockfile

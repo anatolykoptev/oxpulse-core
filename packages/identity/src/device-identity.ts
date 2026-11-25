@@ -51,6 +51,28 @@ const ED25519_PKCS8_PREFIX = new Uint8Array([
 	0x04, 0x22, 0x04, 0x20,
 ]);
 
+// PKCS#8 DER prefix for a bare 32-byte X25519 private scalar (RFC 8410, OID 1.3.101.110).
+// Identical to the Ed25519 prefix except the OID's last byte (0x6e vs 0x70).
+// Measured byte-identical on Node 22/24/26, Chrome, and the BoringSSL/NSS/WebKit sources.
+const X25519_PKCS8_PREFIX = new Uint8Array([
+	0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05,
+	0x06, 0x03, 0x2b, 0x65, 0x6e,
+	0x04, 0x22, 0x04, 0x20,
+]);
+
+/**
+ * Extract the 32-byte scalar from a WebCrypto PKCS#8 export. Exact length and
+ * exact RFC 8410 prefix are required; anything else is refused rather than
+ * sliced blindly. Callers MUST still verify the scalar against the known public
+ * key before trusting or persisting it. The input buffer is NOT zeroed here.
+ */
+function scalarFromPkcs8(pkcs8: Uint8Array, prefix: Uint8Array, label: string): Uint8Array {
+	if (pkcs8.byteLength !== prefix.byteLength + 32 || !bytesEqual(pkcs8.subarray(0, prefix.byteLength), prefix)) {
+		throw new IdentityDataError(`Unexpected PKCS#8 envelope for ${label} key`);
+	}
+	return pkcs8.slice(prefix.byteLength);
+}
+
 // LOAD-BEARING: pre-existing user data uses these exact strings.
 // Changing them strands every installed user's identity. NEVER rename.
 // See identity-extraction-adr.md §3.4 and __tests__/storage-keys.test.ts.
@@ -2033,8 +2055,23 @@ export async function getOrCreateX25519Keypair(): Promise<{ publicKey: Uint8Arra
 		// later WebCrypto X25519 downgrade (browser update removes X25519
 		// support) can recover via the noble path at line 654-666 instead of
 		// regenerating a fresh keypair and breaking TOFU trust with all peers.
-		const rawPrivBytes = await crypto.subtle.exportKey('raw', kp.privateKey);
-		const wrappedPrivRaw = await wrapSecretBytes(wrappingKey, new Uint8Array(rawPrivBytes));
+		// WebCrypto exports 'raw' for X25519 PUBLIC keys only (Secure Curves spec);
+		// exportKey('raw', privateKey) throws on every runtime (Node 22/24
+		// NotSupportedError, Node 26 and Chrome InvalidAccessError). The scalar is
+		// the last 32 bytes of the 48-byte RFC 8410 PKCS#8 envelope. The extracted
+		// scalar is verified against rawPub before anything is persisted.
+		const pkcs8Priv = new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey));
+		let rawPrivBytes: Uint8Array;
+		try {
+			rawPrivBytes = scalarFromPkcs8(pkcs8Priv, X25519_PKCS8_PREFIX, 'X25519');
+		} finally {
+			pkcs8Priv.fill(0);
+		}
+		if (!bytesEqual(nobleX25519.getPublicKey(rawPrivBytes), pub)) {
+			rawPrivBytes.fill(0);
+			throw new IdentityDataError('X25519 private scalar does not match its public key');
+		}
+		const wrappedPrivRaw = await wrapSecretBytes(wrappingKey, rawPrivBytes);
 
 		// Persist before re-importing as non-extractable (window ≈ one tick, only WebCrypto awaits).
 		await idb.save<StoredX25519NobleKeypair>(X25519_KEYPAIR_NAME, {
@@ -2278,7 +2315,9 @@ async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; public
 
 	const pkcs8 = await crypto.subtle.exportKey("pkcs8", extractablePrivKey);
 	const pkcs8Bytes = new Uint8Array(pkcs8);
-	// UNREACHABLE BY CONSTRUCTION, kept as a guard against a WebCrypto bug.
+	// The envelope-shape check below is UNREACHABLE BY CONSTRUCTION for the length
+	// part, kept as a guard against a WebCrypto bug; the public-key check after it
+	// is reachable and tested.
 	//
 	// Measured rather than assumed. A test tried to reach it by storing a
 	// wrappedPrivateKey that unwraps to a 40-byte buffer; the unwrap rejects
@@ -2291,10 +2330,18 @@ async function exportRawDeviceSecretImpl(): Promise<{ secret: Uint8Array; public
 	// error, not this branch — coverage advertised and not delivered. Mutating
 	// either this throw's type or the 48 to a 1 is invisible to the suite, and
 	// that is a property of the branch being unreachable, not of a missing test.
-	if (pkcs8Bytes.byteLength < 48) {
-		throw new IdentityDataError("Unexpected PKCS#8 length for Ed25519 key");
+	let secret: Uint8Array;
+	try {
+		secret = scalarFromPkcs8(pkcs8Bytes, ED25519_PKCS8_PREFIX, 'Ed25519');
+	} finally {
+		pkcs8Bytes.fill(0);
 	}
-	const secret = pkcs8Bytes.slice(16);
+	// Verify before releasing: the scalar must derive the stored public key, or a
+	// backup would silently carry a key that does not belong to this identity.
+	if (!bytesEqual(nobleEd25519.getPublicKey(secret), fromBase64url(stored.publicKeyB64))) {
+		secret.fill(0);
+		throw new IdentityDataError('Exported Ed25519 secret does not match the stored public key');
+	}
 
 	return { secret, publicB64u: stored.publicKeyB64 };
 }

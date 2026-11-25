@@ -75,6 +75,19 @@ describe('exportRawDeviceSecret audit (#103)', () => {
 		expect(audits.at(-1)!.payload?.outcome).toBe('ok');
 	}, 30_000);
 
+	it('refuses to export a secret that does not derive the stored public key', async () => {
+		const { mod } = await loadWithTracker();
+		await mod.getOrCreateDeviceIdentity();
+		const idb = await import('../idb-store.js');
+		const store = idb.createIdbStore({ dbName: 'oxpulse-device-id', storeName: 'identity' });
+		const stored = await store.load<{ publicKeyB64: string; wrappedPrivateKey: ArrayBuffer }>('device-key');
+		// a different, valid 32-byte public key
+		const other = (await mod.generateDeviceIdentity()).publicKeyB64;
+		expect(other).not.toBe(stored!.publicKeyB64);
+		await store.save('device-key', { publicKeyB64: other, wrappedPrivateKey: stored!.wrappedPrivateKey });
+		await expect(mod.exportRawDeviceSecret()).rejects.toThrow(/does not match the stored public key/);
+	}, 30_000);
+
 	it('emits on FAILURE and rethrows', async () => {
 		// A failed export is signal: repeated failures are what probing looks
 		// like, and swallowing them is what an attacker would prefer.

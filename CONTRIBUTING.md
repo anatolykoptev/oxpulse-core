@@ -16,7 +16,7 @@ gh pr merge <n> --squash --subject '<type>(<scope>): ...' --body-file <file>
 
 ## Development
 
-Node 22 and pnpm 10 (pinned by `packageManager`). The gate CI runs, in this order:
+Node 26 (26.13.1, the CI pin) and the pnpm that `packageManager` pins. The gate CI runs, in this order:
 
 ```sh
 pnpm install --frozen-lockfile
