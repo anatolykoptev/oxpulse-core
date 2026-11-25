@@ -125,3 +125,62 @@ describe('X25519 static keypair (B.2-noise-s-key-derivation)', () => {
 		expect(Array.from(kp1.publicKey)).not.toEqual(Array.from(kp2.publicKey));
 	});
 });
+
+// SEC-CR-001/002 — the generate branch must take the WebCrypto path where X25519
+// exists, and must verify the scalar it extracts from PKCS#8 before persisting.
+describe('X25519 generate branch: WebCrypto path + scalar verification', () => {
+	let x25519Supported = false;
+	beforeAll(async () => {
+		try {
+			await crypto.subtle.generateKey('X25519', true, ['deriveBits']);
+			x25519Supported = true;
+		} catch {
+			x25519Supported = false;
+		}
+	});
+
+	it('takes the WebCrypto branch (non-null privateKey, null seed), not the noble fallback', async () => {
+		if (!x25519Supported) return;
+		const mod = await freshImport();
+		const kp = await mod.getOrCreateX25519Keypair();
+		expect(kp.privateKey).not.toBeNull();
+		expect(kp.privateKeySeed).toBeNull();
+	});
+
+	it('refuses to persist a scalar that does not match the public key', async () => {
+		if (!x25519Supported) return;
+		const { vi } = await import('vitest');
+		const mod = await freshImport();
+		const orig = crypto.subtle.exportKey.bind(crypto.subtle);
+		const prefix = [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20];
+		const bad = new Uint8Array([...prefix, ...new Uint8Array(32).fill(7)]);
+		const spy = vi
+			.spyOn(crypto.subtle, 'exportKey')
+			.mockImplementation(((fmt: string, key: CryptoKey) =>
+				fmt === 'pkcs8' ? Promise.resolve(bad.buffer.slice(0)) : orig(fmt as 'raw', key)) as never);
+		try {
+			await expect(mod.getOrCreateX25519Keypair()).rejects.toThrow(/does not match/);
+		} finally {
+			spy.mockRestore();
+		}
+		// fail closed: nothing saved, a later call generates a fresh valid pair
+		const kp = await (await freshImport()).getOrCreateX25519Keypair();
+		expect(kp.publicKey.byteLength).toBe(32);
+	});
+
+	it('refuses a PKCS#8 envelope with the wrong prefix', async () => {
+		if (!x25519Supported) return;
+		const { vi } = await import('vitest');
+		const mod = await freshImport();
+		const orig = crypto.subtle.exportKey.bind(crypto.subtle);
+		const spy = vi
+			.spyOn(crypto.subtle, 'exportKey')
+			.mockImplementation(((fmt: string, key: CryptoKey) =>
+				fmt === 'pkcs8' ? Promise.resolve(new ArrayBuffer(48)) : orig(fmt as 'raw', key)) as never);
+		try {
+			await expect(mod.getOrCreateX25519Keypair()).rejects.toThrow(/Unexpected PKCS#8 envelope/);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+});
